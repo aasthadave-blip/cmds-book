@@ -1,0 +1,38 @@
+@import "tailwindcss";
+
+@theme {
+  --color-mystic-900: #1a0a2e;
+  --color-mystic-800: #2d1b4e;
+  --color-mystic-700: #3f2b6e;
+  --color-mystic-600: #553c8b;
+  --color-mystic-500: #6b4fa8;
+  --color-mystic-400: #8b6fc0;
+  --color-mystic-300: #ab8fd8;
+  --color-mystic-200: #cbafee;
+  --color-mystic-100: #e5d7f7;
+  --color-mystic-50: #f5f0fb;
+  --color-gold-500: #d4a843;
+  --color-gold-400: #e0be6a;
+  --color-gold-300: #ecd48f;
+  --color-gold-200: #f5e6b8;
+  --font-heading: "Georgia", serif;
+  --font-body: system-ui, sans-serif;
+}
+
+body {
+  font-family: var(--font-body);
+}
+
+h1, h2, h3, h4, h5, h6 {
+  font-family: var(--font-heading);
+}
+
+.stars-bg {
+  background-image: radial-gradient(2px 2px at 20px 30px, #ecd48f 0%, transparent 100%),
+    radial-gradient(2px 2px at 40px 70px, #ab8fd8 0%, transparent 100%),
+    radial-gradient(1px 1px at 90px 40px, #ffffff 0%, transparent 100%),
+    radial-gradient(1px 1px at 130px 80px, #ecd48f 0%, transparent 100%),
+    radial-gradient(2px 2px at 160px 30px, #ab8fd8 0%, transparent 100%);
+  background-size: 200px 100px;
+  background-repeat: repeat;
+}
