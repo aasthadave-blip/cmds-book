@@ -1,0 +1,164 @@
+"""Regenerations router — kick off regen and inspect results."""
+
+from __future__ import annotations
+
+from typing import Any
+from uuid import UUID
+
+from fastapi import APIRouter, Body, Depends, HTTPException
+from sqlalchemy import desc, select
+from sqlalchemy.ext.asyncio import AsyncSession
+
+from app.core.db import get_session
+from app.models.book import Book
+from app.models.job import Job
+from app.models.regeneration import Regeneration
+from app.models.section import Section
+from app.schemas.book import BookUploadResponse
+from app.schemas.regen import RegenerationOut, RegenParams
+
+router = APIRouter(tags=["regenerations"])
+
+
+@router.post("/api/books/{book_id}/regenerate", response_model=BookUploadResponse)
+async def regenerate_book(
+    book_id: UUID,
+    params: RegenParams = Body(...),
+    session: AsyncSession = Depends(get_session),
+) -> BookUploadResponse:
+    book = await session.get(Book, book_id)
+    if book is None:
+        raise HTTPException(404, detail="Book not found")
+
+    regen = Regeneration(
+        book_id=book.id,
+        params=params.model_dump(),
+        blocks_by_section={},
+        qc_drift=None,
+    )
+    session.add(regen)
+    await session.flush()
+
+    job = Job(book_id=book.id, type="regen", status="queued", progress=0)
+    session.add(job)
+    await session.flush()
+
+    # Commit BEFORE dispatch. In inline mode the worker thread starts
+    # immediately and runs with a separate sync session — it can't see
+    # uncommitted data. Without this commit, regen_row lookup in the
+    # worker returns None and blocks_by_section stays empty ({}).
+    await session.commit()
+
+    import app.workers.extract  # noqa: F401
+    from app.workers.runner import dispatch
+
+    dispatch(
+        "regenerate_book",
+        str(book.id),
+        str(job.id),
+        str(regen.id),
+        params.model_dump(),
+    )
+
+    return BookUploadResponse(book_id=book.id, job_id=job.id, regen_id=regen.id, status="regenerating")
+
+
+@router.get("/api/books/{book_id}/regenerations", response_model=list[RegenerationOut])
+async def list_regenerations(
+    book_id: UUID,
+    session: AsyncSession = Depends(get_session),
+) -> list[RegenerationOut]:
+    """List all regenerations for a book, newest first."""
+    result = await session.execute(
+        select(Regeneration)
+        .where(Regeneration.book_id == book_id)
+        .order_by(desc(Regeneration.created_at))
+    )
+    return [RegenerationOut.model_validate(r) for r in result.scalars().all()]
+
+
+@router.get("/api/regenerations/{regen_id}", response_model=RegenerationOut)
+async def get_regeneration(
+    regen_id: UUID,
+    session: AsyncSession = Depends(get_session),
+) -> RegenerationOut:
+    regen = await session.get(Regeneration, regen_id)
+    if regen is None:
+        raise HTTPException(404, detail="Regeneration not found")
+    return RegenerationOut.model_validate(regen)
+
+
+@router.post("/api/regenerations/{regen_id}/sections/{section_id}/rerun")
+async def rerun_section(
+    regen_id: UUID,
+    section_id: str,
+    body: dict[str, Any] = Body(default={}),
+    session: AsyncSession = Depends(get_session),
+) -> dict:
+    """Re-run regeneration for a single section with optional custom instructions."""
+    regen = await session.get(Regeneration, regen_id)
+    if regen is None:
+        raise HTTPException(404, detail="Regeneration not found")
+
+    # Find the section by section_id string (e.g. "1.1")
+    result = await session.execute(
+        select(Section).where(
+            Section.book_id == regen.book_id,
+            Section.section_id == section_id,
+        )
+    )
+    sec = result.scalar_one_or_none()
+    if sec is None:
+        raise HTTPException(404, detail=f"Section {section_id!r} not found")
+
+    # Build params: inherit from original regen, override custom_instructions
+    base_params = dict(regen.params or {})
+    custom = body.get("custom_instructions", "")
+    if custom:
+        base_params["custom_instructions"] = custom
+    params = RegenParams(**base_params)
+
+    from app.services.regenerator import regenerate_section
+    new_blocks = await regenerate_section(
+        section_id=sec.section_id,
+        section_title=sec.title,
+        blocks=list(sec.blocks or []),
+        params=params,
+    )
+
+    # Patch blocks_by_section in-place
+    updated = dict(regen.blocks_by_section or {})
+    updated[sec.section_id] = new_blocks
+    regen.blocks_by_section = updated
+    await session.flush()
+
+    return {"section_id": section_id, "blocks": new_blocks}
+
+
+@router.post("/api/regenerations/{regen_id}/save", response_model=dict)
+async def save_regeneration(
+    regen_id: UUID,
+    body: dict[str, Any] = Body(...),
+    session: AsyncSession = Depends(get_session),
+) -> dict:
+    """Save only confirmed sections to the regeneration record.
+
+    Removes skipped sections from blocks_by_section so the Regenerated
+    folder in the sidebar only shows confirmed content. Original sections
+    are never modified.
+    """
+    regen = await session.get(Regeneration, regen_id)
+    if regen is None:
+        raise HTTPException(404, detail="Regeneration not found")
+
+    confirmed_ids: list[str] = body.get("confirmed_section_ids", [])
+    if not confirmed_ids:
+        raise HTTPException(400, detail="No confirmed section IDs provided")
+
+    current = dict(regen.blocks_by_section or {})
+    # Keep only confirmed sections
+    saved = {sid: blocks for sid, blocks in current.items() if sid in confirmed_ids}
+    regen.blocks_by_section = saved
+    await session.flush()
+
+    return {"saved": True, "sections_saved": len(saved)}

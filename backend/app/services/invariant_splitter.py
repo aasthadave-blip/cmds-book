@@ -1,0 +1,120 @@
+"""Convert P4 paragraph dicts into canonical Block dicts.
+
+P4 returns paragraphs with type values like "body", "heading", etc. The stored
+Block schema uses short codes: "p", "h3", "eq", "def", "kp", "fig", "list",
+"example". This module translates between the two.
+
+Consecutive list_item paragraphs are consolidated into a single ListBlock.
+
+Invariant split (INVARIANT_TYPES never sent to Claude during regeneration) is
+provided here too — see split_blocks() / merge_blocks_in_order().
+"""
+
+from __future__ import annotations
+
+from app.schemas.block import INVARIANT_TYPES
+
+_TYPE_MAP = {
+    "body": "p",
+    "heading": "h3",
+    "equation": "eq",
+    "definition": "def",
+    "key_point": "kp",
+    "figure": "fig",
+    "list_item": "list_item",  # handled specially (merged into ListBlock)
+    "table": "table",
+    "example": "example",
+}
+
+
+def paragraphs_to_blocks(paragraphs: list[dict]) -> list[dict]:
+    """Convert P4-style paragraphs into canonical Block dicts.
+
+    Unknown types are dropped (defensive). Consecutive list_items are
+    consolidated into a single ``{"t": "list", "items": [...]}`` block.
+    """
+    blocks: list[dict] = []
+    list_buffer: list[str] = []
+
+    def flush_list() -> None:
+        if list_buffer:
+            blocks.append({"t": "list", "items": list(list_buffer)})
+            list_buffer.clear()
+
+    for p in paragraphs or []:
+        ptype = (p.get("type") or p.get("t") or "").strip()
+        short = _TYPE_MAP.get(ptype)
+        if short is None:
+            continue
+
+        if short == "list_item":
+            content = (p.get("content") or p.get("c") or "").strip()
+            if content:
+                list_buffer.append(content)
+            continue
+
+        flush_list()
+
+        if short == "def":
+            term = (p.get("term") or "").strip()
+            c = (p.get("content") or p.get("c") or "").strip()
+            if not c:
+                continue
+            blocks.append({"t": "def", "term": term, "c": c})
+        elif short == "table":
+            blocks.append(
+                {
+                    "t": "table",
+                    "caption": (p.get("caption") or "").strip(),
+                    "headers": list(p.get("headers") or []),
+                    "rows": list(p.get("rows") or []),
+                }
+            )
+        elif short == "example":
+            blocks.append(
+                {
+                    "t": "example",
+                    "label": (p.get("label") or "").strip(),
+                    "prob": (p.get("prob") or "").strip(),
+                    "eqs": list(p.get("eqs") or []),
+                }
+            )
+        else:
+            c = (p.get("content") or p.get("c") or "").strip()
+            if c:
+                blocks.append({"t": short, "c": c})
+
+    flush_list()
+    return blocks
+
+
+def split_blocks(
+    blocks: list[dict],
+) -> tuple[list[dict], list[dict]]:
+    """Return (invariant_blocks, free_blocks) preserving order."""
+    invariant = [b for b in blocks if b.get("t") in INVARIANT_TYPES]
+    free = [b for b in blocks if b.get("t") not in INVARIANT_TYPES]
+    return invariant, free
+
+
+def merge_blocks_in_order(
+    original_blocks: list[dict],
+    regenerated_free_blocks: list[dict],
+) -> list[dict]:
+    """Walk original blocks; at each position copy invariants verbatim and
+    pull in order from ``regenerated_free_blocks`` for free slots. Leftover
+    regen blocks are appended at the end.
+    """
+    merged: list[dict] = []
+    free_idx = 0
+    for orig in original_blocks:
+        if orig.get("t") in INVARIANT_TYPES:
+            merged.append(dict(orig))
+        else:
+            if free_idx < len(regenerated_free_blocks):
+                merged.append(regenerated_free_blocks[free_idx])
+                free_idx += 1
+    while free_idx < len(regenerated_free_blocks):
+        merged.append(regenerated_free_blocks[free_idx])
+        free_idx += 1
+    return merged

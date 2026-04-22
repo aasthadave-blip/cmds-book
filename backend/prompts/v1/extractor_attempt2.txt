@@ -1,0 +1,5 @@
+
+
+PREVIOUS ATTEMPT FAILED QC. Fix ONLY these specific problems:
+{formatted_qc_issues}
+Everything else that passed QC — do not change it.
