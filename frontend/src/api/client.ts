@@ -164,10 +164,15 @@ export const api = {
       `/api/books/${bookId}/re-extract`,
       { method: "POST" },
     ),
-  regenerate: (bookId: UUID, params: RegenParams) =>
+  regenerate: (bookId: UUID, params: RegenParams, sectionIds?: string[] | null) =>
     req<{ book_id: UUID; job_id: UUID; regen_id: UUID; status: string }>(
       `/api/books/${bookId}/regenerate`,
-      { method: "POST", body: JSON.stringify(params) },
+      {
+        method: "POST",
+        body: JSON.stringify(
+          sectionIds && sectionIds.length > 0 ? { ...params, section_ids: sectionIds } : params,
+        ),
+      },
     ),
   listRegenerations: (bookId: UUID) => req<Regeneration[]>(`/api/books/${bookId}/regenerations`),
   getRegeneration: (id: UUID) => req<Regeneration>(`/api/regenerations/${id}`),
@@ -194,6 +199,15 @@ export const api = {
     const a = document.createElement("a");
     const qs = regenId ? `?regen_id=${regenId}` : "";
     a.href = `${API_BASE}/api/books/${bookId}/export/json${qs}`;
+    a.download = "";
+    document.body.appendChild(a);
+    a.click();
+    a.remove();
+  },
+  exportDocx: (bookId: UUID, regenId?: UUID | null) => {
+    const a = document.createElement("a");
+    const qs = regenId ? `?regen_id=${regenId}` : "";
+    a.href = `${API_BASE}/api/books/${bookId}/export/docx${qs}`;
     a.download = "";
     document.body.appendChild(a);
     a.click();

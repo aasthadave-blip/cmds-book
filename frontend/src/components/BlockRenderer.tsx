@@ -1,5 +1,11 @@
 import type { Block } from "../api/client";
 
+// Strip leading "1. ", "2) ", "(3) " etc. so we don't double up the marker
+// when the <ol> auto-numbers the item. Also handles bare dashes and bullets.
+function stripLeadingNumber(text: string): string {
+  return text.replace(/^\s*(?:\(\s*\d+\s*\)|\d+[.)])\s+/, "").replace(/^\s*[-•]\s+/, "");
+}
+
 export function BlockRenderer({ blocks }: { blocks: Block[] }) {
   return (
     <div>
@@ -60,7 +66,7 @@ function BlockView({ block }: { block: Block }) {
         <div className="blk">
           <ol className="blkul">
             {block.items.map((it, i) => (
-              <li key={i}>{it}</li>
+              <li key={i}>{stripLeadingNumber(it)}</li>
             ))}
           </ol>
         </div>

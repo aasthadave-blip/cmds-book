@@ -23,16 +23,49 @@ router = APIRouter(tags=["regenerations"])
 @router.post("/api/books/{book_id}/regenerate", response_model=BookUploadResponse)
 async def regenerate_book(
     book_id: UUID,
-    params: RegenParams = Body(...),
+    body: dict[str, Any] = Body(...),
     session: AsyncSession = Depends(get_session),
 ) -> BookUploadResponse:
+    """Kick off a regeneration.
+
+    Body shape:
+        {...RegenParams fields..., "section_ids": ["1.1", "1.2"] | null}
+
+    If ``section_ids`` is omitted or null, every leaf section of the book
+    is regenerated. If provided, only those sections are regenerated — the
+    rest are left absent from ``blocks_by_section``.
+    """
     book = await session.get(Book, book_id)
     if book is None:
         raise HTTPException(404, detail="Book not found")
 
+    # Split body: RegenParams fields + optional section_ids
+    section_ids_raw = body.pop("section_ids", None)
+    try:
+        params = RegenParams(**body)
+    except Exception as e:
+        raise HTTPException(422, detail=f"Invalid regen params: {e}") from e
+
+    section_ids: list[str] | None = None
+    if section_ids_raw is not None:
+        if not isinstance(section_ids_raw, list) or not all(
+            isinstance(s, str) for s in section_ids_raw
+        ):
+            raise HTTPException(422, detail="section_ids must be a list of strings")
+        # Empty list = nothing selected → reject (avoids creating empty regen)
+        if not section_ids_raw:
+            raise HTTPException(400, detail="section_ids is empty — select at least one section")
+        section_ids = list(section_ids_raw)
+
+    # Stash the section selection on the regen row so startup recovery
+    # after a backend crash can restart with the same scope.
+    params_payload = params.model_dump()
+    if section_ids is not None:
+        params_payload["_section_ids"] = list(section_ids)
+
     regen = Regeneration(
         book_id=book.id,
-        params=params.model_dump(),
+        params=params_payload,
         blocks_by_section={},
         qc_drift=None,
     )
@@ -57,7 +90,8 @@ async def regenerate_book(
         str(book.id),
         str(job.id),
         str(regen.id),
-        params.model_dump(),
+        params.model_dump(),  # pure RegenParams — no _section_ids leak into the worker's RegenParams(**)
+        section_ids,
     )
 
     return BookUploadResponse(book_id=book.id, job_id=job.id, regen_id=regen.id, status="regenerating")

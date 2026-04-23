@@ -1,11 +1,29 @@
-import { useState } from "react";
+import { useMemo, useState } from "react";
 import { useBook, useSections, useRegenerate, useRegeneration, useJob } from "../api/hooks";
-import type { RegenParams, Block, UUID } from "../api/client";
+import type { RegenParams, Block, UUID, BookSchema, SchemaSection } from "../api/client";
 import { api } from "../api/client";
 import { useUI } from "../stores/ui";
 import { JobProgress } from "../components/JobProgress";
 import { BlockRenderer } from "../components/BlockRenderer";
 import { RegenReviewPage } from "./RegenReviewPage";
+
+// Walk the schema and collect leaf sections in document order.
+// A leaf = section with no non-excluded subsections. These are the units
+// the backend actually regenerates (containers are skipped server-side).
+function collectLeafSections(schema: BookSchema | null | undefined): SchemaSection[] {
+  if (!schema) return [];
+  const out: SchemaSection[] = [];
+  const walk = (nodes: SchemaSection[]) => {
+    for (const n of nodes) {
+      if (n.type === "excluded") continue;
+      const liveKids = (n.subsections || []).filter((c) => c.type !== "excluded");
+      if (liveKids.length === 0) out.push(n);
+      walk(n.subsections || []);
+    }
+  };
+  walk(schema.sections || []);
+  return out;
+}
 
 const DEFAULT: RegenParams = {
   intensity: "moderate",
@@ -70,8 +88,13 @@ export function RegenPage() {
   const [regenId, setRegenId] = useState<string | null>(null);
   const [showResults, setShowResults] = useState(false);
   const [showReview, setShowReview] = useState(false);
+  // section_ids to regenerate. null = "all leaves" (backend default).
+  // Set<string> = explicit user selection.
+  const [selectedSectionIds, setSelectedSectionIds] = useState<Set<string> | null>(null);
   const regen = useRegenerate();
   const { data: job } = useJob(jobId);
+
+  const leafSections = useMemo(() => collectLeafSections(book?.schema_), [book?.schema_]);
 
   if (!book) {
     return (
@@ -94,13 +117,47 @@ export function RegenPage() {
   const jobDone = job?.status === "succeeded";
   const jobFailed = job?.status === "failed";
 
+  // How many leaves would actually be regenerated given the current selection.
+  // null = "all leaves" (backend default). Empty Set = nothing selected (disable submit).
+  const effectiveCount =
+    selectedSectionIds === null ? leafSections.length : selectedSectionIds.size;
+  const nothingSelected = selectedSectionIds !== null && selectedSectionIds.size === 0;
+
+  function toggleSection(id: string) {
+    setSelectedSectionIds((prev) => {
+      // First interaction: seed with "all selected" then toggle off this one.
+      const base = prev ?? new Set(leafSections.map((s) => s.id));
+      const next = new Set(base);
+      if (next.has(id)) next.delete(id);
+      else next.add(id);
+      return next;
+    });
+  }
+
+  function selectAll() {
+    setSelectedSectionIds(null); // null = all (backend default)
+  }
+
+  function selectNone() {
+    setSelectedSectionIds(new Set());
+  }
+
   async function onSubmit(e: React.FormEvent) {
     e.preventDefault();
     if (!selectedBookId) return;
+    if (nothingSelected) return;
     setShowResults(false);
     setShowReview(false);
     setRegenId(null);
-    const res = await regen.mutateAsync({ bookId: selectedBookId, params: p });
+    // null = regenerate all leaves (backend default).
+    // Non-empty Set = only those sections.
+    const sectionIds =
+      selectedSectionIds === null ? null : Array.from(selectedSectionIds);
+    const res = await regen.mutateAsync({
+      bookId: selectedBookId,
+      params: p,
+      sectionIds,
+    });
     setJobId(res.job_id);
     setRegenId(res.regen_id ?? null);
   }
@@ -144,6 +201,7 @@ export function RegenPage() {
           <>
             <button className="btn bg" onClick={() => api.exportMarkdown(selectedBookId, regenId)} title="Export regenerated as Markdown">⬇ .md</button>
             <button className="btn bg" onClick={() => api.exportJson(selectedBookId, regenId)} title="Export regenerated as JSON">⬇ .json</button>
+            <button className="btn bg" onClick={() => api.exportDocx(selectedBookId, regenId)} title="Export regenerated as Word (.docx) — native equations and numbered lists">⬇ .docx</button>
           </>
         )}
         {showResults && (
@@ -189,9 +247,62 @@ export function RegenPage() {
                   <textarea className="inp" value={p.custom_instructions ?? ""} onChange={(e) => setP({ ...p, custom_instructions: e.target.value || null })} rows={3} placeholder="e.g. Emphasise real-world applications, use SI units only" />
                 </div>
 
-                <div style={{ display: "flex", gap: 9 }}>
-                  <button type="submit" className="btn bp" disabled={regen.isPending}>
-                    {regen.isPending ? "Starting…" : "✨ Start regeneration"}
+                {leafSections.length > 0 && (
+                  <div className="card">
+                    <div style={{ display: "flex", alignItems: "center", justifyContent: "space-between", marginBottom: 8 }}>
+                      <div className="clbl" style={{ margin: 0 }}>
+                        Sections to regenerate · {effectiveCount} of {leafSections.length}
+                      </div>
+                      <div style={{ display: "flex", gap: 6 }}>
+                        <button type="button" className="btn bg" style={{ padding: "3px 10px", fontSize: "0.72rem" }} onClick={selectAll}>
+                          All
+                        </button>
+                        <button type="button" className="btn bg" style={{ padding: "3px 10px", fontSize: "0.72rem" }} onClick={selectNone}>
+                          None
+                        </button>
+                      </div>
+                    </div>
+                    <div style={{ maxHeight: 260, overflowY: "auto", border: "1px solid var(--border)", borderRadius: 7, padding: 6 }}>
+                      {leafSections.map((s) => {
+                        const effectiveSelected =
+                          selectedSectionIds === null || selectedSectionIds.has(s.id);
+                        return (
+                          <label
+                            key={s.id}
+                            style={{
+                              display: "flex", alignItems: "center", gap: 8,
+                              padding: "4px 8px", borderRadius: 5, cursor: "pointer",
+                              fontSize: "0.78rem", color: "var(--text2)",
+                            }}
+                          >
+                            <input
+                              type="checkbox"
+                              checked={effectiveSelected}
+                              onChange={() => toggleSection(s.id)}
+                            />
+                            <span style={{ fontFamily: "var(--mono)", color: "var(--text3)", fontSize: "0.72rem", minWidth: 40 }}>
+                              {s.id}
+                            </span>
+                            <span style={{ overflow: "hidden", textOverflow: "ellipsis", whiteSpace: "nowrap" }}>
+                              {s.title}
+                            </span>
+                          </label>
+                        );
+                      })}
+                    </div>
+                    {nothingSelected && (
+                      <div style={{ marginTop: 6, fontSize: "0.72rem", color: "var(--red)" }}>
+                        Select at least one section to regenerate.
+                      </div>
+                    )}
+                  </div>
+                )}
+
+                <div style={{ display: "flex", gap: 9, alignItems: "center" }}>
+                  <button type="submit" className="btn bp" disabled={regen.isPending || nothingSelected}>
+                    {regen.isPending
+                      ? "Starting…"
+                      : `✨ Start regeneration${effectiveCount !== leafSections.length ? ` (${effectiveCount} section${effectiveCount === 1 ? "" : "s"})` : ""}`}
                   </button>
                 </div>
               </form>

@@ -519,9 +519,22 @@ def re_extract_section_task(self, section_id: str, job_id: str) -> dict:
 
 @celery_app.task(name="regenerate_book", bind=True)
 def regenerate_book_task(
-    self, book_id: str, job_id: str, regeneration_id: str, params: dict
+    self,
+    book_id: str,
+    job_id: str,
+    regeneration_id: str,
+    params: dict,
+    section_ids: list[str] | None = None,
 ) -> dict:
-    """Run P5 regeneration across all sections with invariant split + post-regen QC."""
+    """Run P5 regeneration across sections with invariant split + post-regen QC.
+
+    If ``section_ids`` is None → regenerate every leaf section in the book.
+    If ``section_ids`` is provided → regenerate only those sections.
+    Container sections (any schema section with non-excluded subsections) are
+    always skipped: their content is fully covered by their children, so
+    regenerating them would duplicate every paragraph and waste a slow,
+    flaky high-token Gemini call.
+    """
     book_uuid = UUID(book_id)
     job_uuid = UUID(job_id)
     regen_uuid = UUID(regeneration_id)
@@ -547,16 +560,48 @@ def regenerate_book_task(
             )
             return {"ok": False, "reason": "regen_row_missing"}
 
-        sections = session.execute(
+        # Build container-section set from schema — these are skipped always.
+        container_ids: set[str] = set()
+        book_row = session.get(Book, book_uuid)
+        if book_row is not None and book_row.schema:
+            try:
+                from app.schemas.analyser import BookSchema as _BookSchema
+                schema_obj = _BookSchema(**book_row.schema)
+
+                def _walk(nodes):
+                    for n in nodes:
+                        if any(c.type != "excluded" for c in (n.subsections or [])):
+                            container_ids.add(n.id)
+                        _walk(n.subsections or [])
+
+                _walk(schema_obj.sections)
+            except Exception as e:
+                logger.warning("Could not parse schema to find containers: %s", e)
+
+        all_sections = session.execute(
             select(Section).where(Section.book_id == book_uuid).order_by(Section.section_id)
         ).scalars().all()
+
+        # Always drop container sections from the regen set
+        sections = [s for s in all_sections if s.section_id not in container_ids]
+
+        # If the caller specified section_ids, further filter to those
+        if section_ids is not None:
+            wanted = set(section_ids)
+            unknown = wanted - {s.section_id for s in sections}
+            if unknown:
+                logger.warning(
+                    "regenerate_book_task: ignoring unknown/container section_ids: %s",
+                    sorted(unknown),
+                )
+            sections = [s for s in sections if s.section_id in wanted]
 
         if not sections:
             _update_job(
                 session,
                 job_uuid,
                 status="failed",
-                error="No sections to regenerate",
+                error="No sections to regenerate (after container + selection filter)",
                 finished_at=datetime.utcnow(),
             )
             return {"ok": False, "reason": "no_sections"}
@@ -670,9 +715,13 @@ def _re_extract_section(section_id: str, job_id: str) -> dict:
 
 
 def _regenerate_book(
-    book_id: str, job_id: str, regeneration_id: str, params: dict
+    book_id: str,
+    job_id: str,
+    regeneration_id: str,
+    params: dict,
+    section_ids: list[str] | None = None,
 ) -> dict:
-    return regenerate_book_task(None, book_id, job_id, regeneration_id, params)  # type: ignore[arg-type]
+    return regenerate_book_task(None, book_id, job_id, regeneration_id, params, section_ids)  # type: ignore[arg-type]
 
 
 register_task("analyse_book", _analyse_book)

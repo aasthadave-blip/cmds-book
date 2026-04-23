@@ -33,6 +33,8 @@ dependencies = [
     "python-json-logger>=2.0.7",
     "orjson>=3.10.0",
     "google-genai>=1.0.0",
+    # Word (.docx) export — bundles pandoc binary, preserves LaTeX as OMML equations
+    "pypandoc-binary>=1.13",
 ]
 
 [project.optional-dependencies]

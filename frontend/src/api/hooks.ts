@@ -155,8 +155,15 @@ export function useReExtractBook() {
 export function useRegenerate() {
   const qc = useQueryClient();
   return useMutation({
-    mutationFn: ({ bookId, params }: { bookId: UUID; params: RegenParams }) =>
-      api.regenerate(bookId, params),
+    mutationFn: ({
+      bookId,
+      params,
+      sectionIds,
+    }: {
+      bookId: UUID;
+      params: RegenParams;
+      sectionIds?: string[] | null;
+    }) => api.regenerate(bookId, params, sectionIds),
     onSuccess: (_data, vars) => invalidateBook(qc, vars.bookId),
   });
 }

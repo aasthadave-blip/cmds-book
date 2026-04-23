@@ -98,6 +98,9 @@ export function ReaderPage() {
             <button className="btn bg" onClick={() => api.exportJson(selectedBookId, selectedRegenId)} title={isRegenView ? "Export regenerated sections as JSON" : "Export original sections as JSON"}>
               ⬇ .json
             </button>
+            <button className="btn bg" onClick={() => api.exportDocx(selectedBookId, selectedRegenId)} title={isRegenView ? "Export regenerated sections as Word (.docx) — equations preserved as native Word math" : "Export original sections as Word (.docx) — equations preserved as native Word math"}>
+              ⬇ .docx
+            </button>
           </>
         )}
         {selectedBookId && !isRegenView && (

@@ -3,7 +3,11 @@
 from __future__ import annotations
 
 import json
+import os
 import re
+import shutil
+import tempfile
+from pathlib import Path
 from typing import Any
 from uuid import UUID
 
@@ -23,6 +27,124 @@ from app.schemas.analyser import BookSchema
 from app.schemas.book import BookOut, BookUploadResponse
 
 router = APIRouter(prefix="/api/books", tags=["books"])
+
+
+# ─────────────────────────────────────────────────────────────────────
+# Shared markdown builder (used by /export/markdown and /export/docx)
+# ─────────────────────────────────────────────────────────────────────
+
+_LEADING_NUM_RE = re.compile(r"^\s*(?:\(\s*\d+\s*\)|\d+[.)])\s+")
+_HEADING_NORM_RE = re.compile(r"\s+")
+
+
+def _strip_leading_number(s: str) -> str:
+    """Strip baked-in ``1. ``/``2) ``/``(3) `` prefixes from list items."""
+    return _LEADING_NUM_RE.sub("", s).strip()
+
+
+def _norm_heading(s: str) -> str:
+    """Lowercase + collapse whitespace + strip punctuation for heading compare."""
+    s = _HEADING_NORM_RE.sub(" ", (s or "").strip().lower())
+    return s.strip(" .:;—-")
+
+
+def _build_markdown(
+    book: Book,
+    sections: list[Section],
+    regen_blocks: dict[str, list],
+    *,
+    numbered_lists: bool = False,
+) -> str:
+    """Render extraction/regen blocks as Markdown.
+
+    numbered_lists=True emits ``1. ``/``2. `` items so pandoc → docx produces
+    a native numbered list. numbered_lists=False keeps the plain ``-`` bullets
+    used by the existing .md download.
+    """
+    lines: list[str] = [f"# {book.title}", ""]
+    for sec in sections:
+        level = sec.level or 2
+        hashes = "#" * min(level + 1, 6)
+        lines.append(f"{hashes} {sec.section_id} {sec.title}")
+        lines.append("")
+        section_title_norm = _norm_heading(sec.title or "")
+        blocks_to_render = regen_blocks.get(sec.section_id) if regen_blocks else None
+        for block in (blocks_to_render if blocks_to_render is not None else sec.blocks or []):
+            t = block.get("t")
+            if t == "p":
+                lines.append(block.get("c", ""))
+                lines.append("")
+            elif t == "h3":
+                h_text = block.get("c", "")
+                # Skip h3 blocks that simply repeat the section title — the
+                # parent section heading already renders that text.
+                if section_title_norm and _norm_heading(h_text) == section_title_norm:
+                    continue
+                lines.append(f"### {h_text}")
+                lines.append("")
+            elif t == "eq":
+                lines.append("$$")
+                lines.append(block.get("c", ""))
+                lines.append("$$")
+                lines.append("")
+            elif t == "def":
+                lines.append(f"**{block.get('term', 'Definition')}:** {block.get('c', '')}")
+                lines.append("")
+            elif t == "kp":
+                lines.append(f"> **Key Point:** {block.get('c', '')}")
+                lines.append("")
+            elif t == "fig":
+                lines.append(f"*[Figure: {block.get('c', '')}]*")
+                lines.append("")
+            elif t == "list":
+                items = block.get("items", []) or []
+                if numbered_lists:
+                    for idx, item in enumerate(items, 1):
+                        lines.append(f"{idx}. {_strip_leading_number(str(item))}")
+                else:
+                    for item in items:
+                        lines.append(f"- {item}")
+                lines.append("")
+            elif t == "table":
+                caption = block.get("caption", "")
+                if caption:
+                    lines.append(f"*{caption}*")
+                headers = block.get("headers", [])
+                rows = block.get("rows", [])
+                if headers:
+                    lines.append("| " + " | ".join(headers) + " |")
+                    lines.append("| " + " | ".join(["---"] * len(headers)) + " |")
+                for row in rows:
+                    lines.append("| " + " | ".join(str(c) for c in row) + " |")
+                lines.append("")
+            elif t == "example":
+                lines.append(f"**Example — {block.get('label', '')}:** {block.get('prob', '')}")
+                for eq in block.get("eqs", []):
+                    lines.append(f"$$\n{eq}\n$$")
+                lines.append("")
+    return "\n".join(lines)
+
+
+def _ensure_pandoc_on_path() -> str:
+    """Locate the pandoc binary for pypandoc. Returns the resolved path."""
+    found = shutil.which("pandoc")
+    if found:
+        return found
+    # Common install locations that may not be on the launchd PATH
+    candidates = [
+        Path.home() / ".local/bin/pandoc",
+        Path("/opt/homebrew/bin/pandoc"),
+        Path("/usr/local/bin/pandoc"),
+    ]
+    for c in candidates:
+        if c.is_file() and os.access(c, os.X_OK):
+            os.environ["PATH"] = f"{c.parent}:{os.environ.get('PATH', '')}"
+            os.environ.setdefault("PYPANDOC_PANDOC", str(c))
+            return str(c)
+    raise HTTPException(
+        500,
+        detail="Pandoc binary not found. Install pandoc or set PYPANDOC_PANDOC.",
+    )
 
 
 @router.post("", response_model=BookUploadResponse, status_code=status.HTTP_201_CREATED)
@@ -214,13 +336,11 @@ async def re_extract_book(
     return BookUploadResponse(book_id=book.id, job_id=job.id, status="extracting")
 
 
-@router.get("/{book_id}/export/markdown")
-async def export_book_markdown(
+async def _load_export_context(
     book_id: UUID,
-    regen_id: UUID | None = Query(default=None),
-    session: AsyncSession = Depends(get_session),
-) -> Response:
-    """Export sections as Markdown. Pass regen_id to export regenerated content."""
+    regen_id: UUID | None,
+    session: AsyncSession,
+) -> tuple[Book, list[Section], dict[str, list]]:
     book = await session.get(Book, book_id)
     if book is None:
         raise HTTPException(404, detail="Book not found")
@@ -232,73 +352,109 @@ async def export_book_markdown(
             regen_blocks = dict(regen.blocks_by_section or {})
 
     result = await session.execute(
-        select(Section)
-        .where(Section.book_id == book_id)
-        .order_by(Section.section_id)
+        select(Section).where(Section.book_id == book_id)
     )
-    sections = result.scalars().all()
+    sections_by_id = {s.section_id: s for s in result.scalars().all()}
+
+    # Order sections by the schema's hierarchical sequence (pre-order walk),
+    # not lexicographic section_id — otherwise "8.10" would sort before "8.2".
+    # Also: skip container sections that have non-excluded subsections — their
+    # content is fully represented by the child sections, including them would
+    # duplicate every paragraph in the export.
+    ordered: list[Section] = []
+    if book.schema:
+        try:
+            from app.services.chunk_builder import flatten_sections as _flatten
+            schema_obj = BookSchema(**book.schema)
+            seen: set[str] = set()
+            skipped_containers: set[str] = set()
+            for ss in _flatten(schema_obj):
+                has_live_children = any(
+                    c.type != "excluded" for c in (ss.subsections or [])
+                )
+                if has_live_children:
+                    skipped_containers.add(ss.id)
+                    continue  # children will carry this section's content
+                sec = sections_by_id.get(ss.id)
+                if sec is not None and ss.id not in seen:
+                    ordered.append(sec)
+                    seen.add(ss.id)
+            # Append any DB-only sections (defensive) at the end — but NOT the
+            # containers we deliberately skipped above.
+            for sid, sec in sections_by_id.items():
+                if sid not in seen and sid not in skipped_containers:
+                    ordered.append(sec)
+        except Exception:
+            ordered = list(sections_by_id.values())
+    else:
+        ordered = list(sections_by_id.values())
 
     # When exporting regenerated: only include sections that have regen blocks
     if regen_blocks:
-        sections = [s for s in sections if s.section_id in regen_blocks]
+        ordered = [s for s in ordered if s.section_id in regen_blocks]
+    return book, ordered, regen_blocks
 
-    lines: list[str] = [f"# {book.title}", ""]
-    for sec in sections:
-        level = sec.level or 2
-        hashes = "#" * min(level + 1, 6)
-        lines.append(f"{hashes} {sec.section_id} {sec.title}")
-        lines.append("")
-        blocks_to_render = regen_blocks.get(sec.section_id) if regen_blocks else None
-        for block in (blocks_to_render if blocks_to_render is not None else sec.blocks or []):
-            t = block.get("t")
-            if t == "p":
-                lines.append(block.get("c", ""))
-                lines.append("")
-            elif t == "h3":
-                lines.append(f"### {block.get('c', '')}")
-                lines.append("")
-            elif t == "eq":
-                lines.append("$$")
-                lines.append(block.get("c", ""))
-                lines.append("$$")
-                lines.append("")
-            elif t == "def":
-                lines.append(f"**{block.get('term', 'Definition')}:** {block.get('c', '')}")
-                lines.append("")
-            elif t == "kp":
-                lines.append(f"> **Key Point:** {block.get('c', '')}")
-                lines.append("")
-            elif t == "fig":
-                lines.append(f"*[Figure: {block.get('c', '')}]*")
-                lines.append("")
-            elif t == "list":
-                for item in block.get("items", []):
-                    lines.append(f"- {item}")
-                lines.append("")
-            elif t == "table":
-                caption = block.get("caption", "")
-                if caption:
-                    lines.append(f"*{caption}*")
-                headers = block.get("headers", [])
-                rows = block.get("rows", [])
-                if headers:
-                    lines.append("| " + " | ".join(headers) + " |")
-                    lines.append("| " + " | ".join(["---"] * len(headers)) + " |")
-                for row in rows:
-                    lines.append("| " + " | ".join(str(c) for c in row) + " |")
-                lines.append("")
-            elif t == "example":
-                lines.append(f"**Example — {block.get('label', '')}:** {block.get('prob', '')}")
-                for eq in block.get("eqs", []):
-                    lines.append(f"$$\n{eq}\n$$")
-                lines.append("")
 
-    content = "\n".join(lines)
+@router.get("/{book_id}/export/markdown")
+async def export_book_markdown(
+    book_id: UUID,
+    regen_id: UUID | None = Query(default=None),
+    session: AsyncSession = Depends(get_session),
+) -> Response:
+    """Export sections as Markdown. Pass regen_id to export regenerated content."""
+    book, sections, regen_blocks = await _load_export_context(book_id, regen_id, session)
+    content = _build_markdown(book, sections, regen_blocks, numbered_lists=False)
     safe_name = re.sub(r"[^\w-]+", "_", book.title).strip("_") or "extraction"
     return Response(
         content=content.encode("utf-8"),
         media_type="text/markdown; charset=utf-8",
         headers={"Content-Disposition": f'attachment; filename="{safe_name}.md"'},
+    )
+
+
+@router.get("/{book_id}/export/docx")
+async def export_book_docx(
+    book_id: UUID,
+    regen_id: UUID | None = Query(default=None),
+    session: AsyncSession = Depends(get_session),
+) -> Response:
+    """Export sections as a Word (.docx) document.
+
+    Conversion: internal blocks → Markdown (with native numbered lists and
+    ``$...$`` / ``$$...$$`` math) → pandoc → .docx. Pandoc converts LaTeX to
+    OMML so equations render as native Word equations (not images).
+    """
+    _ensure_pandoc_on_path()
+    # Lazy import so the backend still boots cleanly if pypandoc is missing
+    import pypandoc
+
+    book, sections, regen_blocks = await _load_export_context(book_id, regen_id, session)
+    markdown = _build_markdown(book, sections, regen_blocks, numbered_lists=True)
+
+    safe_name = re.sub(r"[^\w-]+", "_", book.title).strip("_") or "extraction"
+
+    # pandoc needs to write to a real file to produce binary output
+    with tempfile.NamedTemporaryFile(suffix=".docx", delete=False) as tmp:
+        tmp_path = tmp.name
+    try:
+        pypandoc.convert_text(
+            markdown,
+            to="docx",
+            format="markdown+tex_math_dollars+tex_math_double_backslash",
+            outputfile=tmp_path,
+            extra_args=["--standalone"],
+        )
+        data = Path(tmp_path).read_bytes()
+    finally:
+        try:
+            os.unlink(tmp_path)
+        except OSError:
+            pass
+
+    return Response(
+        content=data,
+        media_type="application/vnd.openxmlformats-officedocument.wordprocessingml.document",
+        headers={"Content-Disposition": f'attachment; filename="{safe_name}.docx"'},
     )
 
 

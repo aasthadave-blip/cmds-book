@@ -198,12 +198,18 @@ async def recover_orphaned_jobs() -> None:
                         continue
                     book.status = "regenerating"
                     session.commit()
+                    # Extract the stashed section selection (if the original
+                    # request targeted specific sections) so recovery reruns
+                    # with the same scope.
+                    saved_params = dict(regen.params or {})
+                    recovered_section_ids = saved_params.pop("_section_ids", None)
                     dispatch(
                         "regenerate_book",
                         str(book.id),
                         str(job.id),
                         str(regen.id),
-                        regen.params or {},
+                        saved_params,
+                        recovered_section_ids,
                     )
 
                 elif job.type == "extract_figures":

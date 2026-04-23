@@ -95,7 +95,7 @@ class Settings(BaseSettings):
 
     # Gemini — used for PDF extraction and regeneration
     GEMINI_API_KEY: str = ""
-    GEMINI_REGEN_MODEL: str = "gemini-2.5-flash"
+    GEMINI_REGEN_MODEL: str = "gemini-2.5-pro"
 
     # Multi-OCR (Sprint 4; empty by default)
     MATHPIX_APP_ID: str = ""

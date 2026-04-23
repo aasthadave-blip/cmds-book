@@ -726,13 +726,20 @@ body {
     font-style: italic;
   }
   .blkul {
-    padding-left: 18px;
+    padding-left: 28px;
+    list-style-type: decimal;
+    list-style-position: outside;
   }
   .blkul li {
     font-size: 0.86rem;
     line-height: 1.72;
     color: var(--text);
     padding: 1px 0;
+    display: list-item;
+  }
+  .blkul li::marker {
+    color: var(--text3);
+    font-weight: 600;
   }
   .blkex {
     background: var(--surface2);
