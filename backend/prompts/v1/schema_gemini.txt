@@ -115,7 +115,34 @@ Decision examples:
 
 Rule of thumb: contains teaching content → include. Contains only student assessment questions → exclude. "QUESTIONS" boxes between NCERT subsections are always exclude — they contain only numbered questions for students to answer, no explanatory content.
 
-## PASS 4 — ID Assignment
+## PASS 4 — Question Census
+
+For every section AND every excluded section, estimate `expected_question_count`:
+the number of question-like items printed in that section's pages.
+
+Count as a question:
+- Numbered exercises (1., 2., Q.3, Question 5)
+- MCQ stems (each numbered MCQ is one question, not one per option)
+- "Try It" / "Check Your Understanding" / "Activity" prompts
+- Worked examples that pose a problem ("Example 4: Find …")
+- Short-answer / long-answer / numerical prompts
+- Each numbered sub-part with its own number is a separate question;
+  (a)(b)(c) sub-parts under the same number count as ONE question
+
+Do NOT count:
+- Crosswords, word puzzles, fill-in-blank decorative panels
+- Hint boxes, "Did You Know", learning objectives, summaries
+- Standalone answer keys
+- Headings or section titles
+
+If a section has no questions at all (pure theory), set `expected_question_count: 0`.
+Be conservative — under-count rather than guess. Skim the pages once just for
+this estimate; do not re-OCR every word.
+
+End-of-chapter "Exercises" / "Practice Questions" blocks live in `excluded_sections`
+and almost always have a non-zero count. Do not leave them at 0 by default.
+
+## PASS 5 — ID Assignment
 
 For numbered sections, the ID is the section number:
 - "Chapter 8" → id: "8"
@@ -150,6 +177,7 @@ Return valid JSON only. No markdown fences. No explanation before or after.
       "page_end": 19,
       "content_types": ["theory"],
       "is_numbered": true,
+      "expected_question_count": 0,
       "subsections": [
         {
           "id": "intro",
@@ -160,6 +188,7 @@ Return valid JSON only. No markdown fences. No explanation before or after.
           "page_end": 3,
           "content_types": ["theory"],
           "is_numbered": false,
+          "expected_question_count": 0,
           "subsections": []
         },
         {
@@ -171,6 +200,7 @@ Return valid JSON only. No markdown fences. No explanation before or after.
           "page_end": 3,
           "content_types": ["theory"],
           "is_numbered": true,
+          "expected_question_count": 2,
           "subsections": []
         },
         {
@@ -182,6 +212,7 @@ Return valid JSON only. No markdown fences. No explanation before or after.
           "page_end": 7,
           "content_types": ["theory", "figures"],
           "is_numbered": true,
+          "expected_question_count": 0,
           "subsections": [
             {
               "id": "8.4.1",
@@ -192,6 +223,7 @@ Return valid JSON only. No markdown fences. No explanation before or after.
               "page_end": 6,
               "content_types": ["theory"],
               "is_numbered": true,
+              "expected_question_count": 0,
               "subsections": []
             }
           ]
@@ -204,7 +236,8 @@ Return valid JSON only. No markdown fences. No explanation before or after.
       "title": "Exercises",
       "page_start": 19,
       "page_end": 19,
-      "reason": "End-of-chapter practice questions for students"
+      "reason": "End-of-chapter practice questions for students",
+      "expected_question_count": 14
     }
   ],
   "extraction_notes": "Any structural quirks worth noting"
@@ -217,6 +250,7 @@ Before returning, verify:
 - Did you scan every page of the PDF?
 - Did you capture numbered and unnumbered headings?
 - Are all "X.Y.Z" subsections nested inside "X.Y" parents?
+- Does every section AND every excluded section have `expected_question_count`?
 - Did you include introductions, summaries, biographical features?
 - Did you exclude only assessment sections (exercises, MCQs, answer keys)?
 - Is the JSON valid (no trailing commas, all arrays present)?

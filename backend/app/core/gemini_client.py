@@ -93,14 +93,14 @@ def _generate_sync(
 
     config = types.GenerateContentConfig(
         system_instruction=system,
-        temperature=0.7,
+        temperature=0.2,
         max_output_tokens=max_tokens,
     )
     # gemini-2.5-flash requires thinking to be explicitly disabled for non-thinking mode
     if "2.5-flash" in model:
         config = types.GenerateContentConfig(
             system_instruction=system,
-            temperature=0.7,
+            temperature=0.2,
             max_output_tokens=max_tokens,
             thinking_config=types.ThinkingConfig(thinking_budget=0),
         )

@@ -47,6 +47,12 @@ def _update_job(session: Session, job_id: UUID, **fields) -> None:
         return
     for k, v in fields.items():
         setattr(job, k, v)
+    # Bump heartbeat on every progress/message update so the watchdog measures
+    # time since real progress, not since job start. Without this, any run
+    # longer than the watchdog's stale window (5 min) gets killed regardless
+    # of how much work is actually happening.
+    from datetime import datetime, timezone
+    job.last_heartbeat_at = datetime.now(timezone.utc)
     session.commit()
 
 

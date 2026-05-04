@@ -2,26 +2,38 @@ import { useState, useMemo } from "react";
 import {
   useApprove,
   useBook,
+  useCreateQuestionBank,
   useJob,
   usePatchSchema,
+  useQuestionBanks,
+  useQuestionStructure,
   useReExtractSection,
   useSections,
 } from "../api/hooks";
-import type { BookSchema, SchemaSection, Section } from "../api/client";
+import type {
+  BookSchema,
+  QuestionStructureNode,
+  SchemaSection,
+  Section,
+} from "../api/client";
 import { api } from "../api/client";
 import { useUI } from "../stores/ui";
 import { JobProgress } from "../components/JobProgress";
 import { WizardRail, type RailStep } from "../components/WizardRail";
 
 export function SchemaPage() {
-  const { selectedBookId, setView } = useUI();
+  const { selectedBookId, setView, selectBank } = useUI();
   const { data: book } = useBook(selectedBookId);
   const patch = usePatchSchema();
   const approve = useApprove();
+  const createBank = useCreateQuestionBank();
+  const { data: banks } = useQuestionBanks(selectedBookId);
   const [schema, setSchema] = useState<BookSchema | null>(null);
   const [jobId, setJobId] = useState<string | null>(null);
   const [copied, setCopied] = useState(false);
+  const [lens, setLens] = useState<"theory" | "questions">("theory");
   const { data: job } = useJob(jobId);
+  const latestBank = banks?.[0] ?? null;
 
   const rail: RailStep = jobId
     ? job?.status === "succeeded"
@@ -200,6 +212,45 @@ export function SchemaPage() {
           <div className="card">
             <div className="clbl">
               Content schema
+              <div
+                style={{
+                  display: "flex",
+                  gap: 2,
+                  marginLeft: 10,
+                  padding: 2,
+                  background: "var(--surface2)",
+                  borderRadius: 6,
+                }}
+              >
+                <button
+                  type="button"
+                  onClick={() => setLens("theory")}
+                  className={lens === "theory" ? "btn bp" : "btn bg"}
+                  style={{
+                    fontSize: "0.66rem",
+                    padding: "2px 8px",
+                    border: "none",
+                    background: lens === "theory" ? "var(--accent)" : "transparent",
+                    color: lens === "theory" ? "white" : "var(--text3)",
+                  }}
+                >
+                  📄 Theory
+                </button>
+                <button
+                  type="button"
+                  onClick={() => setLens("questions")}
+                  className={lens === "questions" ? "btn bp" : "btn bg"}
+                  style={{
+                    fontSize: "0.66rem",
+                    padding: "2px 8px",
+                    border: "none",
+                    background: lens === "questions" ? "var(--purple)" : "transparent",
+                    color: lens === "questions" ? "white" : "var(--text3)",
+                  }}
+                >
+                  ❓ Questions
+                </button>
+              </div>
               <span
                 style={{
                   fontFamily: "var(--mono)",
@@ -231,24 +282,30 @@ export function SchemaPage() {
                 ⬇ Download
               </button>
             </div>
-            <div className="sbox">
-              <SchemaTreeView
-                sections={current.sections}
-                onRename={(id, title) => updateSection(id, (s) => ({ ...s, title }))}
-                onChangeType={(id, type) =>
-                  updateSection(id, (s) => ({ ...s, type }))
-                }
-                onDelete={deleteSection}
-              />
-            </div>
-            <button
-              type="button"
-              className="btn bg"
-              onClick={addRootSection}
-              style={{ fontSize: "0.7rem", padding: "4px 10px" }}
-            >
-              + Add section
-            </button>
+            {lens === "theory" ? (
+              <>
+                <div className="sbox">
+                  <SchemaTreeView
+                    sections={current.sections}
+                    onRename={(id, title) => updateSection(id, (s) => ({ ...s, title }))}
+                    onChangeType={(id, type) =>
+                      updateSection(id, (s) => ({ ...s, type }))
+                    }
+                    onDelete={deleteSection}
+                  />
+                </div>
+                <button
+                  type="button"
+                  className="btn bg"
+                  onClick={addRootSection}
+                  style={{ fontSize: "0.7rem", padding: "4px 10px" }}
+                >
+                  + Add section
+                </button>
+              </>
+            ) : (
+              <QuestionSchemaView bookId={selectedBookId} />
+            )}
             {current.exclusion_summary.length > 0 && (
               <div
                 style={{
@@ -264,13 +321,34 @@ export function SchemaPage() {
           </div>
 
           {!jobId && (
-            <div style={{ display: "flex", gap: 9 }}>
+            <div style={{ display: "flex", gap: 9, flexWrap: "wrap" }}>
               <button
                 className="btn bp"
                 onClick={onApprove}
                 disabled={approve.isPending || patch.isPending}
+                title="Run theory extraction on all non-excluded sections"
               >
-                ✓ Approve & Extract
+                ✓ Approve & Extract Theory
+              </button>
+              <button
+                className="btn bg"
+                disabled={createBank.isPending || !selectedBookId}
+                title="OCR all questions/exercises from excluded blocks (independent of theory)"
+                onClick={() => {
+                  if (!selectedBookId) return;
+                  createBank.mutate(selectedBookId, {
+                    onSuccess: (res) => {
+                      selectBank(res.bank_id);
+                      setView("questions");
+                    },
+                  });
+                }}
+              >
+                {createBank.isPending
+                  ? "Starting…"
+                  : latestBank
+                    ? "❓ Re-run Question Extraction"
+                    : "❓ Extract Questions"}
               </button>
               <button className="btn bg" onClick={() => setView("upload")}>
                 Back
@@ -397,6 +475,131 @@ function SchemaTreeView({
         </div>
       ))}
     </>
+  );
+}
+
+function QuestionSchemaView({ bookId }: { bookId: string | null }) {
+  const { data, isLoading } = useQuestionStructure(bookId);
+
+  if (!bookId) return null;
+  if (isLoading) {
+    return (
+      <div className="sbox" style={{ color: "var(--text3)", fontSize: "0.72rem", padding: 10 }}>
+        Loading question structure…
+      </div>
+    );
+  }
+  if (!data || (data.sections.length === 0 && data.unlinked_excluded.length === 0)) {
+    return (
+      <div className="sbox" style={{ color: "var(--text3)", fontSize: "0.72rem", padding: 10 }}>
+        No excluded blocks detected — the analyser didn't find any question sections.
+      </div>
+    );
+  }
+  return (
+    <div className="sbox">
+      <div style={{ fontSize: "0.68rem", color: "var(--text3)", marginBottom: 8 }}>
+        {data.summary.total_sections} sections · {data.summary.linked_excluded} linked question blocks
+        {data.summary.unlinked_excluded > 0 && (
+          <span style={{ color: "var(--warn, #c80)" }}>
+            {" "}· {data.summary.unlinked_excluded} unlinked
+          </span>
+        )}
+      </div>
+      {data.sections.map((node) => (
+        <QSchemaNode key={node.id} node={node} depth={0} />
+      ))}
+      {data.unlinked_excluded.length > 0 && (
+        <div style={{ marginTop: 10 }}>
+          <div
+            style={{
+              fontSize: "0.65rem",
+              color: "var(--warn, #c80)",
+              fontWeight: 600,
+              marginBottom: 4,
+            }}
+          >
+            Unlinked excluded blocks
+          </div>
+          {data.unlinked_excluded.map((ex) => (
+            <div
+              key={`u-${ex.excluded_index}`}
+              style={{
+                paddingLeft: 10,
+                fontSize: "0.72rem",
+                color: "var(--purple)",
+              }}
+            >
+              ❓ {ex.title || `#${ex.excluded_index}`}
+              <span style={{ color: "var(--text3)", marginLeft: 6, fontSize: "0.66rem" }}>
+                p.{ex.page_start ?? "?"}–{ex.page_end ?? "?"}
+              </span>
+            </div>
+          ))}
+        </div>
+      )}
+    </div>
+  );
+}
+
+function QSchemaNode({ node, depth }: { node: QuestionStructureNode; depth: number }) {
+  return (
+    <div>
+      <div
+        style={{
+          display: "flex",
+          alignItems: "center",
+          gap: 6,
+          paddingLeft: depth * 12,
+          fontSize: depth === 0 ? "0.78rem" : "0.74rem",
+          fontWeight: depth === 0 ? 600 : 400,
+          color: depth === 0 ? "var(--text1)" : "var(--text2)",
+          padding: "2px 4px",
+        }}
+      >
+        <span>{node.type === "chapter" ? "📖" : "📄"}</span>
+        <span>§{node.id} {node.title}</span>
+        {node.question_count > 0 && (
+          <span
+            style={{
+              fontSize: "0.62rem",
+              color: "var(--text3)",
+              fontFamily: "var(--mono)",
+              marginLeft: "auto",
+            }}
+          >
+            {node.question_count} Q
+          </span>
+        )}
+      </div>
+      {node.excluded_blocks.map((ex) => {
+        const conf = Math.round(ex.link_confidence * 100);
+        return (
+          <div
+            key={`${node.id}-ex-${ex.excluded_index}`}
+            style={{
+              paddingLeft: (depth + 1) * 12,
+              fontSize: "0.72rem",
+              color: "var(--purple)",
+              padding: "1px 4px",
+              display: "flex",
+              alignItems: "center",
+              gap: 6,
+            }}
+            title={`${ex.link_method} · ${conf}%${ex.reason ? ` · ${ex.reason}` : ""}`}
+          >
+            <span>❓</span>
+            <span>{ex.title || `Questions #${ex.excluded_index}`}</span>
+            <span style={{ color: "var(--text3)", fontSize: "0.62rem", marginLeft: "auto" }}>
+              p.{ex.page_start ?? "?"}–{ex.page_end ?? "?"} · {conf}%
+            </span>
+          </div>
+        );
+      })}
+      {node.subsections.map((child) => (
+        <QSchemaNode key={child.id} node={child} depth={depth + 1} />
+      ))}
+    </div>
   );
 }
 

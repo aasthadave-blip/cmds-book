@@ -39,6 +39,10 @@ class SchemaSection(BaseModel):
     page_start: int | None = None
     page_end: int | None = None
     is_numbered: bool = True
+    # Expected question count for this section, populated by the schema LLM pass.
+    # Used by the v3 question worker as the ground-truth target for completeness
+    # validation. None means schema didn't populate (older books / fallback).
+    expected_question_count: int | None = None
 
     model_config = {"extra": "ignore"}
 
@@ -56,6 +60,10 @@ class ExcludedSection(BaseModel):
     page_end: int | None = None
     reason: str = ""
     is_numbered: bool = False
+    # End-of-chapter "Exercises" / "Practice Questions" blocks live here. The
+    # v3 question worker treats these as section-aligned units too — they get
+    # their own count target.
+    expected_question_count: int | None = None
 
     model_config = {"extra": "ignore"}
 

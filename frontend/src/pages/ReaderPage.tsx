@@ -106,11 +106,14 @@ export function ReaderPage() {
         {selectedBookId && !isRegenView && (
           <button
             className="btn bg"
-            onClick={() => reExtractBook.mutate(selectedBookId)}
+            onClick={() => {
+              if (!confirm("Re-extract ALL sections? This wipes every section's current content and re-runs Gemini on the whole book.")) return;
+              reExtractBook.mutate(selectedBookId);
+            }}
             disabled={reExtractBook.isPending}
-            title="Re-run extraction on all sections with the latest logic"
+            title="Re-run extraction on ALL sections — wipes current content for every section"
           >
-            {reExtractBook.isPending ? "Re-extracting..." : "↺ Re-extract"}
+            {reExtractBook.isPending ? "Re-extracting all..." : "↺ Re-extract all"}
           </button>
         )}
         <button className="btn bg" onClick={() => setView("regen")}>
@@ -139,14 +142,15 @@ export function ReaderPage() {
                   }
                   {!isRegenView && qcBadge && <span className={qcBadge.cls}>{qcBadge.label}</span>}
                   {!isRegenView && <span className="cvc">attempts: {String(section.attempts)}</span>}
-                  {!isRegenView && section.status === "failed" && (
+                  {!isRegenView && (
                     <button
                       onClick={() => reExtract.mutate(section.id)}
                       disabled={reExtract.isPending}
                       className="btn bg"
                       style={{ padding: "2px 8px", fontSize: "0.64rem" }}
+                      title="Re-run Gemini OCR on this section only — other sections are not touched"
                     >
-                      Re-extract
+                      {reExtract.isPending ? "Re-extracting…" : "↺ Re-extract"}
                     </button>
                   )}
                 </div>

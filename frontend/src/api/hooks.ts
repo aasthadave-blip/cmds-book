@@ -4,7 +4,13 @@ import {
   useQueryClient,
   type QueryClient,
 } from "@tanstack/react-query";
-import { api, type BookSchema, type RegenParams, type UUID } from "./client";
+import {
+  api,
+  type BookSchema,
+  type RegenParams,
+  type RegenerateQuestionsParams,
+  type UUID,
+} from "./client";
 
 export const qk = {
   books: () => ["books"] as const,
@@ -15,6 +21,13 @@ export const qk = {
   regen: (id: UUID) => ["regenerations", id] as const,
   providers: () => ["providers"] as const,
   providerKey: (name: string) => ["providers", name, "keys"] as const,
+  questionBanks: (bookId: UUID) => ["books", bookId, "question-banks"] as const,
+  questionBank: (id: UUID) => ["question-banks", id] as const,
+  questions: (bankId: UUID) => ["question-banks", bankId, "questions"] as const,
+  questionStructure: (bookId: UUID) => ["books", bookId, "question-structure"] as const,
+  questionRegens: (bookId: UUID) => ["books", bookId, "question-regenerations"] as const,
+  questionRegen: (id: UUID) => ["question-regenerations", id] as const,
+  regenQuestions: (id: UUID) => ["question-regenerations", id, "questions"] as const,
 };
 
 export function useBooks() {
@@ -186,6 +199,182 @@ export function useSaveRegeneration() {
       api.saveRegeneration(regenId, confirmedSectionIds),
     onSuccess: (_data, vars) => {
       void qc.invalidateQueries({ queryKey: qk.regen(vars.regenId) });
+    },
+  });
+}
+
+export function useQuestionBanks(bookId: UUID | null) {
+  return useQuery({
+    queryKey: qk.questionBanks(bookId ?? ""),
+    queryFn: () => api.listQuestionBanks(bookId!),
+    enabled: !!bookId,
+  });
+}
+
+export function useQuestionBank(bankId: UUID | null, opts?: { pollMs?: number }) {
+  return useQuery({
+    queryKey: qk.questionBank(bankId ?? ""),
+    queryFn: () => api.getQuestionBank(bankId!),
+    enabled: !!bankId,
+    refetchInterval: (query) => {
+      const bank = query.state.data as { status?: string } | undefined;
+      if (bank?.status === "ready" || bank?.status === "failed") return false;
+      return opts?.pollMs ?? 2000;
+    },
+  });
+}
+
+export function useQuestions(
+  bankId: UUID | null,
+  opts?: { bankStatus?: string; pollMs?: number },
+) {
+  return useQuery({
+    queryKey: qk.questions(bankId ?? ""),
+    queryFn: () => api.listQuestions(bankId!),
+    enabled: !!bankId,
+    refetchInterval: () => {
+      const s = opts?.bankStatus;
+      if (s === "ready" || s === "failed" || !s) return false;
+      return opts?.pollMs ?? 2000;
+    },
+  });
+}
+
+export function useQuestionStructure(
+  bookId: UUID | null,
+  opts?: { pollWhileExtracting?: boolean },
+) {
+  return useQuery({
+    queryKey: qk.questionStructure(bookId ?? ""),
+    queryFn: () => api.getQuestionStructure(bookId!),
+    enabled: !!bookId,
+    // Poll every 2s while the caller flags an active extraction so sidebar
+    // folder counts tick up block-by-block.
+    refetchInterval: opts?.pollWhileExtracting ? 2000 : false,
+  });
+}
+
+export function useCreateQuestionBank() {
+  const qc = useQueryClient();
+  return useMutation({
+    mutationFn: (bookId: UUID) => api.createQuestionBank(bookId),
+    onSuccess: (_data, bookId) => {
+      void qc.invalidateQueries({ queryKey: qk.questionBanks(bookId) });
+    },
+  });
+}
+
+export function useRetrySection() {
+  const qc = useQueryClient();
+  return useMutation({
+    mutationFn: ({ bankId, sectionRef }: { bankId: UUID; sectionRef: string }) =>
+      api.retrySection(bankId, sectionRef),
+    onSuccess: (_data, vars) => {
+      void qc.invalidateQueries({ queryKey: qk.questionBank(vars.bankId) });
+      void qc.invalidateQueries({ queryKey: qk.questions(vars.bankId) });
+    },
+  });
+}
+
+export function useReExtractBlock() {
+  const qc = useQueryClient();
+  return useMutation({
+    mutationFn: ({ bankId, blockIdx }: { bankId: UUID; blockIdx: number }) =>
+      api.reExtractBlock(bankId, blockIdx),
+    onSuccess: (_data, vars) => {
+      void qc.invalidateQueries({ queryKey: qk.questionBank(vars.bankId) });
+      void qc.invalidateQueries({ queryKey: qk.questions(vars.bankId) });
+    },
+  });
+}
+
+export function useDeleteQuestionBank() {
+  const qc = useQueryClient();
+  return useMutation({
+    mutationFn: ({ bankId }: { bankId: UUID; bookId: UUID }) =>
+      api.deleteQuestionBank(bankId),
+    onSuccess: (_data, vars) => {
+      void qc.invalidateQueries({ queryKey: qk.questionBanks(vars.bookId) });
+      void qc.invalidateQueries({ queryKey: qk.questionBank(vars.bankId) });
+    },
+  });
+}
+
+export function useQuestionRegenerations(bookId: UUID | null, opts?: { pollMs?: number }) {
+  return useQuery({
+    queryKey: qk.questionRegens(bookId ?? ""),
+    queryFn: () => api.listQuestionRegenerations(bookId!),
+    enabled: !!bookId,
+    refetchInterval: opts?.pollMs,
+  });
+}
+
+export function useQuestionRegen(regenId: UUID | null, opts?: { pollMs?: number }) {
+  return useQuery({
+    queryKey: qk.questionRegen(regenId ?? ""),
+    queryFn: () => api.getQuestionRegeneration(regenId!),
+    enabled: !!regenId,
+    refetchInterval: (query) => {
+      const r = query.state.data as { status?: string } | undefined;
+      if (r?.status === "ready" || r?.status === "failed" || r?.status === "saved") return false;
+      return opts?.pollMs ?? 2000;
+    },
+  });
+}
+
+export function useRegenQuestions(regenId: UUID | null, opts?: { pollMs?: number }) {
+  return useQuery({
+    queryKey: qk.regenQuestions(regenId ?? ""),
+    queryFn: () => api.listRegenQuestions(regenId!),
+    enabled: !!regenId,
+    refetchInterval: opts?.pollMs,
+  });
+}
+
+export function useStartQuestionRegeneration() {
+  const qc = useQueryClient();
+  return useMutation({
+    mutationFn: ({ bankId, params }: { bankId: UUID; params: RegenerateQuestionsParams }) =>
+      api.startQuestionRegeneration(bankId, params),
+    onSuccess: (_data, vars) => {
+      void qc.invalidateQueries({ queryKey: qk.questionBank(vars.bankId) });
+      void qc.invalidateQueries({ queryKey: ["books"] });
+    },
+  });
+}
+
+export function useDeleteQuestionRegeneration() {
+  const qc = useQueryClient();
+  return useMutation({
+    mutationFn: ({ regenId }: { regenId: UUID; bookId: UUID }) =>
+      api.deleteQuestionRegeneration(regenId),
+    onSuccess: (_data, vars) => {
+      void qc.invalidateQueries({ queryKey: qk.questionRegens(vars.bookId) });
+      void qc.invalidateQueries({ queryKey: qk.questionRegen(vars.regenId) });
+    },
+  });
+}
+
+export function useSaveQuestionRegeneration() {
+  const qc = useQueryClient();
+  return useMutation({
+    mutationFn: ({ regenId }: { regenId: UUID; bookId: UUID }) =>
+      api.saveQuestionRegeneration(regenId),
+    onSuccess: (_data, vars) => {
+      void qc.invalidateQueries({ queryKey: qk.questionRegens(vars.bookId) });
+      void qc.invalidateQueries({ queryKey: qk.questionRegen(vars.regenId) });
+    },
+  });
+}
+
+export function useBulkDeleteRegenQuestions() {
+  const qc = useQueryClient();
+  return useMutation({
+    mutationFn: ({ regenId, questionIds }: { regenId: UUID; questionIds: UUID[] }) =>
+      api.bulkDeleteRegenQuestions(regenId, questionIds),
+    onSuccess: (_data, vars) => {
+      void qc.invalidateQueries({ queryKey: qk.regenQuestions(vars.regenId) });
+      void qc.invalidateQueries({ queryKey: qk.questionRegen(vars.regenId) });
     },
   });
 }

@@ -26,3 +26,8 @@ class Job(Base):
     error: Mapped[str | None] = mapped_column(Text)
     started_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True))
     finished_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True))
+    # Updated by the worker heartbeat. The watchdog uses this to fail jobs
+    # whose worker has stopped responding (no progress for >5 min).
+    last_heartbeat_at: Mapped[datetime | None] = mapped_column(
+        DateTime(timezone=True), index=True
+    )

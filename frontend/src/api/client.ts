@@ -98,6 +98,210 @@ export interface Regeneration {
   created_at: string;
 }
 
+export interface ExtractionBlockStats {
+  excluded_block_index: number;
+  title: string;
+  page_start: number | null;
+  page_end: number | null;
+  section_ref: string | null;
+  link_method: string;
+  link_confidence: number;
+  identified: number;
+  extracted: number;
+  attempts: number;
+  missed: number;
+  status: "ok" | "partial" | "empty" | "failed";
+  failures: string[];
+}
+
+export interface ExtractionStats {
+  total_identified: number;
+  total_extracted: number;
+  missed: number;
+  blocks: ExtractionBlockStats[];
+  // v3-only (optional — present when worker_version === "v3")
+  worker_version?: "v2" | "v3";
+  totals?: {
+    expected_total: number;
+    extracted_total: number;
+    complete: number;
+    partial: number;
+    empty: number;
+    failed: number;
+  };
+  sections?: ExtractionSectionStats[];
+  dedup?: {
+    checked: number;
+    kept: number;
+    dropped: number;
+    groups: { fingerprint: string; kept_id: string; dropped_ids: string[] }[];
+  };
+}
+
+export interface ExtractionRejectedItem {
+  raw_text?: string;
+  _reject_reason?: string;
+  [k: string]: unknown;
+}
+
+export interface ExtractionSectionStats {
+  section_ref: string;
+  section_title: string;
+  kind: "section" | "excluded";
+  page_start: number | null;
+  page_end: number | null;
+  expected: number | null;
+  identified: number;
+  extracted: number;
+  rejected: number;
+  rejected_items: ExtractionRejectedItem[];
+  status: "complete" | "partial" | "empty" | "failed";
+  attempts: number;
+  error: string | null;
+}
+
+export interface QuestionBank {
+  id: UUID;
+  book_id: UUID;
+  title: string;
+  subject: string | null;
+  status: "pending" | "extracting" | "ready" | "failed";
+  question_count: number;
+  stats: ExtractionStats | null;
+  last_error: string | null;
+  created_at: string;
+  updated_at: string;
+  active_job_id?: UUID | null;
+  active_job?: {
+    id: UUID;
+    status: string;
+    progress: number | null;
+    message: string | null;
+  } | null;
+}
+
+export interface Question {
+  id: UUID;
+  section_ref: string | null;
+  section_title: string | null;
+  page_start: number | null;
+  page_end: number | null;
+  raw_text: string;
+  status: string;
+  // Phase 1 linking context
+  excluded_block_ref: string;
+  excluded_block_index: number | null;
+  link_method: string | null;
+  link_confidence: number | null;
+  // Stage 2 OCR metadata
+  question_number: string | null;
+  exercise_ref: string | null;
+  chapter_ref: string | null;
+  sub_part: string | null;
+  question_type: string | null;
+  has_options: boolean;
+  solution_text: string | null;
+  has_solution: boolean;
+  kind: string;
+}
+
+export type QuestionKind = "exercise" | "example" | "problem" | "try_it" | "review" | "mcq" | "other";
+
+export interface QuestionBankSectionGroup {
+  section_ref: string;
+  section_title: string;
+  questions: Question[];
+  by_kind: Partial<Record<QuestionKind, Question[]>>;
+  identified: number;
+  extracted: number;
+  missed: number;
+}
+
+export interface QuestionBankDetail {
+  bank_id: UUID;
+  book_id: UUID;
+  title: string;
+  status: QuestionBank["status"];
+  total_questions: number;
+  stats: ExtractionStats | null;
+  sections: QuestionBankSectionGroup[];
+}
+
+export interface QuestionStructureExcludedBlock {
+  title: string;
+  page_start: number | null;
+  page_end: number | null;
+  reason: string;
+  excluded_index: number;
+  excluded_block_ref: string;
+  link_method: string;
+  link_confidence: number;
+  section_ref: string | null;
+}
+
+export interface QuestionStructureNode {
+  id: string;
+  title: string;
+  level: number;
+  type: string;
+  page_start: number | null;
+  page_end: number | null;
+  question_count: number;
+  excluded_blocks: QuestionStructureExcludedBlock[];
+  subsections: QuestionStructureNode[];
+}
+
+export interface QuestionStructureResponse {
+  book_id: UUID;
+  document_title: string;
+  sections: QuestionStructureNode[];
+  unlinked_excluded: QuestionStructureExcludedBlock[];
+  summary: {
+    total_sections: number;
+    total_excluded: number;
+    linked_excluded: number;
+    unlinked_excluded: number;
+  };
+}
+
+export interface QuestionRegeneration {
+  id: UUID;
+  bank_id: UUID;
+  book_id: UUID;
+  source_regen_id: UUID | null;
+  label: string | null;
+  scope: "bank" | "sections";
+  section_refs: string[];
+  custom_instructions: string | null;
+  status: "pending" | "extracting" | "ready" | "failed" | "saved";
+  job_id: UUID | null;
+  question_count: number;
+  stats: ExtractionStats | null;
+  last_error: string | null;
+  created_at: string | null;
+  updated_at: string | null;
+  finished_at: string | null;
+}
+
+export interface QuestionRegenSectionGroup {
+  section_ref: string | null;
+  section_title: string | null;
+  questions: Question[];
+}
+
+export interface QuestionRegenQuestionsResponse {
+  regen: QuestionRegeneration;
+  sections: QuestionRegenSectionGroup[];
+}
+
+export interface RegenerateQuestionsParams {
+  scope: "bank" | "sections";
+  section_refs?: string[] | null;
+  custom_instructions?: string | null;
+  source_regen_id?: UUID | null;
+  label?: string | null;
+}
+
 export interface Provider {
   name: string;
   handles: string[];
@@ -214,6 +418,75 @@ export const api = {
     a.remove();
   },
   getJob: (id: UUID) => req<Job>(`/api/jobs/${id}`),
+  getQuestionStructure: (bookId: UUID) =>
+    req<QuestionStructureResponse>(`/api/books/${bookId}/question-structure`),
+  createQuestionBank: (bookId: UUID) =>
+    req<{ bank_id: UUID; job_id: UUID; status: string }>(
+      `/api/books/${bookId}/question-banks`,
+      { method: "POST" },
+    ),
+  listQuestionBanks: (bookId: UUID) =>
+    req<QuestionBank[]>(`/api/books/${bookId}/question-banks`),
+  getQuestionBank: (bankId: UUID) =>
+    req<QuestionBank>(`/api/question-banks/${bankId}`),
+  deleteQuestionBank: (bankId: UUID) =>
+    req<void>(`/api/question-banks/${bankId}`, { method: "DELETE" }),
+  retrySection: (bankId: UUID, sectionRef: string) =>
+    req<{ bank_id: UUID; section_ref: string; job_id: UUID; status: string }>(
+      `/api/question-banks/${bankId}/sections/${encodeURIComponent(sectionRef)}/retry`,
+      { method: "POST" },
+    ),
+  reExtractBlock: (bankId: UUID, blockIdx: number) =>
+    req<{ bank_id: UUID; block_idx: number; job_id: UUID; status: string }>(
+      `/api/question-banks/${bankId}/blocks/${blockIdx}/re-extract`,
+      { method: "POST" },
+    ),
+  listQuestions: (bankId: UUID) =>
+    req<QuestionBankDetail>(`/api/question-banks/${bankId}/questions`),
+  exportQuestionsJson: (bankId: UUID) => {
+    const a = document.createElement("a");
+    a.href = `${API_BASE}/api/question-banks/${bankId}/export/json`;
+    a.download = "";
+    document.body.appendChild(a);
+    a.click();
+    a.remove();
+  },
+  exportQuestionsMarkdown: (bankId: UUID) => {
+    const a = document.createElement("a");
+    a.href = `${API_BASE}/api/question-banks/${bankId}/export/markdown`;
+    a.download = "";
+    document.body.appendChild(a);
+    a.click();
+    a.remove();
+  },
+  exportQuestionsDocx: (bankId: UUID) => {
+    const a = document.createElement("a");
+    a.href = `${API_BASE}/api/question-banks/${bankId}/export/docx`;
+    a.download = "";
+    document.body.appendChild(a);
+    a.click();
+    a.remove();
+  },
+  startQuestionRegeneration: (bankId: UUID, params: RegenerateQuestionsParams) =>
+    req<{ regen_id: UUID; job_id: UUID; status: string }>(
+      `/api/question-banks/${bankId}/regenerate`,
+      { method: "POST", body: JSON.stringify(params) },
+    ),
+  listQuestionRegenerations: (bookId: UUID) =>
+    req<QuestionRegeneration[]>(`/api/books/${bookId}/question-regenerations`),
+  getQuestionRegeneration: (regenId: UUID) =>
+    req<QuestionRegeneration>(`/api/question-regenerations/${regenId}`),
+  listRegenQuestions: (regenId: UUID) =>
+    req<QuestionRegenQuestionsResponse>(`/api/question-regenerations/${regenId}/questions`),
+  saveQuestionRegeneration: (regenId: UUID) =>
+    req<QuestionRegeneration>(`/api/question-regenerations/${regenId}/save`, { method: "POST" }),
+  deleteQuestionRegeneration: (regenId: UUID) =>
+    req<void>(`/api/question-regenerations/${regenId}`, { method: "DELETE" }),
+  bulkDeleteRegenQuestions: (regenId: UUID, questionIds: UUID[]) =>
+    req<{ deleted: number }>(`/api/question-regenerations/${regenId}/questions`, {
+      method: "DELETE",
+      body: JSON.stringify({ question_ids: questionIds }),
+    }),
   listProviders: () => req<Provider[]>("/api/providers"),
   getProviderKeyStatus: (name: string) =>
     req<{ provider: string; configured: boolean }>(`/api/providers/${name}/keys`),

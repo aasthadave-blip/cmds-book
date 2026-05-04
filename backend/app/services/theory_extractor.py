@@ -13,10 +13,7 @@ Retries up to MAX_ATTEMPTS times on empty/failed extraction.
 from __future__ import annotations
 
 import asyncio
-import io
 import logging
-import os
-import tempfile
 from dataclasses import dataclass
 
 from app.schemas.qc import QCResult
@@ -41,19 +38,6 @@ class ExtractionResult:
     local_qc_fail: bool = False
     raw_response: str = ""
     notes: str = ""
-
-
-def _get_api_key() -> str:
-    api_key = os.environ.get("GEMINI_API_KEY") or ""
-    if not api_key:
-        try:
-            from app.core.config import settings
-            api_key = settings.GEMINI_API_KEY
-        except Exception:
-            pass
-    if not api_key:
-        raise ValueError("GEMINI_API_KEY is not set in .env")
-    return api_key
 
 
 def _slice_pdf(pdf_bytes: bytes, page_start: int | None, page_end: int | None) -> bytes:
@@ -109,56 +93,21 @@ def _call_gemini_ocr_sync(
     system_prompt: str,
     user_prompt: str,
 ) -> str:
-    """Upload PDF slice to Gemini and get OCR JSON back. Synchronous."""
-    from google import genai
-    from google.genai import types
+    """Upload PDF slice to Gemini and get OCR JSON back.
 
-    client = genai.Client(api_key=_get_api_key())
-    tmp_path = None
-    uploaded_file = None
+    Real socket timeout via ``HttpOptions`` — see app.core.gemini_runtime.
+    """
+    from app.core.gemini_runtime import call_gemini_with_pdf
 
-    try:
-        with tempfile.NamedTemporaryFile(suffix=".pdf", delete=False) as tmp:
-            tmp.write(pdf_slice)
-            tmp_path = tmp.name
-
-        with open(tmp_path, "rb") as f:
-            uploaded_file = client.files.upload(
-                file=f,
-                config=types.UploadFileConfig(
-                    mime_type="application/pdf",
-                    display_name="section.pdf",
-                ),
-            )
-
-        response = client.models.generate_content(
-            model=GEMINI_MODEL,
-            contents=[
-                types.Part.from_uri(
-                    file_uri=uploaded_file.uri,
-                    mime_type="application/pdf",
-                ),
-                system_prompt + "\n\n" + user_prompt,
-            ],
-            config=types.GenerateContentConfig(
-                response_mime_type="application/json",
-                temperature=0.0,
-                max_output_tokens=32000,
-            ),
-        )
-        return response.text or ""
-
-    finally:
-        if tmp_path:
-            try:
-                os.unlink(tmp_path)
-            except Exception:
-                pass
-        if uploaded_file is not None:
-            try:
-                client.files.delete(name=uploaded_file.name)
-            except Exception:
-                pass
+    return call_gemini_with_pdf(
+        pdf_bytes=pdf_slice,
+        system_prompt=system_prompt,
+        user_prompt=user_prompt,
+        model=GEMINI_MODEL,
+        max_output_tokens=32000,
+        temperature=0.0,
+        display_name="section.pdf",
+    )
 
 
 def _simple_qc(paragraphs: list[dict], section_id: str) -> QCResult:

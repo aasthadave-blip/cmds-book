@@ -97,6 +97,11 @@ class Settings(BaseSettings):
     GEMINI_API_KEY: str = ""
     GEMINI_REGEN_MODEL: str = "gemini-2.5-pro"
 
+    # Question worker version. v2 = legacy excluded-block-driven (3-pass, has
+    # the cross-section-duplication problem). v3 = section-aligned (mirrors
+    # theory extractor; one Gemini call per schema section). Default v3.
+    QUESTION_WORKER_VERSION: Literal["v2", "v3"] = "v3"
+
     # Multi-OCR (Sprint 4; empty by default)
     MATHPIX_APP_ID: str = ""
     MATHPIX_APP_KEY: str = ""

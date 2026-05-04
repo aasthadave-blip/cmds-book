@@ -2,13 +2,23 @@
 
 from __future__ import annotations
 
+import asyncio  # noqa: F401  (used in type hint for _watchdog_task)
 import logging
 
 from fastapi import FastAPI, HTTPException
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import FileResponse
 
-from app.api import books, jobs, providers, regenerations, sections
+from app.api import (
+    books,
+    jobs,
+    providers,
+    qa,
+    question_banks,
+    question_regenerations,
+    regenerations,
+    sections,
+)
 from app.core.config import settings
 
 logging.basicConfig(level=settings.LOG_LEVEL)
@@ -58,6 +68,12 @@ app.include_router(sections.router)
 app.include_router(regenerations.router)
 app.include_router(jobs.router)
 app.include_router(providers.router)
+app.include_router(question_banks.books_router)
+app.include_router(question_banks.banks_router)
+app.include_router(question_regenerations.books_router)
+app.include_router(question_regenerations.banks_router)
+app.include_router(question_regenerations.regens_router)
+app.include_router(qa.router)
 
 
 if settings.STORAGE_BACKEND == "local":
@@ -76,6 +92,36 @@ if settings.STORAGE_BACKEND == "local":
 
 # Eager-load worker registrations so inline dispatch has the task table populated.
 from app.workers import extract as _extract_tasks  # noqa: E402, F401
+from app.workers import questions as _question_tasks  # noqa: E402, F401
+from app.workers import questions_v2 as _question_v2_tasks  # noqa: E402, F401
+from app.workers import questions_v3 as _question_v3_tasks  # noqa: E402, F401
+from app.workers import qa as _qa_tasks  # noqa: E402, F401
+
+
+_watchdog_task: "asyncio.Task[None] | None" = None
+
+
+@app.on_event("startup")
+async def start_watchdog() -> None:
+    """Launch the stale-job watchdog. See app.core.watchdog for behaviour."""
+    import asyncio
+
+    from app.core.watchdog import watchdog_loop
+
+    global _watchdog_task
+    _watchdog_task = asyncio.create_task(watchdog_loop(), name="watchdog")
+
+
+@app.on_event("shutdown")
+async def stop_watchdog() -> None:
+    global _watchdog_task
+    if _watchdog_task is not None:
+        _watchdog_task.cancel()
+        try:
+            await _watchdog_task
+        except BaseException:
+            pass
+        _watchdog_task = None
 
 
 @app.on_event("startup")
@@ -217,6 +263,56 @@ async def recover_orphaned_jobs() -> None:
 
                 elif job.type == "regen_figures":
                     dispatch("regenerate_figures", str(book.id), str(job.id))
+
+                elif job.type == "extract_questions":
+                    dispatch("extract_questions", str(book.id), str(job.id))
+
+                elif job.type == "extract_questions_v2":
+                    dispatch("extract_questions_v2", str(book.id), str(job.id))
+
+                elif job.type == "extract_questions_v3":
+                    # v3 needs the bank_id which is not on the Job row — skip
+                    # recovery and let the user retry from the UI.
+                    job.status = "failed"
+                    job.error = "Interrupted by server restart — click Re-extract to retry"
+                    session.commit()
+                    skipped += 1
+                    continue
+
+                elif job.type == "extract_questions_regen":
+                    from app.models.question_regeneration import QuestionRegeneration
+
+                    regen = session.execute(
+                        select(QuestionRegeneration).where(
+                            QuestionRegeneration.job_id == job.id
+                        )
+                    ).scalars().first()
+                    if regen is None:
+                        job.status = "failed"
+                        job.error = "Interrupted before regen row was linked — click Regenerate to retry"
+                        session.commit()
+                        skipped += 1
+                        continue
+                    dispatch("extract_questions_regen", str(regen.id), str(job.id))
+
+                elif job.type == "run_qa_fidelity":
+                    # Bank id is not on the Job row — cannot recover. Mark
+                    # failed so the UI surfaces it and the user can retrigger.
+                    job.status = "failed"
+                    job.error = "Interrupted by server restart — click Run QA to retry"
+                    session.commit()
+                    skipped += 1
+                    continue
+
+                elif job.type == "re_extract_block":
+                    # Block re-extract jobs store (bank_id, block_idx) in dispatch
+                    # args, not in the Job row — cannot recover. Mark failed so the
+                    # UI shows it clearly and the user can click ↺ again.
+                    job.status = "failed"
+                    job.error = "Interrupted by server restart — click ↺ to retry the block"
+                    session.commit()
+                    skipped += 1
+                    continue
 
                 elif job.type == "re_extract":
                     # Per-section re-extract jobs store the section via dispatch args,

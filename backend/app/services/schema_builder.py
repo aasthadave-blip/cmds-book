@@ -17,8 +17,6 @@ from __future__ import annotations
 
 import asyncio
 import logging
-import os
-import tempfile
 
 from app.schemas.analyser import BookSchema
 from app.services.prompt_loader import load_raw
@@ -42,19 +40,6 @@ def _ensure_event_loop() -> None:
     except RuntimeError:
         loop = asyncio.new_event_loop()
         asyncio.set_event_loop(loop)
-
-
-def _get_api_key() -> str:
-    api_key = os.environ.get("GEMINI_API_KEY") or ""
-    if not api_key:
-        try:
-            from app.core.config import settings
-            api_key = settings.GEMINI_API_KEY
-        except Exception:
-            pass
-    if not api_key:
-        raise ValueError("GEMINI_API_KEY is not set in .env")
-    return api_key
 
 
 _VALID_TYPES = {"chapter", "section", "subsection", "excluded"}
@@ -97,59 +82,25 @@ def _sanitize_schema(data: dict) -> dict:
 
 
 def _run_gemini_schema(pdf_bytes: bytes, schema_prompt: str) -> dict:
-    """One synchronous Gemini call: upload PDF → generate schema → return dict."""
-    from google import genai
-    from google.genai import types
+    """One synchronous Gemini call: upload PDF → generate schema → return dict.
 
-    api_key = _get_api_key()
-    client = genai.Client(api_key=api_key)
+    Real socket timeout via ``HttpOptions`` — see app.core.gemini_runtime.
+    Schema generation runs over the full book PDF and is the slowest single
+    call in the system; we give it 5 min instead of the default 150s.
+    """
+    from app.core.gemini_runtime import call_gemini_with_pdf
 
-    tmp_path = None
-    uploaded_file = None
-    try:
-        with tempfile.NamedTemporaryFile(suffix=".pdf", delete=False) as tmp:
-            tmp.write(pdf_bytes)
-            tmp_path = tmp.name
-
-        with open(tmp_path, "rb") as f:
-            uploaded_file = client.files.upload(
-                file=f,
-                config=types.UploadFileConfig(
-                    mime_type="application/pdf",
-                    display_name="textbook_chapter.pdf",
-                ),
-            )
-        logger.info("Gemini file uploaded: %s", uploaded_file.name)
-
-        response = client.models.generate_content(
-            model=GEMINI_MODEL,
-            contents=[
-                types.Part.from_uri(
-                    file_uri=uploaded_file.uri,
-                    mime_type="application/pdf",
-                ),
-                schema_prompt,
-            ],
-            config=types.GenerateContentConfig(
-                response_mime_type="application/json",
-                temperature=0.1,
-                max_output_tokens=16000,
-            ),
-        )
-
-        return parse_json(response.text)
-
-    finally:
-        if tmp_path:
-            try:
-                os.unlink(tmp_path)
-            except Exception:
-                pass
-        if uploaded_file is not None:
-            try:
-                client.files.delete(name=uploaded_file.name)
-            except Exception:
-                pass
+    raw = call_gemini_with_pdf(
+        pdf_bytes=pdf_bytes,
+        system_prompt=schema_prompt,
+        user_prompt="",
+        model=GEMINI_MODEL,
+        timeout_s=300,
+        max_output_tokens=16000,
+        temperature=0.1,
+        display_name="textbook_chapter.pdf",
+    )
+    return parse_json(raw)
 
 
 def build_schema(pdf_bytes: bytes) -> BookSchema:
