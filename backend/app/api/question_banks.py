@@ -67,10 +67,19 @@ def _normalise_stats(stats: dict | None) -> dict | None:
         return stats
 
     bogus_expected = 0
+    bogus_extracted = 0
     bogus_missed = 0
+    # Per-status correction — subtract Crossword/Activity-style blocks
+    # from whichever status they were counted under (usually "partial"
+    # because extracted=0 < expected=14).
+    bogus_status: dict[str, int] = {}
     for s in sections:
         if _is_intentional_non_question_block(s.get("section_title")):
             bogus_expected += int(s.get("expected") or 0)
+            bogus_extracted += int(s.get("extracted") or 0)
+            st = s.get("status")
+            if st:
+                bogus_status[st] = bogus_status.get(st, 0) + 1
 
     blocks = list(stats.get("blocks") or [])
     fixed_blocks = []
@@ -86,6 +95,11 @@ def _normalise_stats(stats: dict | None) -> dict | None:
     totals = dict(out.get("totals") or {})
     if bogus_expected and "expected_total" in totals:
         totals["expected_total"] = max(0, int(totals["expected_total"]) - bogus_expected)
+    if bogus_extracted and "extracted_total" in totals:
+        totals["extracted_total"] = max(0, int(totals["extracted_total"]) - bogus_extracted)
+    for st, n in bogus_status.items():
+        if st in totals:
+            totals[st] = max(0, int(totals[st] or 0) - n)
     out["totals"] = totals
     if "missed" in out:
         out["missed"] = max(0, int(out["missed"] or 0) - bogus_missed)

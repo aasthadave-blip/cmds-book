@@ -1454,15 +1454,21 @@ async def _run_v3(book_id: UUID, bank_id: UUID, job_id: UUID) -> dict[str, Any]:
                 with SyncSession() as session:
                     _persist_unit(session, bank_id, book_id, unit, result)
 
-            counts[status] = counts.get(status, 0) + 1
-            # Don't count expected from sections whose title says they're
-            # non-question blocks (Crossword / Activity / Try-It / etc.).
-            # Their schema-counted "expected" is meaningless — the prompt
-            # correctly returns 0 and we should not inflate `missed` by
-            # the gap. See `_is_intentional_non_question_block`.
-            if not _is_intentional_non_question_block(unit.title):
+            # Non-question blocks (Crossword / Activity / Try-It / etc.):
+            # don't count them in ANY headline metric. They're shown in
+            # the per-section list so users see what was on the page,
+            # but they don't add to:
+            #   - expected_total (would inflate the denominator)
+            #   - extracted_total (they correctly produce 0 items)
+            #   - status counters (complete / partial / empty / failed)
+            # The prompt is supposed to return 0 from them, and that's
+            # the desired behavior — not a "missed section".
+            if _is_intentional_non_question_block(unit.title):
+                pass  # do not contribute to any count
+            else:
+                counts[status] = counts.get(status, 0) + 1
                 expected_total += int(unit.expected or 0)
-            extracted_total += kept
+                extracted_total += kept
 
             section_reports.append({
                 "section_ref": unit.id,
@@ -1664,14 +1670,16 @@ async def _run_section_retry(
 
         # Recompute totals — same exclusion rule as the main worker:
         # non-question blocks (Crossword / Activity / etc.) do not
-        # contribute to `expected_total` so they can't inflate `missed`.
+        # contribute to any headline metric (expected_total /
+        # extracted_total / status counters).
         counts = {"complete": 0, "partial": 0, "empty": 0, "failed": 0}
         expected_total = 0
         extracted_total = 0
         for s in sections:
+            if _is_intentional_non_question_block(s.get("section_title")):
+                continue
             counts[s["status"]] = counts.get(s["status"], 0) + 1
-            if not _is_intentional_non_question_block(s.get("section_title")):
-                expected_total += int(s.get("expected") or 0)
+            expected_total += int(s.get("expected") or 0)
             extracted_total += int(s.get("extracted") or 0)
 
         legacy_blocks = [
