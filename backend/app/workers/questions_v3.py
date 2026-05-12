@@ -1298,6 +1298,46 @@ def _legacy_block_status(v3_status: str) -> str:
     return {"complete": "ok", "skipped": "empty"}.get(v3_status, v3_status)
 
 
+# Sections that the EXTRACTOR PROMPT correctly excludes — crosswords,
+# activity boxes, hint/note callouts, etc. The analyser may have given
+# them an `expected` count > 0 (it counts visible numbered items), but
+# the prompt rules return 0 questions, so the gap is NOT a real miss.
+# Used to suppress the bogus "14 missed" inflation seen on Crossword.
+#
+# Match is case-insensitive substring on section_title; keep terms
+# narrow enough to avoid colliding with real section names. Update if
+# the prompt's exclusion list grows.
+_NON_QUESTION_TITLE_PATTERNS = (
+    "crossword",
+    "word search",
+    "word-search",
+    "jumble",
+    "fill in the blank",
+    "fill-in-the-blank",
+    "try it",
+    "try-it",
+    "quick check",
+    "quick-check",
+    "self check",
+    "self-check",
+    "check your understanding",
+    "progress check",
+    "test yourself",
+    "did you know",
+    "fun fact",
+    "thinking corner",
+    "activity",          # "Activity", "Activity 5.1" — hands-on theory aid
+    "illustration",      # "Illustration N" — worked walk-through, not a Q
+)
+
+
+def _is_intentional_non_question_block(title: str | None) -> bool:
+    if not title:
+        return False
+    t = title.strip().lower()
+    return any(pat in t for pat in _NON_QUESTION_TITLE_PATTERNS)
+
+
 def _classify_unit(
     expected: int | None, kept: int, identified: int, ok: bool
 ) -> str:
@@ -1415,7 +1455,13 @@ async def _run_v3(book_id: UUID, bank_id: UUID, job_id: UUID) -> dict[str, Any]:
                     _persist_unit(session, bank_id, book_id, unit, result)
 
             counts[status] = counts.get(status, 0) + 1
-            expected_total += int(unit.expected or 0)
+            # Don't count expected from sections whose title says they're
+            # non-question blocks (Crossword / Activity / Try-It / etc.).
+            # Their schema-counted "expected" is meaningless — the prompt
+            # correctly returns 0 and we should not inflate `missed` by
+            # the gap. See `_is_intentional_non_question_block`.
+            if not _is_intentional_non_question_block(unit.title):
+                expected_total += int(unit.expected or 0)
             extracted_total += kept
 
             section_reports.append({
@@ -1450,7 +1496,17 @@ async def _run_v3(book_id: UUID, bank_id: UUID, job_id: UUID) -> dict[str, Any]:
                     "page_end": s["page_end"],
                     "identified": s["identified"],
                     "extracted": s["extracted"],
-                    "missed": max(0, (s.get("expected") or s["identified"]) - s["extracted"]),
+                    # Non-question blocks (Crossword / Activity / Try-It …)
+                    # contribute 0 to missed — the prompt is supposed to
+                    # return 0 from them. See helper for the title list.
+                    "missed": (
+                        0
+                        if _is_intentional_non_question_block(s.get("section_title"))
+                        else max(
+                            0,
+                            (s.get("expected") or s["identified"]) - s["extracted"],
+                        )
+                    ),
                     "status": _legacy_block_status(s["status"]),
                 }
                 for idx, s in enumerate(sorted_reports)
@@ -1606,13 +1662,16 @@ async def _run_section_retry(
         if not replaced:
             sections.append(new_section)
 
-        # Recompute totals
+        # Recompute totals — same exclusion rule as the main worker:
+        # non-question blocks (Crossword / Activity / etc.) do not
+        # contribute to `expected_total` so they can't inflate `missed`.
         counts = {"complete": 0, "partial": 0, "empty": 0, "failed": 0}
         expected_total = 0
         extracted_total = 0
         for s in sections:
             counts[s["status"]] = counts.get(s["status"], 0) + 1
-            expected_total += int(s.get("expected") or 0)
+            if not _is_intentional_non_question_block(s.get("section_title")):
+                expected_total += int(s.get("expected") or 0)
             extracted_total += int(s.get("extracted") or 0)
 
         legacy_blocks = [
@@ -1624,7 +1683,14 @@ async def _run_section_retry(
                 "page_end": s["page_end"],
                 "identified": s["identified"],
                 "extracted": s["extracted"],
-                "missed": max(0, (s.get("expected") or s["identified"]) - s["extracted"]),
+                "missed": (
+                    0
+                    if _is_intentional_non_question_block(s.get("section_title"))
+                    else max(
+                        0,
+                        (s.get("expected") or s["identified"]) - s["extracted"],
+                    )
+                ),
                 "status": _legacy_block_status(s["status"]),
             }
             for idx, s in enumerate(sections)

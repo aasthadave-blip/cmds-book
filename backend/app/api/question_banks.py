@@ -46,6 +46,52 @@ def _maybe_int(v) -> int | None:
         return None
 
 
+def _normalise_stats(stats: dict | None) -> dict | None:
+    """Read-side fix for legacy banks where `expected_total` / `missed`
+    were inflated by non-question blocks (Crossword / Activity / Try-It).
+
+    The worker's new write path already excludes these (see
+    `_is_intentional_non_question_block` in questions_v3.py), but existing
+    rows still carry the old totals. We re-derive on read so the UI
+    reads consistent numbers without forcing a re-extract.
+    """
+    if not stats:
+        return stats
+    try:
+        from app.workers.questions_v3 import _is_intentional_non_question_block
+    except Exception:
+        return stats
+
+    sections = list(stats.get("sections") or [])
+    if not sections:
+        return stats
+
+    bogus_expected = 0
+    bogus_missed = 0
+    for s in sections:
+        if _is_intentional_non_question_block(s.get("section_title")):
+            bogus_expected += int(s.get("expected") or 0)
+
+    blocks = list(stats.get("blocks") or [])
+    fixed_blocks = []
+    for b in blocks:
+        if _is_intentional_non_question_block(b.get("title")):
+            m = int(b.get("missed") or 0)
+            bogus_missed += m
+            b = {**b, "missed": 0}
+        fixed_blocks.append(b)
+
+    out = dict(stats)
+    out["blocks"] = fixed_blocks
+    totals = dict(out.get("totals") or {})
+    if bogus_expected and "expected_total" in totals:
+        totals["expected_total"] = max(0, int(totals["expected_total"]) - bogus_expected)
+    out["totals"] = totals
+    if "missed" in out:
+        out["missed"] = max(0, int(out["missed"] or 0) - bogus_missed)
+    return out
+
+
 def _bank_dict(bank: QuestionBank, question_count: int = 0) -> dict:
     return {
         "id": str(bank.id),
@@ -54,7 +100,7 @@ def _bank_dict(bank: QuestionBank, question_count: int = 0) -> dict:
         "subject": bank.subject,
         "status": bank.status,
         "question_count": question_count,
-        "stats": bank.extraction_stats,
+        "stats": _normalise_stats(bank.extraction_stats),
         "last_error": bank.last_error,
         "created_at": bank.created_at.isoformat() if bank.created_at else None,
         "updated_at": bank.updated_at.isoformat() if bank.updated_at else None,
@@ -588,7 +634,7 @@ async def list_questions(
         "title": bank.title,
         "status": bank.status,
         "total_questions": len(questions),
-        "stats": stats,
+        "stats": _normalise_stats(stats),
         "sections": sections_out,
     }
 
