@@ -12,6 +12,7 @@ import {
 } from "../api/hooks";
 import type {
   BookSchema,
+  ExcludedSection,
   QuestionStructureNode,
   SchemaSection,
   Section,
@@ -20,6 +21,7 @@ import { api } from "../api/client";
 import { useUI } from "../stores/ui";
 import { JobProgress } from "../components/JobProgress";
 import { WizardRail, type RailStep } from "../components/WizardRail";
+import { V3SummaryTable } from "./QuestionsPage";
 
 export function SchemaPage() {
   const { selectedBookId, setView, selectBank } = useUI();
@@ -306,7 +308,25 @@ export function SchemaPage() {
             ) : (
               <QuestionSchemaView bookId={selectedBookId} />
             )}
-            {current.exclusion_summary.length > 0 && (
+            {(current.excluded_sections?.length ?? 0) > 0 ? (
+              <div
+                style={{
+                  fontSize: "0.7rem",
+                  color: "var(--text2)",
+                  marginTop: 12,
+                  padding: 10,
+                  background: "var(--bg2, #f5f5fa)",
+                  borderRadius: 4,
+                }}
+              >
+                <div style={{ fontWeight: 600, marginBottom: 6, color: "var(--text2)" }}>
+                  Excluded from extraction (sent to Question Bank):
+                </div>
+                {current.excluded_sections!.map((ex, i) => (
+                  <ExcludedNode key={`${ex.title}-${i}`} node={ex} depth={0} />
+                ))}
+              </div>
+            ) : current.exclusion_summary.length > 0 ? (
               <div
                 style={{
                   fontSize: "0.68rem",
@@ -317,7 +337,7 @@ export function SchemaPage() {
                 Excluded from extraction:{" "}
                 <b>{current.exclusion_summary.join(", ")}</b>
               </div>
-            )}
+            ) : null}
           </div>
 
           {!jobId && (
@@ -369,9 +389,63 @@ export function SchemaPage() {
               )}
             </>
           )}
+
+          {/* Post-extraction summary — pinned at the bottom of the schema
+              page, showing the latest ready bank's totals. Moved here from
+              the Questions page so all stats live in one place. */}
+          {latestBank?.status === "ready" && latestBank.stats && (
+            <div style={{ marginTop: 24 }}>
+              <div
+                style={{
+                  fontSize: "0.62rem",
+                  color: "var(--text3)",
+                  textTransform: "uppercase",
+                  letterSpacing: 0.4,
+                  marginBottom: 6,
+                }}
+              >
+                Extraction Summary
+              </div>
+              <V3SummaryTable stats={latestBank.stats} />
+            </div>
+          )}
         </div>
       </div>
     </>
+  );
+}
+
+/** Read-only nested view of an excluded_section tree (e.g. "PRACTICE
+ *  QUESTIONS: CLASSROOM WING" → "Very Short / Short / Essay"), shown
+ *  beneath the theory schema editor so the user can verify what the
+ *  Question Bank will pick up. */
+function ExcludedNode({ node, depth }: { node: ExcludedSection; depth: number }) {
+  const eqc = node.expected_question_count ?? 0;
+  const indent = depth * 14;
+  return (
+    <div style={{ marginLeft: indent, padding: "2px 0" }}>
+      <span style={{ fontWeight: depth === 0 ? 600 : 400 }}>
+        {depth === 0 ? "📂 " : "└─ "}
+        {node.title}
+      </span>
+      {(node.page_start || node.page_end) && (
+        <span style={{ color: "var(--text3)", marginLeft: 6, fontSize: "0.66rem" }}>
+          · p.{node.page_start ?? "?"}–{node.page_end ?? "?"}
+        </span>
+      )}
+      {eqc > 0 && (
+        <span style={{ color: "var(--accent, #5b6cff)", marginLeft: 6, fontSize: "0.66rem", fontWeight: 600 }}>
+          · {eqc} Q
+        </span>
+      )}
+      {(node.subsections?.length ?? 0) > 0 && (
+        <div>
+          {node.subsections!.map((c, i) => (
+            <ExcludedNode key={`${c.title}-${i}`} node={c} depth={depth + 1} />
+          ))}
+        </div>
+      )}
+    </div>
   );
 }
 
@@ -506,6 +580,7 @@ function QuestionSchemaView({ bookId }: { bookId: string | null }) {
           </span>
         )}
       </div>
+
       {data.sections.map((node) => (
         <QSchemaNode key={node.id} node={node} depth={0} />
       ))}

@@ -20,6 +20,7 @@ import logging
 
 from app.schemas.analyser import BookSchema
 from app.services.prompt_loader import load_raw
+from app.services.schema_postpass import verify_schema_against_pdf_text
 from app.utils.json_parse import parse_json
 
 logger = logging.getLogger(__name__)
@@ -96,7 +97,7 @@ def _run_gemini_schema(pdf_bytes: bytes, schema_prompt: str) -> dict:
         user_prompt="",
         model=GEMINI_MODEL,
         timeout_s=300,
-        max_output_tokens=16000,
+        max_output_tokens=32000,
         temperature=0.1,
         display_name="textbook_chapter.pdf",
     )
@@ -116,7 +117,17 @@ def build_schema(pdf_bytes: bytes) -> BookSchema:
         try:
             data = _run_gemini_schema(pdf_bytes, schema_prompt)
             data = _sanitize_schema(data)
-            return BookSchema(**data)
+            schema = BookSchema(**data)
+            # Deterministic post-pass — VERIFIER ONLY (no injection).
+            # Cross-checks pypdf-extracted labels against the Gemini schema
+            # and logs any candidate misses as warnings. The schema is NEVER
+            # mutated here. Gemini's strict OCR-ONLY Pass 3.5 is the single
+            # source of truth.
+            try:
+                schema, _warnings = verify_schema_against_pdf_text(pdf_bytes, schema)
+            except Exception as e:
+                logger.warning("schema verifier failed (continuing): %s", e)
+            return schema
         except Exception as e:
             last_err = e
             logger.warning("Schema attempt %s failed: %s", attempt, e)

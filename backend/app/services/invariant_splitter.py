@@ -24,7 +24,12 @@ _TYPE_MAP = {
     "list_item": "list_item",  # handled specially (merged into ListBlock)
     "table": "table",
     "example": "example",
+    "example_ref": "example_ref",
+    "exercise_ref": "exercise_ref",
+    "question_ref": "question_ref",
 }
+
+_REF_TYPES = {"example_ref", "exercise_ref", "question_ref"}
 
 
 def paragraphs_to_blocks(paragraphs: list[dict]) -> list[dict]:
@@ -79,6 +84,26 @@ def paragraphs_to_blocks(paragraphs: list[dict]) -> list[dict]:
                     "eqs": list(p.get("eqs") or []),
                 }
             )
+        elif short in _REF_TYPES:
+            label = (p.get("label") or "").strip()
+            number = (p.get("number") or "").strip()
+            if not label and not number:
+                # placeholder with no identifier — drop defensively
+                continue
+            blocks.append(
+                {
+                    "t": short,
+                    "label": label,
+                    "number": number,
+                }
+            )
+        elif short == "fig":
+            c = (p.get("content") or p.get("c") or "").strip()
+            label = (p.get("label") or "").strip()
+            # accept empty content if a label is present (pure label placeholder)
+            if not c and not label:
+                continue
+            blocks.append({"t": "fig", "c": c, "label": label})
         else:
             c = (p.get("content") or p.get("c") or "").strip()
             if c:

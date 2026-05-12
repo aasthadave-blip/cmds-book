@@ -7,6 +7,7 @@ from app.models.question import Question
 from app.models.question_bank import QuestionBank
 from app.models.question_regeneration import QuestionRegeneration
 from app.models.regeneration import Regeneration
+from app.models.rejected_question import RejectedQuestion
 from app.models.section import Section
 from app.models.user_provider_key import UserProviderKey
 
@@ -21,5 +22,6 @@ __all__ = [
     "QuestionBank",
     "QuestionRegeneration",
     "Question",
+    "RejectedQuestion",
     "QARun",
 ]

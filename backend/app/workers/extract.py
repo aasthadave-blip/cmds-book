@@ -27,6 +27,7 @@ from app.schemas.regen import RegenParams
 from app.services.chunk_builder import flatten_sections
 from app.services.regenerator import post_regen_qc, regenerate_section
 from app.services.schema_builder import build_schema
+from app.core.heartbeat import Heartbeat
 from app.services.theory_extractor import (
     ExtractionResult,
     extract_section_with_qc,
@@ -159,7 +160,14 @@ def analyse_book_task(self, book_id: str, job_id: str) -> dict:
             # metadata from the schema output — no Claude P1 call needed for any type.
             pdf_type = "digital" if local_result is not None else "scanned"
             _update_job(session, job_uuid, message=f"Running Gemini schema ({pdf_type} PDF)", progress=30)
-            schema = build_schema(pdf_bytes)
+            # Heartbeat keeps the watchdog from killing long Gemini schema
+            # calls for scanned PDFs (5–10 min is normal for image-based pages).
+            with Heartbeat(
+                job_uuid,
+                base_msg=f"Running Gemini schema ({pdf_type} PDF)",
+                progress=30,
+            ):
+                schema = build_schema(pdf_bytes)
 
             # Derive AnalyserResult: use pymupdf fast-path if available, otherwise
             # build it entirely from the Gemini schema output (no Claude P1 needed).
@@ -318,19 +326,31 @@ def extract_book_task(self, book_id: str, job_id: str) -> dict:
                 next_title = next_sec.title if next_sec else None
 
                 # Effective page range:
-                # - Top-level sections (direct schema roots): FULL page range.
-                #   These are the "overall chapter" view — they contain everything.
-                # - Leaf sections (no children): exact schema range, unchanged.
-                # - Intermediate containers (has children, depth > 0): trimmed to
-                #   next section's page_start — only their own intro text, not children.
-                #   If next_sec.page_start unknown: fall back to schema page_end.
-                # - Intermediate container with no intro text → empty → status="skipped".
+                # - Top-level sections (direct schema roots) and intermediate
+                #   containers: trimmed to first child's page_start.
+                # - Leaf sections (no children): EXTENDED to next sibling's
+                #   page_start so prose that continues onto the page where
+                #   the next section starts is captured (Gemini's next_title
+                #   STOP anchor prevents leak into the next section).
+                # - Container with no intro text → empty → status="skipped".
                 is_container = len(sec_schema.subsections) > 0
                 is_top_level = sec_schema.id in top_level_ids
 
-                if is_container and not is_top_level and next_sec and next_sec.page_start is not None:
+                if is_container and next_sec and next_sec.page_start is not None:
+                    # Container: trim DOWN to first child's page_start so the
+                    # parent only OCRs its own intro text, not all children.
                     effective_page_end = min(
                         sec_schema.page_end or next_sec.page_start,
+                        next_sec.page_start,
+                    )
+                elif (not is_container) and next_sec and next_sec.page_start is not None:
+                    # Leaf: extend UP to next sibling's page_start so we
+                    # capture content continuing onto the page where the
+                    # next section's heading appears. next_title is set
+                    # below as the STOP anchor in the prompt — Gemini
+                    # transcribes up to that heading and stops.
+                    effective_page_end = max(
+                        sec_schema.page_end or 0,
                         next_sec.page_start,
                     )
                 else:
@@ -345,17 +365,29 @@ def extract_book_task(self, book_id: str, job_id: str) -> dict:
                 )
 
                 try:
-                    result: ExtractionResult = asyncio.run(
-                        extract_section_with_qc(
-                            section_id=sec_schema.id,
-                            title=sec_schema.title,
-                            level=sec_schema.level,
-                            pdf_bytes=pdf_bytes,
-                            page_start=sec_schema.page_start,
-                            page_end=effective_page_end,
-                            next_title=next_title,
+                    # Watchdog keepalive: a 10s daemon-thread heartbeat runs
+                    # for the duration of this section so the watchdog (300s
+                    # threshold) does not kill long single-call extractions
+                    # for big top-level chapter sections. This thread ONLY
+                    # writes job.last_heartbeat_at — it does NOT touch the
+                    # prompt, the Gemini call, retries, or the extracted
+                    # output in any way.
+                    with Heartbeat(
+                        job_uuid,
+                        base_msg=f"Extracting {sec_schema.title} ({i}/{total})",
+                        progress=progress,
+                    ):
+                        result: ExtractionResult = asyncio.run(
+                            extract_section_with_qc(
+                                section_id=sec_schema.id,
+                                title=sec_schema.title,
+                                level=sec_schema.level,
+                                pdf_bytes=pdf_bytes,
+                                page_start=sec_schema.page_start,
+                                page_end=effective_page_end,
+                                next_title=next_title,
+                            )
                         )
-                    )
                 except Exception as e:
                     logger.exception("extract_section_with_qc crashed on %s", sec_schema.id)
                     sec = session.execute(
@@ -382,12 +414,11 @@ def extract_book_task(self, book_id: str, job_id: str) -> dict:
                 sec.qc_local = result.qc.to_dict()
                 sec.attempts = result.attempts
 
-                # Intermediate containers with no intro text (content starts
-                # immediately with a child section) produce empty blocks — correct,
-                # not an error. Mark skipped so they don't pollute the QC fail list.
-                # Top-level sections always have content (full chapter range), so
-                # empty result there is a real failure.
-                if not result.qc.pass_ and is_container and not is_top_level and not result.blocks:
+                # Container sections (top-level OR intermediate) trimmed to
+                # before the first child may have no intro text — totally
+                # normal, not a failure. Mark skipped so they don't pollute
+                # the QC fail list.
+                if not result.qc.pass_ and is_container and not result.blocks:
                     sec.status = "skipped"
                 else:
                     sec.status = "passed" if result.qc.pass_ else "failed"
@@ -398,6 +429,17 @@ def extract_book_task(self, book_id: str, job_id: str) -> dict:
 
             book.status = "ready"
             session.commit()
+
+            # Inject example/exercise placeholder chips into parent theory
+            # sections. Idempotent post-processing — does not modify
+            # transcribed theory blocks beyond inserting `question_ref`
+            # references for child `<parent>-example-N` sections.
+            try:
+                from app.services.example_linker import link_examples_to_theory_sync
+                link_examples_to_theory_sync(session, book_uuid)
+            except Exception as e:
+                logger.warning("example_linker failed (book=%s): %s", book_uuid, e)
+
             _update_job(
                 session,
                 job_uuid,
@@ -470,15 +512,40 @@ def re_extract_section_task(self, section_id: str, job_id: str) -> dict:
 
             pdf_bytes = download_pdf(book.pdf_url)
 
-            # Look up next section title from schema for boundary-aware extraction
+            # Look up next section title AND page_start from schema for
+            # boundary-aware extraction. For leaf sections, extend page_end
+            # to next sibling's page_start so prose continuing onto the page
+            # where the next section starts is captured (next_title acts as
+            # the STOP anchor in the prompt). Mirrors the logic in
+            # extract_book_task.
             next_title: str | None = None
+            next_page_start: int | None = None
+            sec_is_container = False
             if book.schema:
                 from app.services.chunk_builder import flatten_sections as _flatten
-                flat = _flatten(BookSchema(**book.schema))
+                book_schema_obj = BookSchema(**book.schema)
+                flat = _flatten(book_schema_obj)
                 for idx, s in enumerate(flat):
-                    if s.id == sec.section_id and idx + 1 < len(flat):
-                        next_title = flat[idx + 1].title
+                    if s.id == sec.section_id:
+                        sec_is_container = len(s.subsections) > 0
+                        if idx + 1 < len(flat):
+                            next_title = flat[idx + 1].title
+                            next_page_start = flat[idx + 1].page_start
                         break
+
+            # Same effective_page_end logic as extract_book_task.
+            if sec_is_container and next_page_start is not None:
+                effective_page_end = min(
+                    sec.page_end or next_page_start,
+                    next_page_start,
+                )
+            elif (not sec_is_container) and next_page_start is not None:
+                effective_page_end = max(
+                    sec.page_end or 0,
+                    next_page_start,
+                )
+            else:
+                effective_page_end = sec.page_end
 
             result: ExtractionResult = asyncio.run(
                 re_extract_with_fix(
@@ -487,7 +554,7 @@ def re_extract_section_task(self, section_id: str, job_id: str) -> dict:
                     level=sec.level or 1,
                     pdf_bytes=pdf_bytes,
                     page_start=sec.page_start,
-                    page_end=sec.page_end,
+                    page_end=effective_page_end,
                     next_title=next_title,
                 )
             )
@@ -497,6 +564,14 @@ def re_extract_section_task(self, section_id: str, job_id: str) -> dict:
             sec.attempts = (sec.attempts or 0) + 1
             sec.status = "passed" if result.qc.pass_ else "failed"
             session.commit()
+
+            # Re-link example placeholder chips into parent theory after a
+            # single-section re-extract — keeps inline chips in sync.
+            try:
+                from app.services.example_linker import link_examples_to_theory_sync
+                link_examples_to_theory_sync(session, sec.book_id)
+            except Exception as e:
+                logger.warning("example_linker failed after re_extract (section=%s): %s", section_uuid, e)
 
             _update_job(
                 session,

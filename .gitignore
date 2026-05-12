@@ -50,3 +50,9 @@ backend/uploads/
 
 # Claude Code internal cache/backups (not project code)
 .claude/
+*.xlsx
+COST_MODEL.xlsx
+
+# Dev-only sample generators — not part of the prod export pipeline
+backend/sample_export_format_a.py
+backend/sample_export_theory.py

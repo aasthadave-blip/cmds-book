@@ -418,39 +418,28 @@ async def export_book_docx(
     regen_id: UUID | None = Query(default=None),
     session: AsyncSession = Depends(get_session),
 ) -> Response:
-    """Export sections as a Word (.docx) document.
-
-    Conversion: internal blocks → Markdown (with native numbered lists and
-    ``$...$`` / ``$$...$$`` math) → pandoc → .docx. Pandoc converts LaTeX to
-    OMML so equations render as native Word equations (not images).
-    """
-    _ensure_pandoc_on_path()
-    # Lazy import so the backend still boots cleanly if pypandoc is missing
-    import pypandoc
+    """Export theory sections as a Word (.docx) document using the native
+    python-docx builder (`app.services.docx_export`). Replaces the
+    pandoc pipeline so we control fonts, spacing, no-duplicate-heading
+    invariant, and inline math/figure rendering precisely."""
+    from app.services.docx_export import build_theory_docx
 
     book, sections, regen_blocks = await _load_export_context(book_id, regen_id, session)
-    markdown = _build_markdown(book, sections, regen_blocks, numbered_lists=True)
 
-    safe_name = re.sub(r"[^\w-]+", "_", book.title).strip("_") or "extraction"
+    # Shape adapter: ORM Section rows + regen overrides → builder shape.
+    payload: list[dict] = []
+    for sec in sections:
+        blocks = regen_blocks.get(sec.section_id) if regen_blocks else None
+        if blocks is None:
+            blocks = sec.blocks or []
+        payload.append({
+            "section_id": sec.section_id,
+            "title": sec.title,
+            "blocks": blocks,
+        })
 
-    # pandoc needs to write to a real file to produce binary output
-    with tempfile.NamedTemporaryFile(suffix=".docx", delete=False) as tmp:
-        tmp_path = tmp.name
-    try:
-        pypandoc.convert_text(
-            markdown,
-            to="docx",
-            format="markdown+tex_math_dollars+tex_math_double_backslash",
-            outputfile=tmp_path,
-            extra_args=["--standalone"],
-        )
-        data = Path(tmp_path).read_bytes()
-    finally:
-        try:
-            os.unlink(tmp_path)
-        except OSError:
-            pass
-
+    data = build_theory_docx(book.title or "Theory Export", payload)
+    safe_name = re.sub(r"[^\w-]+", "_", book.title or "extraction").strip("_") or "extraction"
     return Response(
         content=data,
         media_type="application/vnd.openxmlformats-officedocument.wordprocessingml.document",

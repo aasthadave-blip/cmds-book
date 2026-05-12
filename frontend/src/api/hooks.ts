@@ -276,6 +276,19 @@ export function useRetrySection() {
   });
 }
 
+// R6 — per-section retry inside an existing question-regen run
+export function useRetryRegenSection() {
+  const qc = useQueryClient();
+  return useMutation({
+    mutationFn: ({ regenId, sectionRef }: { regenId: UUID; sectionRef: string }) =>
+      api.retryRegenSection(regenId, sectionRef),
+    onSuccess: (_data, vars) => {
+      void qc.invalidateQueries({ queryKey: qk.regenQuestions(vars.regenId) });
+      void qc.invalidateQueries({ queryKey: qk.questionRegen(vars.regenId) });
+    },
+  });
+}
+
 export function useReExtractBlock() {
   const qc = useQueryClient();
   return useMutation({
@@ -283,6 +296,51 @@ export function useReExtractBlock() {
       api.reExtractBlock(bankId, blockIdx),
     onSuccess: (_data, vars) => {
       void qc.invalidateQueries({ queryKey: qk.questionBank(vars.bankId) });
+      void qc.invalidateQueries({ queryKey: qk.questions(vars.bankId) });
+    },
+  });
+}
+
+export function useRestoreRejected() {
+  const qc = useQueryClient();
+  return useMutation({
+    mutationFn: ({ bankId, rejectedId }: { bankId: UUID; rejectedId: UUID }) =>
+      api.restoreRejected(bankId, rejectedId),
+    onSuccess: (_data, vars) => {
+      void qc.invalidateQueries({ queryKey: qk.questions(vars.bankId) });
+      void qc.invalidateQueries({ queryKey: qk.questionBank(vars.bankId) });
+    },
+  });
+}
+
+export function useDiscardRejected() {
+  const qc = useQueryClient();
+  return useMutation({
+    mutationFn: ({ bankId, rejectedId }: { bankId: UUID; rejectedId: UUID }) =>
+      api.discardRejected(bankId, rejectedId),
+    onSuccess: (_data, vars) => {
+      void qc.invalidateQueries({ queryKey: qk.questions(vars.bankId) });
+    },
+  });
+}
+
+export function useHideQuestion() {
+  const qc = useQueryClient();
+  return useMutation({
+    mutationFn: ({ questionId }: { bankId: UUID; questionId: UUID }) =>
+      api.hideQuestion(questionId),
+    onSuccess: (_data, vars) => {
+      void qc.invalidateQueries({ queryKey: qk.questions(vars.bankId) });
+    },
+  });
+}
+
+export function useUnhideQuestion() {
+  const qc = useQueryClient();
+  return useMutation({
+    mutationFn: ({ questionId }: { bankId: UUID; questionId: UUID }) =>
+      api.unhideQuestion(questionId),
+    onSuccess: (_data, vars) => {
       void qc.invalidateQueries({ queryKey: qk.questions(vars.bankId) });
     },
   });

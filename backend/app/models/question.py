@@ -94,8 +94,24 @@ class Question(Base):
         index=True,
     )
 
+    # 0014 (2026-05-11) — for regen rows, points to the original Question
+    # (regen_id IS NULL) that was used as the source. Lets the UI group N
+    # variants under their specific source instead of mixing them at the
+    # section level. Always NULL on original rows.
+    source_question_id: Mapped[UUID | None] = mapped_column(
+        sa.Uuid(as_uuid=True),
+        nullable=True,
+        index=True,
+    )
+
     created_at: Mapped[datetime] = mapped_column(
         DateTime(timezone=True), server_default=func.now(), nullable=False
+    )
+
+    # Soft-hide via UI. Hidden questions stay in the DB and exports but the
+    # default question listing skips them. Toggle with PATCH /questions/{id}.
+    is_hidden: Mapped[bool] = mapped_column(
+        sa.Boolean, nullable=False, default=False, server_default=sa.false()
     )
 
     bank = relationship("QuestionBank", back_populates="questions")

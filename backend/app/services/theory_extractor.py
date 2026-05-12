@@ -26,6 +26,64 @@ logger = logging.getLogger(__name__)
 MAX_ATTEMPTS = 3
 GEMINI_MODEL = "gemini-2.5-pro"
 
+# Sub-retry policy for transient infra errors only (network blips, Gemini 5xx,
+# read timeouts). These DO NOT count against MAX_ATTEMPTS and do not change
+# anything about the extraction itself — same prompt, same slice, same model,
+# same output. They only stop a transient network error from being mistaken
+# for a content failure and burning a real QC attempt.
+TRANSIENT_SUBSTRINGS = (
+    "Server disconnected",
+    "RemoteProtocolError",
+    "ReadTimeout",
+    "ReadError",
+    "ConnectionError",
+    "ConnectError",
+    "ConnectTimeout",
+    "503",
+    "502",
+    "504",
+    "Connection reset",
+    "Temporary failure",
+)
+TRANSIENT_SUB_ATTEMPTS = 4  # initial + 3 retries
+TRANSIENT_BACKOFF_S = (5.0, 15.0, 45.0)
+
+
+def _is_transient(err: Exception) -> bool:
+    msg = f"{type(err).__name__}: {err}"
+    return any(s in msg for s in TRANSIENT_SUBSTRINGS)
+
+
+async def _call_gemini_with_transient_retries(
+    pdf_slice: bytes, system_prompt: str, user_prompt: str, section_id: str
+) -> str:
+    """Retry the SAME Gemini call on transient infra errors only.
+
+    Non-transient errors (auth, 4xx, schema) bubble immediately so we don't
+    waste time on something that can't recover. Output is identical to a
+    direct call — this only changes resilience, not behaviour.
+    """
+    last_err: Exception | None = None
+    for sub in range(TRANSIENT_SUB_ATTEMPTS):
+        try:
+            return await asyncio.to_thread(
+                _call_gemini_ocr_sync, pdf_slice, system_prompt, user_prompt
+            )
+        except Exception as e:
+            if not _is_transient(e):
+                raise
+            last_err = e
+            if sub == TRANSIENT_SUB_ATTEMPTS - 1:
+                break
+            wait = TRANSIENT_BACKOFF_S[min(sub, len(TRANSIENT_BACKOFF_S) - 1)]
+            logger.warning(
+                "Gemini transient error (section=%s sub-attempt=%s/%s wait=%ss): %s",
+                section_id, sub + 1, TRANSIENT_SUB_ATTEMPTS, wait, e,
+            )
+            await asyncio.sleep(wait)
+    assert last_err is not None
+    raise last_err
+
 
 @dataclass
 class ExtractionResult:
@@ -71,19 +129,26 @@ def _slice_pdf(pdf_bytes: bytes, page_start: int | None, page_end: int | None) -
 
 
 def _build_user_prompt(section_id: str, title: str, next_title: str | None = None) -> str:
-    stop_instruction = (
-        f"\nSTOP extracting when you reach the heading \"{next_title}\" — do NOT include any content from that heading onwards."
-        if next_title
-        else ""
-    )
+    if next_title:
+        stop_instruction = (
+            f"\nSTOP extracting the MOMENT you reach the heading \"{next_title}\". Anything below that heading — even a single line, even a single equation — belongs to a different section and must NOT appear in your output.\n"
+            f"DO NOT stop earlier than \"{next_title}\". Continue transcribing every paragraph, every line, every callout box, every figure caption that appears BETWEEN \"{title}\" and \"{next_title}\". Even if the content feels 'complete' or 'wraps up', KEEP GOING until you literally see \"{next_title}\" on the page.\n"
+            f"If the section's content continues onto the next page, KEEP TRANSCRIBING on the next page until you reach \"{next_title}\". Do NOT assume a page break means the section ended.\n"
+            f"If you are uncertain whether a paragraph belongs to \"{title}\" or to the next section, EXCLUDE it. Over-including a paragraph means the next section's extraction will be incomplete and the user will see the same content under two sidebar entries. Under-include rather than over-include — the system can recover from a missed paragraph (retry this one section), but it cannot recover from a section eating its neighbour's content."
+        )
+    else:
+        stop_instruction = (
+            "\nThis is the last section of its scope. Transcribe everything from the heading to the end of the provided pages."
+        )
     return (
         f"Extract ALL theory content from the section titled: \"{title}\" (ID: {section_id}).\n\n"
         f"START extracting from the heading \"{title}\" — include everything from that heading."
         f"{stop_instruction}\n\n"
         "These PDF pages may contain content from adjacent sections. "
-        "Extract ONLY the content that belongs to this section.\n"
-        "Transcribe EVERY word of theory content verbatim — pure OCR, no summarisation.\n"
-        "Do NOT use training knowledge. Only transcribe what you see on the pages.\n\n"
+        "Extract ONLY the content that belongs to this section (between START heading and STOP heading).\n"
+        "Transcribe EVERY word of theory content verbatim — pure OCR, no summarisation, no skipping.\n"
+        "Do NOT use training knowledge. Only transcribe what you see on the pages.\n"
+        "Do NOT decide the section is 'complete' on your own — completeness is determined ONLY by reaching the STOP heading.\n\n"
         f"Return JSON with section_id=\"{section_id}\" and section_title=\"{title}\"."
     )
 
@@ -147,11 +212,8 @@ async def extract_section_with_qc(
 
     for attempt in range(1, MAX_ATTEMPTS + 1):
         try:
-            raw = await asyncio.to_thread(
-                _call_gemini_ocr_sync,
-                pdf_slice,
-                system_prompt,
-                user_prompt,
+            raw = await _call_gemini_with_transient_retries(
+                pdf_slice, system_prompt, user_prompt, section_id
             )
             data = parse_json(raw)
             paragraphs = list(data.get("paragraphs") or [])

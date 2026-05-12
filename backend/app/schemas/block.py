@@ -40,6 +40,32 @@ class KeyPointBlock(BaseModel):
 class FigureBlock(BaseModel):
     t: Literal["fig"] = "fig"
     c: str
+    label: str = ""
+
+
+class ExampleRefBlock(BaseModel):
+    """Placeholder for a worked example printed in the section.
+
+    The body is intentionally not transcribed — it is captured by the question
+    extraction pipeline. We only record the printed identifier so the reader
+    can render a position marker.
+    """
+
+    t: Literal["example_ref"] = "example_ref"
+    label: str
+    number: str = ""
+
+
+class ExerciseRefBlock(BaseModel):
+    t: Literal["exercise_ref"] = "exercise_ref"
+    label: str
+    number: str = ""
+
+
+class QuestionRefBlock(BaseModel):
+    t: Literal["question_ref"] = "question_ref"
+    label: str
+    number: str = ""
 
 
 class ListBlock(BaseModel):
@@ -64,9 +90,21 @@ Block = Annotated[
         FigureBlock,
         ListBlock,
         ExampleBlock,
+        ExampleRefBlock,
+        ExerciseRefBlock,
+        QuestionRefBlock,
     ],
     Field(discriminator="t"),
 ]
 
-INVARIANT_TYPES: set[str] = {"eq", "def", "fig", "example", "table"}
+INVARIANT_TYPES: set[str] = {
+    "eq",
+    "def",
+    "fig",
+    "example",
+    "table",
+    "example_ref",
+    "exercise_ref",
+    "question_ref",
+}
 FREE_TYPES: set[str] = {"p", "h3", "kp", "list"}

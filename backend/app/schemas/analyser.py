@@ -64,6 +64,12 @@ class ExcludedSection(BaseModel):
     # v3 question worker treats these as section-aligned units too — they get
     # their own count target.
     expected_question_count: int | None = None
+    # Sub-categories printed inside a Practice Questions block — e.g.
+    # "Very Short Answer Type", "Short Answer Type", "MCQs", "Numerical
+    # Problems", "Assertion-Reason". The analyser fills these from visible
+    # sub-headings; the worker emits each as its own extraction unit so the
+    # bank mirrors the book exactly.
+    subsections: list[ExcludedSection] = Field(default_factory=list)
 
     model_config = {"extra": "ignore"}
 
@@ -84,3 +90,4 @@ class BookSchema(BaseModel):
 
 
 SchemaSection.model_rebuild()
+ExcludedSection.model_rebuild()

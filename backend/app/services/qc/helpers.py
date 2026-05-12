@@ -81,6 +81,10 @@ def paragraphs_to_plain_text(paragraphs: list[dict]) -> str:
             if eqs:
                 body.append(" ".join(eqs))
             parts.append(" ".join(body))
+        elif t in ("example_ref", "exercise_ref", "question_ref"):
+            label = p.get("label", "") or p.get("number", "")
+            if label:
+                parts.append(label)
         else:
             content = p.get("content", "") or p.get("c", "")
             if content:
@@ -103,6 +107,10 @@ def blocks_to_plain_text(blocks: list[dict]) -> str:
             if eqs:
                 pieces.append(" ".join(eqs))
             parts.append(" ".join(pieces))
+        elif t in ("example_ref", "exercise_ref", "question_ref"):
+            label = b.get("label", "") or b.get("number", "")
+            if label:
+                parts.append(label)
         elif t == "list":
             items = b.get("items", []) or []
             parts.append("\n".join(items))

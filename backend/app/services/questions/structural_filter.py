@@ -1,12 +1,21 @@
-"""Post-extraction structural filter — reject items that are not actually questions.
+"""Post-extraction structural filter — drop only obvious junk.
 
-The Gemini extractor is permissive by design (we'd rather it tag too much than
-miss things), so we apply a mechanical filter on the way out. An item must
-satisfy at least one positive question-marker AND none of the hard exclusions
-to survive.
+The Gemini extractor's prompt is already strict (RULE A/B in
+question_extractor_v3.txt: never fabricate, must be anchored to a printed
+marker). Anything it emits as a question has already passed that bar.
 
-Each rejection records a reason so the diagnostic UI can explain "why did this
-disappear" without the user having to re-OCR by hand.
+So this filter is intentionally permissive: it does NOT try to re-validate
+"is this a question" via heuristics — those heuristics produced false
+rejections on legitimate worked examples (e.g. "In a Coolidge tube, …
+Find the minimum wavelength" — verb at word 17, missed by an early-window
+check). Instead we only drop:
+
+    - empty / single-fragment items (length < MIN_RAW_TEXT_LEN)
+    - items whose body literally contains a known callout phrase
+      ("Did You Know", "Answer Key", crossword markers, …)
+
+Anything else is kept. If a downstream user wants to drop more (legitimate
+human review), they do that in the UI with a Reject button — not here.
 """
 
 from __future__ import annotations
@@ -73,12 +82,13 @@ class FilterResult:
 
 
 def _looks_like_question(raw_text: str) -> tuple[bool, str]:
-    """Return (is_question, reason_if_not).
+    """Return (keep, reason_if_dropped).
 
-    A line counts as a question when ANY of these are true:
-        - has a numbered/lettered prefix (1., Q.3, (a), Exercise 8.2, …)
-        - contains a question mark
-        - starts with an imperative verb in the first 10 words
+    Permissive — trusts the upstream Gemini prompt's anti-fabrication guards.
+    Drops ONLY:
+      - too short to be a real question stem
+      - body literally contains a known non-question callout phrase
+    Everything else is kept; if it's noise, a human can reject it in the UI.
     """
     text = (raw_text or "").strip()
     if len(text) < MIN_RAW_TEXT_LEN:
@@ -89,17 +99,7 @@ def _looks_like_question(raw_text: str) -> tuple[bool, str]:
         if phrase in lower:
             return False, f"contains excluded phrase: '{phrase}'"
 
-    if _NUMBER_PREFIX.match(text):
-        return True, ""
-    if "?" in text:
-        return True, ""
-    # Check the first ~10 words for an imperative verb. Beyond that, the verb
-    # is probably part of the body, not the prompt itself.
-    head = " ".join(text.split()[:10])
-    if _IMPERATIVE_VERB.search(head):
-        return True, ""
-
-    return False, "no question markers (number, '?', or imperative verb)"
+    return True, ""
 
 
 def filter_items(items: list[dict[str, Any]]) -> FilterResult:

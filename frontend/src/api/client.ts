@@ -30,6 +30,16 @@ export interface BookSchema {
   subject: string;
   sections: SchemaSection[];
   exclusion_summary: string[];
+  excluded_sections?: ExcludedSection[];
+}
+
+export interface ExcludedSection {
+  title: string;
+  reason?: string | null;
+  page_start?: number | null;
+  page_end?: number | null;
+  expected_question_count?: number;
+  subsections?: ExcludedSection[];
 }
 
 export interface SchemaSection {
@@ -47,10 +57,13 @@ export type Block =
   | { t: "eq"; c: string }
   | { t: "def"; term: string; c: string }
   | { t: "kp"; c: string }
-  | { t: "fig"; c: string }
+  | { t: "fig"; c: string; label?: string }
   | { t: "list"; items: string[] }
   | { t: "table"; caption: string; headers: string[]; rows: string[][] }
-  | { t: "example"; label: string; prob: string; eqs: string[] };
+  | { t: "example"; label: string; prob: string; eqs: string[] }
+  | { t: "example_ref"; label: string; number?: string; section_id?: string; question_id?: string }
+  | { t: "exercise_ref"; label: string; number?: string; section_id?: string; question_id?: string }
+  | { t: "question_ref"; label: string; number?: string; section_id?: string; question_id?: string };
 
 export interface Section {
   id: UUID;
@@ -155,7 +168,7 @@ export interface ExtractionSectionStats {
   extracted: number;
   rejected: number;
   rejected_items: ExtractionRejectedItem[];
-  status: "complete" | "partial" | "empty" | "failed";
+  status: "complete" | "partial" | "empty" | "failed" | "skipped";
   attempts: number;
   error: string | null;
 }
@@ -182,6 +195,8 @@ export interface QuestionBank {
 
 export interface Question {
   id: UUID;
+  regen_id?: UUID | null;
+  source_question_id?: UUID | null;
   section_ref: string | null;
   section_title: string | null;
   page_start: number | null;
@@ -203,6 +218,20 @@ export interface Question {
   solution_text: string | null;
   has_solution: boolean;
   kind: string;
+  is_hidden: boolean;
+}
+
+export interface RejectedQuestion {
+  id: UUID;
+  section_ref: string | null;
+  section_title: string | null;
+  page_start: number | null;
+  page_end: number | null;
+  raw_text: string;
+  reject_reason: string | null;
+  payload: Record<string, unknown> | null;
+  status: "pending" | "restored" | "discarded";
+  created_at: string | null;
 }
 
 export type QuestionKind = "exercise" | "example" | "problem" | "try_it" | "review" | "mcq" | "other";
@@ -212,6 +241,7 @@ export interface QuestionBankSectionGroup {
   section_title: string;
   questions: Question[];
   by_kind: Partial<Record<QuestionKind, Question[]>>;
+  rejected: RejectedQuestion[];
   identified: number;
   extracted: number;
   missed: number;
@@ -273,7 +303,9 @@ export interface QuestionRegeneration {
   scope: "bank" | "sections";
   section_refs: string[];
   custom_instructions: string | null;
-  status: "pending" | "extracting" | "ready" | "failed" | "saved";
+  // "partial" is set by the v3 worker when any section failed but at least
+  // one section succeeded — the run is usable but not fully complete.
+  status: "pending" | "extracting" | "ready" | "partial" | "failed" | "saved";
   job_id: UUID | null;
   question_count: number;
   stats: ExtractionStats | null;
@@ -283,10 +315,18 @@ export interface QuestionRegeneration {
   finished_at: string | null;
 }
 
+// 0014 — variants grouped by source_question_id for the new theory-style UI.
+export interface QuestionRegenSourceGroup {
+  source_id: UUID | null;
+  source: Question | null;
+  variants: Question[];
+}
+
 export interface QuestionRegenSectionGroup {
   section_ref: string | null;
   section_title: string | null;
-  questions: Question[];
+  questions: Question[];   // flat list — backward-compat
+  sources?: QuestionRegenSourceGroup[];  // grouped by source (new)
 }
 
 export interface QuestionRegenQuestionsResponse {
@@ -300,6 +340,23 @@ export interface RegenerateQuestionsParams {
   custom_instructions?: string | null;
   source_regen_id?: UUID | null;
   label?: string | null;
+  // R4 — v3 regen params. All optional with worker-side defaults.
+  similarity_level?:
+    | "numbers_only"
+    | "numbers_and_rephrase"
+    | "new_question_same_topic"
+    | "same_topic_add_one_concept"
+    | "same_chapter_any_topic"
+    | null;
+  count?: number | null;
+  question_type?: string | null;
+  priority_mode?: "override" | "layer_on_top" | "specific_aspects" | null;
+}
+
+// R10 — section-level retry params
+export interface RetryRegenSectionParams {
+  regen_id: UUID;
+  section_ref: string;
 }
 
 export interface Provider {
@@ -443,6 +500,26 @@ export const api = {
     ),
   listQuestions: (bankId: UUID) =>
     req<QuestionBankDetail>(`/api/question-banks/${bankId}/questions`),
+  restoreRejected: (bankId: UUID, rejectedId: UUID) =>
+    req<{ ok: boolean; question_id: UUID; rejected_id: UUID }>(
+      `/api/question-banks/${bankId}/rejected/${rejectedId}/restore`,
+      { method: "POST" },
+    ),
+  discardRejected: (bankId: UUID, rejectedId: UUID) =>
+    req<{ ok: boolean; rejected_id: UUID }>(
+      `/api/question-banks/${bankId}/rejected/${rejectedId}/discard`,
+      { method: "POST" },
+    ),
+  hideQuestion: (questionId: UUID) =>
+    req<{ ok: boolean; question_id: UUID; is_hidden: boolean }>(
+      `/api/question-banks/questions/${questionId}/hide`,
+      { method: "PATCH" },
+    ),
+  unhideQuestion: (questionId: UUID) =>
+    req<{ ok: boolean; question_id: UUID; is_hidden: boolean }>(
+      `/api/question-banks/questions/${questionId}/unhide`,
+      { method: "PATCH" },
+    ),
   exportQuestionsJson: (bankId: UUID) => {
     const a = document.createElement("a");
     a.href = `${API_BASE}/api/question-banks/${bankId}/export/json`;
@@ -487,6 +564,40 @@ export const api = {
       method: "DELETE",
       body: JSON.stringify({ question_ids: questionIds }),
     }),
+  // R6 — section-level retry
+  retryRegenSection: (regenId: UUID, sectionRef: string) =>
+    req<{ regen_id: UUID; section_ref: string; job_id: UUID; status: string }>(
+      `/api/question-regenerations/${regenId}/retry-section`,
+      { method: "POST", body: JSON.stringify({ section_ref: sectionRef }) },
+    ),
+  // R10 — regen exports (overall, or per-section via section_ref query param)
+  exportRegenJson: (regenId: UUID, sectionRef?: string) => {
+    const qs = sectionRef ? `?section_ref=${encodeURIComponent(sectionRef)}` : "";
+    const a = document.createElement("a");
+    a.href = `${API_BASE}/api/question-regenerations/${regenId}/export/json${qs}`;
+    a.download = "";
+    document.body.appendChild(a);
+    a.click();
+    a.remove();
+  },
+  exportRegenMarkdown: (regenId: UUID, sectionRef?: string) => {
+    const qs = sectionRef ? `?section_ref=${encodeURIComponent(sectionRef)}` : "";
+    const a = document.createElement("a");
+    a.href = `${API_BASE}/api/question-regenerations/${regenId}/export/markdown${qs}`;
+    a.download = "";
+    document.body.appendChild(a);
+    a.click();
+    a.remove();
+  },
+  exportRegenDocx: (regenId: UUID, sectionRef?: string) => {
+    const qs = sectionRef ? `?section_ref=${encodeURIComponent(sectionRef)}` : "";
+    const a = document.createElement("a");
+    a.href = `${API_BASE}/api/question-regenerations/${regenId}/export/docx${qs}`;
+    a.download = "";
+    document.body.appendChild(a);
+    a.click();
+    a.remove();
+  },
   listProviders: () => req<Provider[]>("/api/providers"),
   getProviderKeyStatus: (name: string) =>
     req<{ provider: string; configured: boolean }>(`/api/providers/${name}/keys`),

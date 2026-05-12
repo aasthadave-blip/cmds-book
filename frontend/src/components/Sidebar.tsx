@@ -1,9 +1,11 @@
-import { useState, useMemo } from "react";
+import { useState, useMemo, createContext, useContext } from "react";
 import {
   useBooks,
   useBook,
   useSections,
   useBookRegenerations,
+  useQuestionRegenerations,
+  useRegenQuestions,
   useQuestionBanks,
   useQuestions,
 } from "../api/hooks";
@@ -108,7 +110,7 @@ function shortStatus(s: string): string {
 function BookFolders({ bookId }: { bookId: string }) {
   const { data: regens } = useBookRegenerations(bookId);
   const { data: banks } = useQuestionBanks(bookId);
-  const { bookLens, setBookLens } = useUI();
+  const { bookLens, setBookLens, view, setView } = useUI();
 
   const latestRegen = regens?.[0] ?? null;
   // Prefer the latest READY bank so the user sees results even if a retry
@@ -129,6 +131,31 @@ function BookFolders({ bookId }: { bookId: string }) {
 
   return (
     <div style={{ marginLeft: 14 }}>
+      {/* Schema / Progress — always reachable from any book view */}
+      <button
+        className={`sb-nav-btn ${view === "schema" ? "active" : ""}`}
+        onClick={() => setView("schema")}
+        style={{
+          width: "100%",
+          padding: "4px 8px",
+          marginBottom: 4,
+          fontSize: "0.7rem",
+          fontWeight: 600,
+          textAlign: "left",
+          border: "1px solid var(--b1)",
+          borderRadius: 5,
+          background: view === "schema" ? "var(--accent)" : "var(--bg2)",
+          color: view === "schema" ? "#fff" : "var(--text2)",
+          cursor: "pointer",
+          display: "flex",
+          alignItems: "center",
+          gap: 6,
+        }}
+        title="Schema & extraction progress for this book"
+      >
+        <span>🗂</span>
+        <span>Schema / Progress</span>
+      </button>
       {/* Lens toggle — Theory vs Questions */}
       <div
         style={{
@@ -207,7 +234,20 @@ function BookFolders({ bookId }: { bookId: string }) {
                 : "Extracting…"}
             </div>
           )}
-          {bankReady && <QuestionsLens bankId={latestBank.id} bookId={bookId} />}
+          {bankReady && (
+            <>
+              <QuestionsLens
+                bankId={latestBank.id}
+                bookId={bookId}
+                regenId={null}
+              />
+              {/* ✨ Regenerated — exact tree replica of the Questions lens,
+                   sourced from the latest regen run's questions. Same shape
+                   as theory's flat-list mirror but tree-shaped here because
+                   the question schema is hierarchical. */}
+              <RegenLabelAndLens bookId={bookId} bankId={latestBank.id} />
+            </>
+          )}
         </>
       )}
     </div>
@@ -255,11 +295,27 @@ function SectionList({ bookId, regenId }: { bookId: string; regenId: string | nu
       }
     }
     walk(book?.schema_?.sections ?? []);
-    if (schemaIds.length === 0) return sections;
-    const map = new Map(sections.map((s) => [s.section_id, s]));
-    const result = schemaIds.map((id) => map.get(id)).filter(Boolean) as Section[];
+    // Hide question-kind child sections from the Theory tab — they're
+    // rendered as inline touchpoint chips inside their parent section's
+    // theory blocks. Theory-aid kinds (illustration, progress-check,
+    // activity, try-it, quick-check, thinking-corner, note) are KEPT
+    // because they're part of theory and have content_types=["theory"].
+    // Pattern matches the suffix "<kind>-<num>" or just "<kind>" at end of id.
+    // Question kinds (must match Step 4 linker `_QUESTION_KINDS`):
+    //   example, worked-example, solved-example, exercise, problem,
+    //   practice-problem, in-text-question, intext-question
+    const QUESTION_KIND_RE =
+      /[\.\-](?:worked-example|solved-example|practice-problem|in-text-question|intext-question|example|exercise|problem)(?:[\.\-]\d[\w.-]*)?$/;
+    const isQuestionChild = (id: string) => QUESTION_KIND_RE.test(id);
+    const filteredSections = sections.filter((s) => !isQuestionChild(s.section_id));
+    if (schemaIds.length === 0) return filteredSections;
+    const map = new Map(filteredSections.map((s) => [s.section_id, s]));
+    const result = schemaIds
+      .filter((id) => !isQuestionChild(id))
+      .map((id) => map.get(id))
+      .filter(Boolean) as Section[];
     const inOrder = new Set(schemaIds);
-    sections.forEach((s) => { if (!inOrder.has(s.section_id)) result.push(s); });
+    filteredSections.forEach((s) => { if (!inOrder.has(s.section_id)) result.push(s); });
     return result;
   }, [sections, book]);
 
@@ -319,112 +375,460 @@ const KIND_ORDER: QuestionKind[] = [
   "example", "try_it", "problem", "mcq", "exercise", "review", "other",
 ];
 
-function QuestionsLens({ bankId, bookId }: { bankId: string; bookId: string }) {
-  const { data: detail } = useQuestions(bankId);
-  const { data: book } = useBook(bookId);
+// Tree node we build by walking the schema. Each schema node (section +
+// subsection) becomes a tree node, with its extraction group attached if any
+// Context flag: when set, this Questions tree is the regen mirror, not the
+// original. Tree node click handlers consult it to switch to regen view.
+const QuestionsRegenContext = createContext<{
+  regenId: string | null;
+  regenBankId: string | null;
+  activeBankId: string;
+} | null>(null);
 
-  // Order sections by book schema so the questions lens mirrors the theory lens.
-  const ordered = useMemo(() => {
-    if (!detail) return [];
-    const order: string[] = [];
+// questions were extracted for that section_ref.
+type SchemaTreeNode = {
+  id: string;
+  title: string;
+  type: string;
+  depth: number;
+  children: SchemaTreeNode[];
+  group: QuestionBankSectionGroup | null;
+};
+
+function QuestionsLens({
+  bankId,
+  bookId,
+  regenId = null,
+}: {
+  bankId: string;
+  bookId: string;
+  regenId?: string | null;
+}) {
+  // R1 — when regenId is set, the tree is rendered in "regen mode": same
+  // schema hierarchy, but the per-section group is sourced from regen
+  // variants instead of original extraction. Clicks navigate to the
+  // regen review pane for that section.
+  const { data: bankDetail } = useQuestions(bankId);
+  const { data: regenData } = useRegenQuestions(regenId);
+  const { data: book } = useBook(bookId);
+  // Normalise: bankDetail and regenData both expose `sections[]` with
+  // {section_ref, section_title, questions}. Pick whichever matches mode.
+  const detail = regenId
+    ? regenData
+      ? ({ sections: regenData.sections } as { sections: QuestionBankSectionGroup[] })
+      : undefined
+    : bankDetail;
+
+  // Build a hierarchical tree mirroring the schema 1:1, with extraction
+  // groups attached. Every schema node is rendered — even ones with zero
+  // questions — so missed examples are visible, not hidden.
+  const tree: SchemaTreeNode[] = useMemo(() => {
+    if (!book?.schema_?.sections) return [];
+    const groupByRef = new Map<string, QuestionBankSectionGroup>();
+    for (const s of detail?.sections ?? []) {
+      groupByRef.set(s.section_ref, s);
+    }
     // eslint-disable-next-line @typescript-eslint/no-explicit-any
-    function walk(arr: any[]) {
-      for (const s of arr ?? []) {
-        if (s.type !== "excluded") order.push(s.id as string);
-        walk(s.subsections ?? []);
+    function build(node: any, depth: number): SchemaTreeNode | null {
+      if ((node.type ?? "section") === "excluded") return null;
+      // Chapter wrapper → flatten its children up one level (matches worker)
+      if ((node.type ?? "").toLowerCase() === "chapter") {
+        // We synthesise a chapter node so it still appears in the tree at
+        // the top level, but with depth=0 and its children at depth=1.
+        const kids: SchemaTreeNode[] = [];
+        for (const c of node.subsections ?? []) {
+          const built = build(c, depth + 1);
+          if (built) kids.push(built);
+        }
+        return {
+          id: node.id,
+          title: node.title,
+          type: node.type ?? "chapter",
+          depth,
+          children: kids,
+          group: groupByRef.get(node.id) ?? null,
+        };
       }
+      const kids: SchemaTreeNode[] = [];
+      for (const c of node.subsections ?? []) {
+        const built = build(c, depth + 1);
+        if (built) kids.push(built);
+      }
+      return {
+        id: node.id,
+        title: node.title,
+        type: node.type ?? "section",
+        depth,
+        children: kids,
+        group: groupByRef.get(node.id) ?? null,
+      };
     }
-    walk(book?.schema_?.sections ?? []);
-    if (order.length === 0) return detail.sections;
-    const map = new Map(detail.sections.map((s) => [s.section_ref, s]));
-    const result: QuestionBankSectionGroup[] = [];
-    for (const id of order) {
-      const grp = map.get(id);
-      if (grp) result.push(grp);
+    const out: SchemaTreeNode[] = [];
+    for (const s of book.schema_.sections) {
+      const built = build(s, 0);
+      if (built) out.push(built);
     }
-    const inOrder = new Set(order);
-    detail.sections.forEach((s) => {
-      if (!inOrder.has(s.section_ref)) result.push(s);
-    });
-    return result;
-  }, [detail, book]);
+    return out;
+  }, [book, detail]);
+
+  // Append any extracted groups whose section_ref ISN'T in the schema —
+  // typically excluded blocks ("PRACTICE QUESTIONS: …") that are linked to
+  // sections by a separate process. Render them as a flat list at the bottom.
+  const orphans = useMemo(() => {
+    if (!detail) return [];
+    const inSchema = new Set<string>();
+    function collect(n: SchemaTreeNode) {
+      inSchema.add(n.id);
+      n.children.forEach(collect);
+    }
+    tree.forEach(collect);
+    return detail.sections.filter((s) => !inSchema.has(s.section_ref));
+  }, [detail, tree]);
 
   if (!detail) {
     return (
       <div style={{ padding: "4px 14px", fontSize: "0.7rem", color: "var(--text3)" }}>
-        Loading questions…
+        {regenId ? "Loading regenerated questions…" : "Loading questions…"}
       </div>
     );
   }
-  if (ordered.length === 0) {
+  if (tree.length === 0 && orphans.length === 0) {
     return (
       <div style={{ padding: "4px 14px", fontSize: "0.7rem", color: "var(--text3)" }}>
-        No questions extracted yet.
+        {regenId
+          ? "No regenerated questions yet."
+          : "No questions extracted yet."}
       </div>
     );
   }
 
+  // Resolve the bank that owns this regen so click navigation can hop
+  // banks if the regen is from an older one (cross-bank case).
+  const regenBankId = regenId
+    ? (regenData?.regen?.bank_id ?? bankId)
+    : null;
+
+  return (
+    <QuestionsRegenContext.Provider
+      value={{ regenId, regenBankId, activeBankId: bankId }}
+    >
+    <div>
+      {tree.map((n) => (
+        <QuestionTreeNode key={n.id} node={n} />
+      ))}
+      {orphans.length > 0 && (
+        <>
+          <div className="sb-lbl" style={{ marginTop: 6 }}>
+            End-of-chapter blocks
+          </div>
+          {(() => {
+            // Group "PARENT::CHILD" orphans under a synthetic parent node so
+            // practice sub-headings (Very Short / Short / Essay …) render as
+            // nested folders matching the original PDF layout.
+            type Group = { parent: string; standalone: QuestionBankSectionGroup | null; children: QuestionBankSectionGroup[] };
+            const byParent = new Map<string, Group>();
+            const ordered: string[] = [];
+            for (const s of orphans) {
+              const [parent, ...rest] = s.section_ref.split("::");
+              if (!byParent.has(parent)) {
+                byParent.set(parent, { parent, standalone: null, children: [] });
+                ordered.push(parent);
+              }
+              const g = byParent.get(parent)!;
+              if (rest.length === 0) g.standalone = s;
+              else g.children.push(s);
+            }
+            return ordered.map((p) => {
+              const g = byParent.get(p)!;
+              if (g.children.length === 0 && g.standalone) {
+                return <QuestionFlatNode key={p} section={g.standalone} />;
+              }
+              return <QuestionParentNode key={p} parent={p} children={g.children} />;
+            });
+          })()}
+        </>
+      )}
+    </div>
+    </QuestionsRegenContext.Provider>
+  );
+}
+
+/** Recursive tree node — mirrors schema hierarchy with depth-indent.
+ *  Renders even when the section has 0 extracted questions, so missed
+ *  examples are visible (shown as "0" with muted styling). */
+function QuestionTreeNode({ node }: { node: SchemaTreeNode }) {
+  const hasChildren = node.children.length > 0;
+  // Auto-open the top two levels so the user sees the structure without
+  // clicking. Deeper levels start closed.
+  const [open, setOpen] = useState(node.depth < 2);
+  const {
+    selectedQuestionSectionRef,
+    selectedKind,
+    selectedQuestionRegenId,
+    selectKind,
+    selectQuestionRegen,
+    selectBank,
+    setView,
+  } = useUI();
+  // Regen context — when set, this tree is the ✨ mirror; clicks navigate
+  // to the regen review pane.
+  const regenCtx = useContext(QuestionsRegenContext);
+  const inRegenMode = !!regenCtx?.regenId;
+
+  const group = node.group;
+  const ownCount = group?.questions.length ?? 0;
+  // Sum extracted count of ALL descendants — gives a "this whole subtree
+  // produced N questions" badge on parent rows.
+  const totalCount = useMemo(() => {
+    let n = ownCount;
+    function add(c: SchemaTreeNode) {
+      n += c.group?.questions.length ?? 0;
+      c.children.forEach(add);
+    }
+    node.children.forEach(add);
+    return n;
+  }, [node, ownCount]);
+
+  // Visual cue when the schema expected questions but extraction got zero.
+  // In regen mode, "no variants" is dimmed; in original mode it means
+  // "missed" (extraction found nothing for a schema-listed section).
+  const isMissed = ownCount === 0 && !hasChildren;
+  const indentPx = Math.min(node.depth, 4) * 10;
+  const isExample = /^\s*EXAMPLE\s+\d/i.test(node.title);
+  const isActive =
+    selectedQuestionSectionRef === node.id &&
+    !selectedKind &&
+    (inRegenMode
+      ? selectedQuestionRegenId === regenCtx?.regenId
+      : !selectedQuestionRegenId);
+
+  // Click target: in original mode, clear any regen + show extraction.
+  // In regen mode, hop bank if needed, set the regen and section so
+  // RegenView opens that section's diff pane.
+  const navigate = () => {
+    if (inRegenMode && regenCtx) {
+      if (regenCtx.regenBankId && regenCtx.regenBankId !== regenCtx.activeBankId) {
+        selectBank(regenCtx.regenBankId);
+      }
+      selectQuestionRegen(regenCtx.regenId);
+    } else {
+      selectQuestionRegen(null);
+    }
+    selectKind(node.id, null);
+    setView("questions");
+  };
+
   return (
     <div>
-      {ordered
-        .filter((s) => s.questions.length > 0)
-        .map((s) => (
-          <QuestionSectionNode key={s.section_ref} section={s} />
-        ))}
+      <div
+        className={`tn ${isActive ? "active" : ""}`}
+        style={{
+          paddingLeft: 10 + indentPx,
+          opacity: isMissed ? 0.55 : 1,
+          display: "flex",
+          alignItems: "center",
+          cursor: "pointer",
+        }}
+        onClick={navigate}
+        title={
+          isMissed
+            ? `${node.title} — no questions extracted (schema-listed but Gemini found none)`
+            : node.title
+        }
+      >
+        <span
+          className={`tarr ${open ? "o" : ""}`}
+          onClick={(e) => {
+            e.stopPropagation();
+            if (hasChildren) setOpen((o) => !o);
+          }}
+          style={{ cursor: hasChildren ? "pointer" : "default" }}
+        >
+          {hasChildren ? "▸" : " "}
+        </span>
+        <span className="tico">
+          {inRegenMode
+            ? hasChildren ? "📂" : "✨"
+            : isExample ? "📘" : hasChildren ? "📂" : "📖"}
+        </span>
+        <span className="tlbl" style={{ fontSize: node.depth === 0 ? "0.78rem" : "0.72rem" }}>
+          {node.title}
+        </span>
+        <span
+          className="tcnt"
+          style={{ color: isMissed ? "var(--warn, #c80)" : undefined }}
+        >
+          {hasChildren ? totalCount : ownCount}
+        </span>
+      </div>
+      {open && hasChildren && (
+        <>
+          {node.children.map((c) => (
+            <QuestionTreeNode key={c.id} node={c} />
+          ))}
+        </>
+      )}
     </div>
   );
 }
 
-function QuestionSectionNode({ section }: { section: QuestionBankSectionGroup }) {
-  const [open, setOpen] = useState(false);
-  const { selectedQuestionSectionRef, selectedKind, selectKind, setView } = useUI();
-
-  const totalCount = section.questions.length;
-  const kindsPresent = KIND_ORDER.filter(
-    (k) => (section.by_kind[k]?.length ?? 0) > 0,
-  );
-
+/** Synthetic parent node for excluded sections that have nested
+ *  sub-headings (e.g. "PRACTICE QUESTIONS: CLASSROOM WING" with
+ *  "Very Short / Short / Essay" children). Each child is rendered as a
+ *  QuestionFlatNode beneath the parent, mirroring the PDF structure. */
+function QuestionParentNode({
+  parent,
+  children,
+}: {
+  parent: string;
+  children: QuestionBankSectionGroup[];
+}) {
+  const [open, setOpen] = useState(true);
+  const {
+    selectedQuestionSectionRef,
+    selectedKind,
+    selectedQuestionRegenId,
+    selectKind,
+    selectQuestionRegen,
+    selectBank,
+    setView,
+  } = useUI();
+  const regenCtx = useContext(QuestionsRegenContext);
+  const inRegenMode = !!regenCtx?.regenId;
+  const total = children.reduce((n, c) => n + c.questions.length, 0);
+  const isActive =
+    selectedQuestionSectionRef === parent &&
+    !selectedKind &&
+    (inRegenMode
+      ? selectedQuestionRegenId === regenCtx?.regenId
+      : !selectedQuestionRegenId);
+  const onClick = () => {
+    if (inRegenMode && regenCtx) {
+      if (regenCtx.regenBankId && regenCtx.regenBankId !== regenCtx.activeBankId) {
+        selectBank(regenCtx.regenBankId);
+      }
+      selectQuestionRegen(regenCtx.regenId);
+    } else {
+      selectQuestionRegen(null);
+    }
+    selectKind(parent, null);
+    setView("questions");
+  };
   return (
     <div>
-      <button
-        className="tn"
-        onClick={() => setOpen((o) => !o)}
+      <div
+        className={`tn ${isActive ? "active" : ""}`}
+        style={{ display: "flex", alignItems: "center", cursor: "pointer" }}
+        onClick={onClick}
+        title={`View all ${total} ${inRegenMode ? "regen variants" : "questions"} in ${parent}`}
       >
-        <span className={`tarr ${open ? "o" : ""}`}>▸</span>
-        <span className="tico">📖</span>
-        <span className="tlbl">
-          §{section.section_ref} {section.section_title}
+        <span
+          className={`tarr ${open ? "o" : ""}`}
+          onClick={(e) => {
+            e.stopPropagation();
+            setOpen((o) => !o);
+          }}
+          style={{ cursor: "pointer" }}
+        >
+          ▸
         </span>
-        <span className="tcnt">{totalCount}</span>
-      </button>
+        <span className="tico">📂</span>
+        <span className="tlbl" style={{ fontWeight: 600 }}>{parent}</span>
+        <span className="tcnt">{total}</span>
+      </div>
       {open && (
         <div style={{ marginLeft: 12 }}>
-          {kindsPresent.map((k) => {
-            const meta = KIND_META[k];
-            const items = section.by_kind[k] ?? [];
-            const isActive =
-              selectedQuestionSectionRef === section.section_ref &&
-              selectedKind === k;
+          {children.map((c) => {
+            const childTitle =
+              c.section_title ||
+              c.section_ref.split("::").slice(1).join("::") ||
+              c.section_ref;
             return (
-              <button
-                key={k}
-                className={`tn ${isActive ? "active" : ""}`}
-                onClick={() => {
-                  selectKind(section.section_ref, k);
-                  setView("questions");
-                }}
-                style={{ color: "var(--purple)" }}
-                title={`${items.length} ${meta.label.toLowerCase()} in §${section.section_ref}`}
-              >
-                <span className="tarr"> </span>
-                <span className="tico">{meta.icon}</span>
-                <span className="tlbl">{meta.label}</span>
-                <span className="tcnt">{items.length}</span>
-              </button>
+              <QuestionFlatNode
+                key={c.section_ref}
+                section={{ ...c, section_title: childTitle }}
+              />
             );
           })}
         </div>
       )}
+    </div>
+  );
+}
+
+// ---------------------------------------------------------------------
+// "✨ Regenerated" label + a second QuestionsLens render in regen mode.
+// The same tree component is re-used so the regen subtree is a 1:1
+// structural replica of the original Questions tree — only the per-row
+// content (counts, click target) differs. Same UX pattern as theory's
+// SectionList(regenId) double-render.
+// ---------------------------------------------------------------------
+function RegenLabelAndLens({ bookId, bankId }: { bookId: string; bankId: string }) {
+  const { data: regens } = useQuestionRegenerations(bookId);
+  if (!regens || regens.length === 0) return null;
+  const latestRegen = regens[0];
+  if (!latestRegen) return null;
+  return (
+    <>
+      <div className="sb-lbl" style={{ marginTop: 6 }}>✨ Regenerated</div>
+      <QuestionsLens
+        bankId={bankId}
+        bookId={bookId}
+        regenId={latestRegen.id}
+      />
+    </>
+  );
+}
+
+
+/** Flat node for end-of-chapter excluded blocks that aren't part of the
+ *  schema tree — kept simple, no nesting. */
+function QuestionFlatNode({ section }: { section: QuestionBankSectionGroup }) {
+  const {
+    selectedQuestionSectionRef,
+    selectedKind,
+    selectedQuestionRegenId,
+    selectKind,
+    selectQuestionRegen,
+    selectBank,
+    setView,
+  } = useUI();
+  const regenCtx = useContext(QuestionsRegenContext);
+  const inRegenMode = !!regenCtx?.regenId;
+
+  const totalCount = section.questions.length;
+  const isActive =
+    selectedQuestionSectionRef === section.section_ref &&
+    !selectedKind &&
+    (inRegenMode
+      ? selectedQuestionRegenId === regenCtx?.regenId
+      : !selectedQuestionRegenId);
+
+  const onClick = () => {
+    if (inRegenMode && regenCtx) {
+      if (regenCtx.regenBankId && regenCtx.regenBankId !== regenCtx.activeBankId) {
+        selectBank(regenCtx.regenBankId);
+      }
+      selectQuestionRegen(regenCtx.regenId);
+    } else {
+      selectQuestionRegen(null);
+    }
+    selectKind(section.section_ref, null);
+    setView("questions");
+  };
+
+  return (
+    <div>
+      <button
+        className={`tn ${isActive ? "active" : ""}`}
+        onClick={onClick}
+        title={`${totalCount} ${inRegenMode ? "regen variants" : "questions"} in ${section.section_title || section.section_ref}`}
+      >
+        <span className="tarr"> </span>
+        <span className="tico">{inRegenMode ? "✨" : "📑"}</span>
+        <span className="tlbl">{section.section_title || section.section_ref}</span>
+        <span className="tcnt">{totalCount}</span>
+      </button>
     </div>
   );
 }

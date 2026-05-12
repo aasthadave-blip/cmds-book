@@ -188,3 +188,57 @@ def call_gemini_with_pdf(
     # Exhausted retries on transient failures
     assert last_exc is not None
     raise last_exc
+
+
+def call_gemini_text_only(
+    *,
+    system_prompt: str,
+    user_prompt: str,
+    model: str = "gemini-2.5-flash",
+    timeout_s: int = DEFAULT_TIMEOUT_S,
+    max_output_tokens: int = 32768,
+    temperature: float = 0.4,
+    response_mime_type: str = "application/json",
+) -> str:
+    """Call Gemini WITHOUT a PDF — pure text-in/text-out.
+
+    Used by the question regenerator: source is the previously-extracted
+    question's `raw_text` (already OCR'd by the extractor), not the PDF.
+    Cheaper, faster, no upload/cleanup overhead.
+
+    Same retry + concurrency semantics as ``call_gemini_with_pdf``.
+    Default temperature is higher (0.4) than for OCR-style calls (0.0) so
+    rephrasing/variation gets a little stochasticity.
+    """
+    from google.genai import types as gtypes
+
+    last_exc: BaseException | None = None
+    for attempt in range(RETRY_ATTEMPTS + 1):
+        with _inflight_sem:
+            client = _build_client(timeout_s)
+            try:
+                response = client.models.generate_content(
+                    model=model,
+                    contents=[system_prompt + "\n\n" + user_prompt],
+                    config=gtypes.GenerateContentConfig(
+                        response_mime_type=response_mime_type,
+                        temperature=temperature,
+                        max_output_tokens=max_output_tokens,
+                    ),
+                )
+                return response.text or ""
+            except Exception as e:
+                last_exc = e
+                if attempt < RETRY_ATTEMPTS and _is_transient(e):
+                    backoff = _BACKOFF_BASE_S * (2 ** attempt)
+                    backoff += random.uniform(0, backoff * 0.25)  # jitter
+                    logger.warning(
+                        "Gemini (text-only) transient error (attempt %s/%s): %s — retrying in %.1fs",
+                        attempt + 1, RETRY_ATTEMPTS + 1, e, backoff,
+                    )
+                    time.sleep(backoff)
+                    continue
+                raise
+
+    assert last_exc is not None
+    raise last_exc

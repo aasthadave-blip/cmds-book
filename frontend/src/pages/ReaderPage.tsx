@@ -1,13 +1,16 @@
-import { useEffect } from "react";
+import { useEffect, useState } from "react";
+import { useQueryClient } from "@tanstack/react-query";
 import {
   useBook,
+  useJob,
   useReExtractSection,
   useReExtractBook,
   useSection,
   useSections,
   useRegeneration,
+  qk,
 } from "../api/hooks";
-import { api, type Block } from "../api/client";
+import { api, type Block, type UUID } from "../api/client";
 import { BlockRenderer } from "../components/BlockRenderer";
 import { useUI } from "../stores/ui";
 
@@ -19,6 +22,27 @@ export function ReaderPage() {
   const { data: regen } = useRegeneration(selectedRegenId);
   const reExtract = useReExtractSection();
   const reExtractBook = useReExtractBook();
+  const queryClient = useQueryClient();
+
+  // Track the dispatched re-extract job per section so we can poll it and
+  // refresh the section blocks the moment the worker finishes.
+  const [reExtractJobId, setReExtractJobId] = useState<UUID | null>(null);
+  const [reExtractSectionId, setReExtractSectionId] = useState<UUID | null>(null);
+  const { data: reExtractJob } = useJob(reExtractJobId);
+
+  useEffect(() => {
+    if (!reExtractJob || !reExtractSectionId || !selectedBookId) return;
+    if (reExtractJob.status === "succeeded" || reExtractJob.status === "failed") {
+      void queryClient.invalidateQueries({ queryKey: qk.sections(selectedBookId) });
+      void queryClient.invalidateQueries({ queryKey: qk.section(reExtractSectionId) });
+      // brief delay so the user sees terminal state, then clear
+      const t = setTimeout(() => {
+        setReExtractJobId(null);
+        setReExtractSectionId(null);
+      }, 1500);
+      return () => clearTimeout(t);
+    }
+  }, [reExtractJob, reExtractSectionId, selectedBookId, queryClient]);
 
   const isRegenView = !!selectedRegenId;
 
@@ -142,17 +166,34 @@ export function ReaderPage() {
                   }
                   {!isRegenView && qcBadge && <span className={qcBadge.cls}>{qcBadge.label}</span>}
                   {!isRegenView && <span className="cvc">attempts: {String(section.attempts)}</span>}
-                  {!isRegenView && (
-                    <button
-                      onClick={() => reExtract.mutate(section.id)}
-                      disabled={reExtract.isPending}
-                      className="btn bg"
-                      style={{ padding: "2px 8px", fontSize: "0.64rem" }}
-                      title="Re-run Gemini OCR on this section only — other sections are not touched"
-                    >
-                      {reExtract.isPending ? "Re-extracting…" : "↺ Re-extract"}
-                    </button>
-                  )}
+                  {!isRegenView && (() => {
+                    const isThisSectionJob = reExtractSectionId === section.id && !!reExtractJob;
+                    const jobRunning = isThisSectionJob && reExtractJob && (reExtractJob.status === "queued" || reExtractJob.status === "running");
+                    const jobFailed = isThisSectionJob && reExtractJob?.status === "failed";
+                    const busy = reExtract.isPending || !!jobRunning;
+                    let label = "↺ Re-extract";
+                    if (reExtract.isPending) label = "Dispatching…";
+                    else if (jobRunning) label = `Re-extracting ${reExtractJob.progress ?? 0}%`;
+                    else if (jobFailed) label = "Failed — retry";
+                    return (
+                      <button
+                        onClick={() => {
+                          reExtract.mutate(section.id, {
+                            onSuccess: (data) => {
+                              setReExtractJobId(data.job_id);
+                              setReExtractSectionId(section.id);
+                            },
+                          });
+                        }}
+                        disabled={busy}
+                        className="btn bg"
+                        style={{ padding: "2px 8px", fontSize: "0.64rem", color: jobFailed ? "var(--red)" : undefined }}
+                        title={jobFailed ? `Last attempt failed: ${reExtractJob?.error || "unknown error"}` : "Re-run Gemini OCR on this section only — other sections are not touched"}
+                      >
+                        {label}
+                      </button>
+                    );
+                  })()}
                 </div>
               </div>
 

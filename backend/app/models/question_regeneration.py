@@ -39,6 +39,14 @@ class QuestionRegeneration(Base):
     section_refs: Mapped[list | None] = mapped_column(sa.JSON)
     custom_instructions: Mapped[str | None] = mapped_column(sa.Text)
 
+    # R5 (2026-05-11) — per-regen v3 parameters. All nullable; the v3 worker
+    # falls back to sane defaults when unset. The v2 worker ignores these
+    # entirely so existing flows are unaffected.
+    similarity_level: Mapped[str | None] = mapped_column(sa.String(64))
+    count: Mapped[int | None] = mapped_column(sa.Integer)
+    question_type: Mapped[str | None] = mapped_column(sa.String(64))
+    priority_mode: Mapped[str | None] = mapped_column(sa.String(32))
+
     # status: pending | extracting | ready | failed | saved
     status: Mapped[str] = mapped_column(sa.String(16), nullable=False, default="pending", server_default="pending")
     job_id: Mapped[UUID | None] = mapped_column(sa.Uuid(as_uuid=True), index=True)

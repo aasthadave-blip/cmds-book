@@ -1,4 +1,6 @@
-import type { Block } from "../api/client";
+import type { Block, Section } from "../api/client";
+import { useSections } from "../api/hooks";
+import { useUI } from "../stores/ui";
 
 // Strip leading "1. ", "2) ", "(3) " etc. so we don't double up the marker
 // when the <ol> auto-numbers the item. Also handles bare dashes and bullets.
@@ -58,9 +60,16 @@ function BlockView({ block }: { block: Block }) {
     case "fig":
       return (
         <div className="blk">
-          <div className="blkfig">{block.c}</div>
+          <div className="blkfig">
+            {block.label && <span style={{ fontWeight: 600, marginRight: 6 }}>{block.label}</span>}
+            {block.c}
+          </div>
         </div>
       );
+    case "example_ref":
+    case "exercise_ref":
+    case "question_ref":
+      return <RefChip block={block} />;
     case "list":
       return (
         <div className="blk">
@@ -120,4 +129,66 @@ function BlockView({ block }: { block: Block }) {
     default:
       return null;
   }
+}
+
+/** Clickable touchpoint chip injected by example_linker. Clicking navigates
+ *  the Reader to the example's own theory section (which holds the worked
+ *  problem + solution). */
+function RefChip({
+  block,
+}: {
+  block: Extract<Block, { t: "example_ref" | "exercise_ref" | "question_ref" }>;
+}) {
+  const tone =
+    block.t === "example_ref"
+      ? { bg: "#eef6ff", fg: "#1d4ed8", kind: "Worked example" }
+      : block.t === "exercise_ref"
+        ? { bg: "#fef3c7", fg: "#92400e", kind: "Exercise" }
+        : { bg: "#ecfdf5", fg: "#047857", kind: "Question" };
+
+  const { selectedBookId, selectSection, setView } = useUI();
+  const { data: sections } = useSections(selectedBookId);
+
+  const targetSectionId = block.section_id;
+  const target = targetSectionId
+    ? (sections ?? []).find((s: Section) => s.section_id === targetSectionId)
+    : undefined;
+
+  const clickable = !!target;
+  return (
+    <div className="blk">
+      <button
+        type="button"
+        disabled={!clickable}
+        onClick={() => {
+          if (target) {
+            selectSection(target.id);
+            setView("reader");
+          }
+        }}
+        style={{
+          display: "inline-flex",
+          alignItems: "center",
+          gap: 8,
+          padding: "4px 10px",
+          borderRadius: 999,
+          fontSize: "0.78rem",
+          background: tone.bg,
+          color: tone.fg,
+          border: "1px solid rgba(0,0,0,0.08)",
+          cursor: clickable ? "pointer" : "default",
+          font: "inherit",
+        }}
+        title={
+          clickable
+            ? `Open ${block.label || tone.kind} — has full problem + solution`
+            : `${tone.kind} (no linked content yet)`
+        }
+      >
+        <span style={{ fontWeight: 600 }}>{tone.kind}</span>
+        <span>{block.label || block.number || ""}</span>
+        {clickable && <span style={{ opacity: 0.6 }}>→</span>}
+      </button>
+    </div>
+  );
 }

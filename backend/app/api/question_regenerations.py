@@ -1,20 +1,30 @@
 """Question regenerations router.
 
-POST   /api/question-banks/{bank_id}/regenerate                 — start a regen run
-GET    /api/books/{book_id}/question-regenerations              — list runs for a book
-GET    /api/question-regenerations/{regen_id}                   — fetch one run
-GET    /api/question-regenerations/{regen_id}/questions         — list regen questions grouped by section
-POST   /api/question-regenerations/{regen_id}/save              — mark run as saved
-DELETE /api/question-regenerations/{regen_id}                   — delete the run + its questions
-DELETE /api/question-regenerations/{regen_id}/questions         — bulk-delete questions inside a run
+POST   /api/question-banks/{bank_id}/regenerate                       — start a regen run
+GET    /api/books/{book_id}/question-regenerations                    — list runs for a book
+GET    /api/question-regenerations/{regen_id}                         — fetch one run
+GET    /api/question-regenerations/{regen_id}/questions               — list regen questions grouped by section
+POST   /api/question-regenerations/{regen_id}/save                    — mark run as saved
+DELETE /api/question-regenerations/{regen_id}                         — delete the run + its questions
+DELETE /api/question-regenerations/{regen_id}/questions               — bulk-delete questions inside a run
+POST   /api/question-regenerations/{regen_id}/retry-section           — re-run regen for ONE section (R6)
+GET    /api/question-regenerations/{regen_id}/export/json             — download JSON (R10)
+GET    /api/question-regenerations/{regen_id}/export/markdown         — download Markdown (R10)
+GET    /api/question-regenerations/{regen_id}/export/docx             — download Word document (R10)
 """
 
 from __future__ import annotations
 
+import json
+import os
+import re
+import shutil
+import tempfile
+from pathlib import Path
 from typing import Any
 from uuid import UUID
 
-from fastapi import APIRouter, Body, Depends, HTTPException, Response, status
+from fastapi import APIRouter, Body, Depends, HTTPException, Query, Response, status
 from pydantic import BaseModel, Field
 from sqlalchemy import func, select
 from sqlalchemy.ext.asyncio import AsyncSession
@@ -39,6 +49,21 @@ class RegenerateRequest(BaseModel):
     source_regen_id: UUID | None = None
     label: str | None = None
 
+    # R4 — v3 regen params. All optional with worker-side defaults.
+    similarity_level: str | None = Field(
+        default=None,
+        pattern=(
+            "^(numbers_only|numbers_and_rephrase|new_question_same_topic"
+            "|same_topic_add_one_concept|same_chapter_any_topic)$"
+        ),
+    )
+    count: int | None = Field(default=None, ge=1, le=20)
+    question_type: str | None = Field(default=None, max_length=64)
+    priority_mode: str | None = Field(
+        default=None,
+        pattern="^(override|layer_on_top|specific_aspects)$",
+    )
+
 
 def _regen_dict(r: QuestionRegeneration, question_count: int = 0) -> dict:
     return {
@@ -50,6 +75,13 @@ def _regen_dict(r: QuestionRegeneration, question_count: int = 0) -> dict:
         "scope": r.scope,
         "section_refs": list(r.section_refs or []),
         "custom_instructions": r.custom_instructions,
+        # R9 — surface the v3 params so the regen review page can show them
+        # in the "Parameters used for this run" card. Without these, the UI
+        # rendered all dashes even when the DB had values.
+        "similarity_level": getattr(r, "similarity_level", None),
+        "count": getattr(r, "count", None),
+        "question_type": getattr(r, "question_type", None),
+        "priority_mode": getattr(r, "priority_mode", None),
         "status": r.status,
         "job_id": str(r.job_id) if r.job_id else None,
         "question_count": question_count,
@@ -65,6 +97,9 @@ def _question_dict(q: Question) -> dict:
     return {
         "id": str(q.id),
         "regen_id": str(q.regen_id) if q.regen_id else None,
+        "source_question_id": (
+            str(q.source_question_id) if q.source_question_id else None
+        ),
         "section_ref": q.section_ref,
         "section_title": q.section_title,
         "page_start": q.page_start,
@@ -107,7 +142,7 @@ async def start_regeneration(
     if payload.scope == "sections" and not payload.section_refs:
         raise HTTPException(400, detail="section_refs required when scope='sections'")
 
-    job = Job(book_id=book.id, type="extract_questions_regen", status="queued", progress=0)
+    job = Job(book_id=book.id, type="extract_questions_regen_v3", status="queued", progress=0)
     session.add(job)
     await session.flush()
 
@@ -119,16 +154,23 @@ async def start_regeneration(
         scope=payload.scope,
         section_refs=payload.section_refs,
         custom_instructions=(payload.custom_instructions or None),
+        # R4 — v3 regen params (all optional; worker uses defaults if None)
+        similarity_level=payload.similarity_level,
+        count=payload.count,
+        question_type=payload.question_type,
+        priority_mode=payload.priority_mode,
         status="pending",
         job_id=job.id,
     )
     session.add(regen)
     await session.commit()
 
-    import app.workers.questions_v2  # noqa: F401
+    # R4 — dispatch the v3 task (was: extract_questions_regen / v2).
+    # The v2 task is left registered as a fallback but no longer wired here.
+    import app.workers.question_regen_v3  # noqa: F401
     from app.workers.runner import dispatch
 
-    dispatch("extract_questions_regen", str(regen.id), str(job.id))
+    dispatch("extract_questions_regen_v3", str(regen.id), str(job.id))
 
     return {
         "regen_id": str(regen.id),
@@ -142,6 +184,18 @@ async def list_regenerations(
     book_id: UUID,
     session: AsyncSession = Depends(get_session),
 ) -> list[dict]:
+    # R6 — Only return regens whose parent bank still exists. Historically
+    # FK cascade was off in SQLite so deleting a bank left orphan regen
+    # rows behind; on re-extract a fresh bank was created and the UI listed
+    # the stale regens, which then produced "No source questions to
+    # regenerate" on retrigger. Drop them at read time so the UI is clean,
+    # and physically delete the orphans (idempotent housekeeping).
+    live_bank_ids = (
+        await session.execute(
+            select(QuestionBank.id).where(QuestionBank.book_id == book_id)
+        )
+    ).scalars().all()
+    live_bank_set = set(live_bank_ids)
     rows = (
         await session.execute(
             select(QuestionRegeneration)
@@ -149,6 +203,12 @@ async def list_regenerations(
             .order_by(QuestionRegeneration.created_at.desc())
         )
     ).scalars().all()
+    orphans = [r for r in rows if r.bank_id not in live_bank_set]
+    if orphans:
+        for o in orphans:
+            await session.delete(o)
+        await session.commit()
+        rows = [r for r in rows if r.bank_id in live_bank_set]
 
     counts_rows = await session.execute(
         select(Question.regen_id, func.count(Question.id))
@@ -184,17 +244,34 @@ async def list_regen_questions(
     if r is None:
         raise HTTPException(404, detail="Regeneration not found")
 
+    # Regen questions (rows with regen_id set on this run).
     rows = (
         await session.execute(
             select(Question)
             .where(Question.regen_id == regen_id)
             .order_by(
                 Question.section_ref.nulls_last(),
+                Question.source_question_id.nulls_last(),
                 Question.page_start.nulls_last(),
                 Question.id,
             )
         )
     ).scalars().all()
+
+    # Pre-fetch each source Question once so the response carries the full
+    # source text alongside its variants (UI groups source ↔ variants).
+    source_ids = sorted({
+        q.source_question_id for q in rows
+        if q.source_question_id is not None
+    })
+    source_map: dict[UUID, Question] = {}
+    if source_ids:
+        srows = (
+            await session.execute(
+                select(Question).where(Question.id.in_(source_ids))
+            )
+        ).scalars().all()
+        source_map = {s.id: s for s in srows}
 
     grouped: dict[str, dict[str, Any]] = {}
     for q in rows:
@@ -204,10 +281,43 @@ async def list_regen_questions(
             {
                 "section_ref": q.section_ref,
                 "section_title": q.section_title,
+                # Flat list — preserved for backward compat with older
+                # frontend code that consumes `sections[].questions[]`.
                 "questions": [],
+                # 0014 — variants grouped by source_question_id. Each
+                # entry: {source_id, source: <Question|null>, variants: [...]}
+                # Variants without a source_question_id (old runs) go into
+                # the "_orphan" group at the end.
+                "sources": [],
             },
         )
         bucket["questions"].append(_question_dict(q))
+
+    # Second pass to assemble the `sources` groups deterministically.
+    for sec in grouped.values():
+        per_source: dict[str, dict[str, Any]] = {}
+        orphan_variants: list[dict[str, Any]] = []
+        for qd in sec["questions"]:
+            sid = qd.get("source_question_id")
+            if not sid:
+                orphan_variants.append(qd)
+                continue
+            sid_str = str(sid)
+            if sid_str not in per_source:
+                src_q = source_map.get(UUID(sid_str)) if isinstance(sid_str, str) else None
+                per_source[sid_str] = {
+                    "source_id": sid_str,
+                    "source": _question_dict(src_q) if src_q is not None else None,
+                    "variants": [],
+                }
+            per_source[sid_str]["variants"].append(qd)
+        sec["sources"] = list(per_source.values())
+        if orphan_variants:
+            sec["sources"].append({
+                "source_id": None,
+                "source": None,
+                "variants": orphan_variants,
+            })
 
     return {
         "regen": _regen_dict(r, len(rows)),
@@ -223,11 +333,72 @@ async def save_regeneration(
     r = await session.get(QuestionRegeneration, regen_id)
     if r is None:
         raise HTTPException(404, detail="Regeneration not found")
-    if r.status != "ready":
+    # R2 — accept both "ready" (all sections complete) and "partial" (some
+    # sections failed/skipped). The user explicitly wants partial runs
+    # saveable so they can keep what worked. "saved" is also idempotent.
+    if r.status not in {"ready", "partial", "saved"}:
         raise HTTPException(400, detail=f"Cannot save regen with status={r.status}")
     r.status = "saved"
     await session.commit()
     return _regen_dict(r)
+
+
+class RetrySectionRequest(BaseModel):
+    """R6 — body for section-level regen retry.
+
+    section_ref is passed in body (not path) because it may contain "::"
+    separators or other characters that complicate URL encoding.
+    """
+    section_ref: str = Field(min_length=1, max_length=255)
+
+
+@regens_router.post("/{regen_id}/retry-section")
+async def retry_regen_section(
+    regen_id: UUID,
+    payload: RetrySectionRequest = Body(...),
+    session: AsyncSession = Depends(get_session),
+) -> dict:
+    """R6 — re-run regeneration for ONE section within an existing regen.
+
+    Wipes existing regen Question rows for (regen_id, section_ref) and
+    dispatches a new job that processes only that section. Other sections
+    in the regen are preserved. Per-section status in
+    `regen.extraction_stats.sections` is updated; totals recomputed.
+    """
+    r = await session.get(QuestionRegeneration, regen_id)
+    if r is None:
+        raise HTTPException(404, detail="Regeneration not found")
+    if r.status not in {"ready", "partial", "failed", "saved", "extracting"}:
+        raise HTTPException(
+            400, detail=f"Cannot retry section on regen with status={r.status}",
+        )
+
+    job = Job(
+        book_id=r.book_id,
+        type="retry_regen_section_v3",
+        status="queued",
+        progress=0,
+    )
+    session.add(job)
+    await session.flush()
+    await session.commit()
+
+    import app.workers.question_regen_v3  # noqa: F401
+    from app.workers.runner import dispatch
+
+    dispatch(
+        "retry_regen_section_v3",
+        str(r.id),
+        payload.section_ref,
+        str(job.id),
+    )
+
+    return {
+        "regen_id": str(r.id),
+        "section_ref": payload.section_ref,
+        "job_id": str(job.id),
+        "status": "queued",
+    }
 
 
 @regens_router.delete("/{regen_id}", status_code=status.HTTP_204_NO_CONTENT)
@@ -270,4 +441,186 @@ async def bulk_delete_regen_questions(
     await session.commit()
     return {"deleted": len(rows)}
 
+
+# ===========================================================================
+# R10 — Exports (JSON, Markdown, DOCX), overall + per-section
+# ===========================================================================
+
+_FIG_PLACEHOLDER_RE = re.compile(r"\{\{\s*fig\s*:\s*([^}]+?)\s*\}\}", re.IGNORECASE)
+
+
+def _safe_name(s: str) -> str:
+    """Filesystem-safe filename component."""
+    s = re.sub(r"[^A-Za-z0-9._-]+", "_", (s or "regen").strip())
+    return s.strip("_") or "regen"
+
+
+def _render_figure_placeholders(text: str) -> str:
+    """Mirror of bank exporter — convert {{fig: ...}} → italic callout."""
+    def _sub(m: re.Match[str]) -> str:
+        inner = (m.group(1) or "").strip() or "(unlabelled figure)"
+        return f"*[Figure: {inner}]*"
+    return _FIG_PLACEHOLDER_RE.sub(_sub, text or "")
+
+
+async def _grouped_regen_questions(
+    regen_id: UUID,
+    section_ref: str | None,
+    session: AsyncSession,
+) -> tuple[QuestionRegeneration, list[dict[str, Any]]]:
+    """Load regen + group its questions by section. If section_ref is given,
+    return only that section's group.
+    """
+    r = await session.get(QuestionRegeneration, regen_id)
+    if r is None:
+        raise HTTPException(404, detail="Regeneration not found")
+    q = (
+        select(Question)
+        .where(Question.regen_id == regen_id)
+        .order_by(
+            Question.section_ref.nulls_last(),
+            Question.page_start.nulls_last(),
+            Question.id,
+        )
+    )
+    if section_ref is not None:
+        q = q.where(Question.section_ref == section_ref)
+    rows = (await session.execute(q)).scalars().all()
+    grouped: dict[str, dict[str, Any]] = {}
+    for qq in rows:
+        key = qq.section_ref or "_unsectioned"
+        bucket = grouped.setdefault(key, {
+            "section_ref": qq.section_ref,
+            "section_title": qq.section_title,
+            "questions": [],
+        })
+        bucket["questions"].append(_question_dict(qq))
+    return r, list(grouped.values())
+
+
+def _build_regen_markdown(
+    regen: QuestionRegeneration,
+    sections: list[dict[str, Any]],
+    section_only: str | None = None,
+) -> str:
+    """Render a regen run as GFM. LaTeX math preserved in $...$/$$...$$ so
+    pandoc emits OMML equations. Figure placeholders surface as inline
+    italic callouts.
+    """
+    title = (regen.label or f"Regeneration {str(regen.id)[:8]}")
+    suffix = f" — {section_only}" if section_only else ""
+    lines: list[str] = [f"# {title}{suffix} (Regenerated Questions)", ""]
+    if regen.custom_instructions:
+        lines.append("**Custom instructions:** " + regen.custom_instructions)
+        lines.append("")
+    for sec in sections:
+        qs = sec["questions"]
+        if not qs:
+            continue
+        title_line = (
+            f"## {sec['section_ref']} {sec.get('section_title') or ''}".rstrip()
+        )
+        lines.append(title_line)
+        lines.append("")
+        for idx, qd in enumerate(qs, start=1):
+            body = _render_figure_placeholders(qd.get("raw_text") or "")
+            lines.append(f"{idx}. {body}")
+            sol = _render_figure_placeholders(qd.get("solution_text") or "")
+            if sol:
+                lines.append("")
+                lines.append(f"    **Answer.** {sol}")
+            lines.append("")
+    return "\n".join(lines)
+
+
+def _ensure_pandoc_on_path() -> str:
+    """Locate the pandoc binary for pypandoc (mirrors banks exporter)."""
+    found = shutil.which("pandoc")
+    if found:
+        return found
+    candidates = [
+        Path.home() / ".local/bin/pandoc",
+        Path("/opt/homebrew/bin/pandoc"),
+        Path("/usr/local/bin/pandoc"),
+    ]
+    for c in candidates:
+        if c.is_file() and os.access(c, os.X_OK):
+            os.environ["PATH"] = f"{c.parent}:{os.environ.get('PATH', '')}"
+            os.environ.setdefault("PYPANDOC_PANDOC", str(c))
+            return str(c)
+    raise HTTPException(
+        500,
+        detail="pandoc binary not found — install pandoc to enable DOCX export",
+    )
+
+
+@regens_router.get("/{regen_id}/export/json")
+async def export_regen_json(
+    regen_id: UUID,
+    section_ref: str | None = Query(default=None, max_length=255),
+    session: AsyncSession = Depends(get_session),
+) -> Response:
+    """Download JSON. ?section_ref=... limits to one section."""
+    regen, sections = await _grouped_regen_questions(regen_id, section_ref, session)
+    payload = {
+        "regen": _regen_dict(regen, sum(len(s["questions"]) for s in sections)),
+        "sections": sections,
+    }
+    name = _safe_name(regen.label or f"regen_{str(regen.id)[:8]}")
+    if section_ref:
+        name += f"__{_safe_name(section_ref)}"
+    return Response(
+        content=json.dumps(payload, ensure_ascii=False, indent=2).encode("utf-8"),
+        media_type="application/json; charset=utf-8",
+        headers={"Content-Disposition": f'attachment; filename="{name}.json"'},
+    )
+
+
+@regens_router.get("/{regen_id}/export/markdown")
+async def export_regen_markdown(
+    regen_id: UUID,
+    section_ref: str | None = Query(default=None, max_length=255),
+    session: AsyncSession = Depends(get_session),
+) -> Response:
+    """Download Markdown. ?section_ref=... limits to one section."""
+    regen, sections = await _grouped_regen_questions(regen_id, section_ref, session)
+    md = _build_regen_markdown(regen, sections, section_only=section_ref)
+    name = _safe_name(regen.label or f"regen_{str(regen.id)[:8]}")
+    if section_ref:
+        name += f"__{_safe_name(section_ref)}"
+    return Response(
+        content=md.encode("utf-8"),
+        media_type="text/markdown; charset=utf-8",
+        headers={"Content-Disposition": f'attachment; filename="{name}.md"'},
+    )
+
+
+@regens_router.get("/{regen_id}/export/docx")
+async def export_regen_docx(
+    regen_id: UUID,
+    section_ref: str | None = Query(default=None, max_length=255),
+    session: AsyncSession = Depends(get_session),
+) -> Response:
+    """Download Word .docx via the native python-docx builder.
+    `?section_ref=...` limits to one section."""
+    from app.services.docx_export import build_regen_docx
+
+    regen, sections = await _grouped_regen_questions(regen_id, section_ref, session)
+    label_text = regen.label or f"Regeneration {str(regen.id)[:8]}"
+    data = build_regen_docx(
+        label_text,
+        regen.custom_instructions,
+        sections,
+        section_only=section_ref,
+    )
+    name = _safe_name(regen.label or f"regen_{str(regen.id)[:8]}")
+    if section_ref:
+        name += f"__{_safe_name(section_ref)}"
+    return Response(
+        content=data,
+        media_type=(
+            "application/vnd.openxmlformats-officedocument.wordprocessingml.document"
+        ),
+        headers={"Content-Disposition": f'attachment; filename="{name}.docx"'},
+    )
 

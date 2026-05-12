@@ -32,6 +32,7 @@ from app.models.book import Book
 from app.models.job import Job
 from app.models.question import Question
 from app.models.question_bank import QuestionBank
+from app.models.rejected_question import RejectedQuestion
 from app.services.questions.linking import SchemaIndex, resolve_block_link
 
 books_router = APIRouter(prefix="/api/books", tags=["question-banks"])
@@ -84,6 +85,22 @@ def _question_dict(q: Question) -> dict:
         "solution_text": q.solution_text,
         "has_solution": q.has_solution,
         "kind": q.kind or "exercise",
+        "is_hidden": bool(q.is_hidden),
+    }
+
+
+def _rejected_dict(r: RejectedQuestion) -> dict:
+    return {
+        "id": str(r.id),
+        "section_ref": r.section_ref,
+        "section_title": r.section_title,
+        "page_start": r.page_start,
+        "page_end": r.page_end,
+        "raw_text": r.raw_text,
+        "reject_reason": r.reject_reason,
+        "payload": r.payload,
+        "status": r.status,
+        "created_at": r.created_at.isoformat() if r.created_at else None,
     }
 
 
@@ -294,8 +311,13 @@ async def get_question_bank(
     bank = await session.get(QuestionBank, bank_id)
     if bank is None:
         raise HTTPException(404, detail="QuestionBank not found")
+    # Original-only count — exclude regen variants so the bank header's
+    # "N/M extracted" number reflects extraction output, not regenerated
+    # variants that live in the ✨ Regenerated folder.
     count_row = await session.execute(
-        select(func.count(Question.id)).where(Question.bank_id == bank_id)
+        select(func.count(Question.id))
+        .where(Question.bank_id == bank_id)
+        .where(Question.regen_id.is_(None))
     )
     count = count_row.scalar() or 0
 
@@ -428,6 +450,24 @@ async def retry_section(
     }
 
 
+@banks_router.post("/{bank_id}/link-examples")
+async def link_examples(
+    bank_id: UUID,
+    session: AsyncSession = Depends(get_session),
+) -> dict:
+    """Run the example→theory touchpoint linker for this bank's book.
+
+    Inserts `question_ref` chip blocks into each parent theory section's
+    `blocks` JSON, at the position where its child example appears in the
+    prose. Idempotent — safe to re-run after re-extraction.
+    """
+    bank = await session.get(QuestionBank, bank_id)
+    if bank is None:
+        raise HTTPException(404, detail="QuestionBank not found")
+    from app.services.example_linker import link_examples_to_theory
+    return await link_examples_to_theory(session, bank.book_id)
+
+
 @banks_router.get("/{bank_id}/questions")
 async def list_questions(
     bank_id: UUID,
@@ -438,9 +478,15 @@ async def list_questions(
     if bank is None:
         raise HTTPException(404, detail="QuestionBank not found")
 
+    # Original-only view: exclude regen variants (rows with regen_id set).
+    # Regen variants live in the ✨ Regenerated folder and have their own
+    # endpoint (/api/question-regenerations/{regen_id}/questions). Leaking
+    # them into the bank's question list caused them to appear under both
+    # Original and Regenerated.
     result = await session.execute(
         select(Question)
         .where(Question.bank_id == bank_id)
+        .where(Question.regen_id.is_(None))
         .order_by(Question.section_ref, Question.page_start, Question.created_at)
     )
     questions = result.scalars().all()
@@ -464,6 +510,18 @@ async def list_questions(
     for q in questions:
         grouped.setdefault(q.section_ref, []).append(_question_dict(q))
 
+    # Pending rejected items per section (status='pending' only — restored/discarded hidden)
+    rej_result = await session.execute(
+        select(RejectedQuestion)
+        .where(RejectedQuestion.bank_id == bank_id)
+        .where(RejectedQuestion.status == "pending")
+        .order_by(RejectedQuestion.section_ref, RejectedQuestion.page_start, RejectedQuestion.created_at)
+    )
+    rejected_rows = rej_result.scalars().all()
+    rejected_grouped: dict[str, list[dict]] = {}
+    for r in rejected_rows:
+        rejected_grouped.setdefault(r.section_ref or "", []).append(_rejected_dict(r))
+
     def _group_by_kind(items: list[dict]) -> dict[str, list[dict]]:
         buckets: dict[str, list[dict]] = {}
         for it in items:
@@ -480,6 +538,7 @@ async def list_questions(
             "section_title": titles.get(sid, sid),
             "questions": items,
             "by_kind": _group_by_kind(items),
+            "rejected": rejected_grouped.get(sid, []),
         })
         seen.add(sid)
     for sid, items in grouped.items():
@@ -490,7 +549,21 @@ async def list_questions(
             "section_title": sid,
             "questions": items,
             "by_kind": _group_by_kind(items),
+            "rejected": rejected_grouped.get(sid, []),
         })
+        seen.add(sid)
+    # sections that have ONLY rejected items (no surviving questions)
+    for sid, items in rejected_grouped.items():
+        if sid in seen:
+            continue
+        sections_out.append({
+            "section_ref": sid,
+            "section_title": titles.get(sid, sid),
+            "questions": [],
+            "by_kind": {},
+            "rejected": items,
+        })
+        seen.add(sid)
 
     # Attach per-section extraction counts rolled up from extraction_stats.blocks
     # (each block has a resolved section_ref — aggregate across sections).
@@ -663,43 +736,142 @@ async def export_bank_docx(
     bank_id: UUID,
     session: AsyncSession = Depends(get_session),
 ) -> Response:
-    """Export the bank as a Word document.
-
-    Pipeline: grouped questions → Markdown (with ``$...$`` / ``$$...$$`` math
-    and ``*[Figure: ...]*`` inline callouts) → pandoc → ``.docx``. Pandoc
-    converts the LaTeX math to OMML so equations render as native Word
-    equations, not images.
+    """Export the bank as a Word document using the native python-docx
+    builder (`app.services.docx_export`). Replaces the previous pandoc
+    pipeline so we control fonts, spacing, no-duplicate-heading invariant,
+    and Question/Options/Answer/Solution layout precisely.
     """
     bank = await session.get(QuestionBank, bank_id)
     if bank is None:
         raise HTTPException(404, detail="QuestionBank not found")
 
-    _ensure_pandoc_on_path()
-    import pypandoc
+    from app.services.docx_export import build_questions_docx
 
     grouped = await list_questions(bank_id, session)
-    markdown = _build_bank_markdown(bank, grouped)
+    # Flatten by-kind into a single questions list per section — the
+    # docx builder doesn't need the kind partitioning (worked examples
+    # are detected by section_title containing 'EXAMPLE').
+    sections_flat: list[dict] = []
+    for sec in grouped.get("sections", []):
+        questions: list[dict] = []
+        if "questions" in sec:
+            questions = list(sec["questions"])
+        else:
+            by_kind = sec.get("by_kind") or {}
+            for items in by_kind.values():
+                questions.extend(items or [])
+        sections_flat.append({
+            "section_ref": sec.get("section_ref"),
+            "section_title": sec.get("section_title"),
+            "questions": questions,
+        })
 
-    with tempfile.NamedTemporaryFile(suffix=".docx", delete=False) as tmp:
-        tmp_path = tmp.name
-    try:
-        pypandoc.convert_text(
-            markdown,
-            to="docx",
-            format="markdown+tex_math_dollars+tex_math_double_backslash",
-            outputfile=tmp_path,
-            extra_args=["--standalone"],
-        )
-        data = Path(tmp_path).read_bytes()
-    finally:
-        try:
-            os.unlink(tmp_path)
-        except OSError:
-            pass
-
+    data = build_questions_docx(bank.title or "Question Bank", sections_flat)
     name = _safe_name(bank.title) + "_questions"
     return Response(
         content=data,
         media_type="application/vnd.openxmlformats-officedocument.wordprocessingml.document",
         headers={"Content-Disposition": f'attachment; filename="{name}.docx"'},
     )
+
+
+# ─────────────────────────────────────────────────────────────────────────────
+# Human-in-the-loop review (Issue 3)
+# ─────────────────────────────────────────────────────────────────────────────
+
+@banks_router.post("/{bank_id}/rejected/{rejected_id}/restore")
+async def restore_rejected(
+    bank_id: UUID,
+    rejected_id: UUID,
+    session: AsyncSession = Depends(get_session),
+) -> dict:
+    """Promote a rejected item into the questions table as a normal Question.
+
+    The original RejectedQuestion row is kept (status='restored') for audit.
+    """
+    from datetime import datetime, timezone
+    from uuid import uuid4
+
+    rej = await session.get(RejectedQuestion, rejected_id)
+    if rej is None or rej.bank_id != bank_id:
+        raise HTTPException(404, detail="Rejected item not found")
+    if rej.status != "pending":
+        raise HTTPException(409, detail=f"Rejected item already {rej.status}")
+
+    payload = rej.payload or {}
+    q = Question(
+        id=uuid4(),
+        bank_id=rej.bank_id,
+        book_id=rej.book_id,
+        section_ref=rej.section_ref,
+        section_title=rej.section_title,
+        page_start=rej.page_start,
+        page_end=rej.page_end,
+        raw_text=rej.raw_text,
+        status="passed",
+        question_number=payload.get("question_number"),
+        exercise_ref=payload.get("exercise_ref"),
+        chapter_ref=payload.get("chapter_ref"),
+        sub_part=payload.get("sub_part"),
+        question_type=payload.get("question_type"),
+        has_options=bool(payload.get("has_options") or False),
+        solution_text=payload.get("solution_text"),
+        has_solution=bool(payload.get("has_solution") or False),
+        kind=(payload.get("kind") or "exercise"),
+    )
+    session.add(q)
+
+    rej.status = "restored"
+    rej.decided_at = datetime.now(timezone.utc)
+    rej.decided_by = "user"
+    await session.commit()
+
+    return {"ok": True, "question_id": str(q.id), "rejected_id": str(rej.id)}
+
+
+@banks_router.post("/{bank_id}/rejected/{rejected_id}/discard")
+async def discard_rejected(
+    bank_id: UUID,
+    rejected_id: UUID,
+    session: AsyncSession = Depends(get_session),
+) -> dict:
+    """Mark a rejected item as discarded so it stops showing up in the UI."""
+    from datetime import datetime, timezone
+
+    rej = await session.get(RejectedQuestion, rejected_id)
+    if rej is None or rej.bank_id != bank_id:
+        raise HTTPException(404, detail="Rejected item not found")
+    if rej.status != "pending":
+        raise HTTPException(409, detail=f"Rejected item already {rej.status}")
+
+    rej.status = "discarded"
+    rej.decided_at = datetime.now(timezone.utc)
+    rej.decided_by = "user"
+    await session.commit()
+    return {"ok": True, "rejected_id": str(rej.id)}
+
+
+@banks_router.patch("/questions/{question_id}/hide")
+async def hide_question(
+    question_id: UUID,
+    session: AsyncSession = Depends(get_session),
+) -> dict:
+    q = await session.get(Question, question_id)
+    if q is None:
+        raise HTTPException(404, detail="Question not found")
+    q.is_hidden = True
+    await session.commit()
+    return {"ok": True, "question_id": str(q.id), "is_hidden": True}
+
+
+@banks_router.patch("/questions/{question_id}/unhide")
+async def unhide_question(
+    question_id: UUID,
+    session: AsyncSession = Depends(get_session),
+) -> dict:
+    q = await session.get(Question, question_id)
+    if q is None:
+        raise HTTPException(404, detail="Question not found")
+    q.is_hidden = False
+    await session.commit()
+    return {"ok": True, "question_id": str(q.id), "is_hidden": False}

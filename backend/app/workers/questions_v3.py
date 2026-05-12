@@ -28,7 +28,10 @@ to v3 (controlled by a feature flag in a follow-up step).
 from __future__ import annotations
 
 import asyncio
+import io
 import logging
+import re
+from dataclasses import dataclass, field
 from datetime import datetime, timezone
 from typing import Any
 from uuid import UUID
@@ -37,6 +40,7 @@ from sqlalchemy import create_engine, delete, select
 from sqlalchemy.orm import Session, sessionmaker
 
 from app.core.config import settings
+from app.core.heartbeat import Heartbeat
 from app.core.storage import download_pdf
 from app.models.book import Book
 from app.models.job import Job
@@ -54,10 +58,51 @@ logger = logging.getLogger(__name__)
 _sync_engine = create_engine(settings.SYNC_DATABASE_URL, pool_pre_ping=True)
 SyncSession = sessionmaker(bind=_sync_engine, class_=Session, autoflush=False)
 
-GEMINI_MODEL = "gemini-2.5-flash"
-MAX_ATTEMPTS = 2
+GEMINI_MODEL = "gemini-2.5-flash"  # OCR-style transcription; Flash is ~4× cheaper than Pro at parity
+MAX_ATTEMPTS = 3
 GEMINI_TIMEOUT_S = 150
 MAX_OUTPUT_TOKENS = 65536
+
+# Sub-retry policy for transient OCR errors — Gemini server disconnects, read
+# timeouts, 5xx. Doesn't burn through MAX_ATTEMPTS, just waits for the network
+# blip to resolve. Same prompt, same slice — output unchanged.
+_TRANSIENT_SUBSTRINGS = (
+    "Server disconnected", "RemoteProtocolError", "ReadTimeout", "ReadError",
+    "ConnectionError", "ConnectError", "ConnectTimeout",
+    "503", "502", "504", "Connection reset", "Temporary failure",
+)
+_TRANSIENT_SUB_ATTEMPTS = 4
+_TRANSIENT_BACKOFF_S = (5.0, 15.0, 45.0)
+
+
+def _is_transient(err: Exception) -> bool:
+    msg = f"{type(err).__name__}: {err}"
+    return any(s in msg for s in _TRANSIENT_SUBSTRINGS)
+
+
+async def _gemini_call_with_transient_retries(
+    pdf_slice: bytes, system_prompt: str, user_prompt: str, ctx: str
+) -> str:
+    last_err: Exception | None = None
+    for sub in range(_TRANSIENT_SUB_ATTEMPTS):
+        try:
+            return await asyncio.to_thread(
+                _call_gemini_sync, pdf_slice, system_prompt, user_prompt
+            )
+        except Exception as e:
+            if not _is_transient(e):
+                raise
+            last_err = e
+            if sub == _TRANSIENT_SUB_ATTEMPTS - 1:
+                break
+            wait = _TRANSIENT_BACKOFF_S[min(sub, len(_TRANSIENT_BACKOFF_S) - 1)]
+            logger.warning(
+                "Gemini transient error (%s sub-attempt=%s/%s wait=%ss): %s",
+                ctx, sub + 1, _TRANSIENT_SUB_ATTEMPTS, wait, e,
+            )
+            await asyncio.sleep(wait)
+    assert last_err is not None
+    raise last_err
 
 
 # ---------------------------------------------------------------------------
@@ -109,6 +154,340 @@ def _slice_pdf(pdf_bytes: bytes, page_start: int | None, page_end: int | None) -
         return pdf_bytes
 
 
+def _extract_section_text(
+    pdf_bytes: bytes,
+    page_start: int | None,
+    page_end: int | None,
+) -> str:
+    """Extract pypdf text for a section's page range as one string.
+
+    Used by Q3.5 verify_extraction (substring check) and Q3.6 deterministic
+    question detector. Returns "" on extraction failure (e.g. scanned PDF
+    where pypdf cannot read text). Callers must be defensive — empty string
+    means "no text-based verification possible; rely on Gemini Vision only".
+    """
+    if page_start is None or page_end is None:
+        return ""
+    try:
+        from pypdf import PdfReader
+    except Exception as e:
+        logger.warning("pypdf not available — section text slice empty: %s", e)
+        return ""
+    try:
+        reader = PdfReader(io.BytesIO(pdf_bytes))
+        total = len(reader.pages)
+        p0 = max(0, page_start - 1)
+        p1 = min(total - 1, page_end - 1)
+        if p0 > p1 or p0 >= total:
+            return ""
+        parts: list[str] = []
+        for p in range(p0, p1 + 1):
+            try:
+                parts.append(reader.pages[p].extract_text() or "")
+            except Exception as e:
+                logger.debug("text extract failed page %s: %s", p + 1, e)
+        return "\n".join(parts)
+    except Exception as e:
+        logger.warning(
+            "section text extraction failed (pages %s-%s): %s",
+            page_start, page_end, e,
+        )
+        return ""
+
+
+# ---------------------------------------------------------------------------
+# Q3.5 — verify_extraction()
+# Structural verifier that runs each extracted question against the source
+# text slice (from _extract_section_text). Detects fabrication and degrades
+# suspect fields rather than discarding the whole question, EXCEPT when
+# raw_text itself fails — then the question is rejected.
+#
+# Architecture rule 3:
+#   - Substring check: ≥90% of question's >3-char tokens must appear in
+#     source slice (lowered to 70% if LaTeX/math markers present).
+#   - Options: must find ≥2 option markers in source slice within ~200 chars
+#     of question text, else strip options field.
+#   - Answer/solution: must find "Answer"/"Ans"/"Solution"/"Sol"/"=" near
+#     question, else strip answer field.
+#   - q_no: must literally appear in source slice, else null it.
+#   - Failures degrade (strip suspect field), don't discard, unless raw_text
+#     itself fails — then reject and log.
+#
+# This helper is STANDALONE — it does NOT mutate the input dict. The caller
+# (Q3) wires it into the extraction flow, applies the degrade actions, and
+# rejects questions where verified=False AND reason mentions raw_text.
+# ---------------------------------------------------------------------------
+_MATH_MARKER_RE = re.compile(r"\\frac|\\sqrt|\\times|\\div|\\sum|\\int|\^|_\{|=")
+_OPTION_MARKER_RE = re.compile(
+    r"(?:^|\s)(?:\(?[A-Da-d]\)|\([ivxIVX]+\)|[1-9]\d?\.|\([1-9]\d?\))(?=[\s)])"
+)
+_ANSWER_NEAR_RE = re.compile(
+    r"(?i)\b(?:answer|ans|solution|sol|hence|therefore|=)\b"
+)
+
+
+@dataclass
+class VerificationResult:
+    """Outcome of verify_extraction() for one question.
+
+    Attributes:
+        verified:        Whether the question's raw_text passed substring check.
+                         If False, the caller should REJECT this question
+                         entirely (it is likely fabricated).
+        stripped_fields: List of optional fields whose verification failed.
+                         The caller should null/remove these from the question
+                         before persisting (degrade rather than discard).
+                         Possible values: "options", "answer", "solution", "q_no".
+        reason:          Human-readable explanation of failures (for logging).
+        skipped:         True if no source text slice was available
+                         (scanned PDF). In this case verified=True but no
+                         text-based checks ran — caller should rely on
+                         Gemini Vision OCR alone.
+    """
+    verified: bool
+    stripped_fields: list[str] = field(default_factory=list)
+    reason: str | None = None
+    skipped: bool = False
+
+
+def _tokens_for_match(s: str) -> list[str]:
+    """Return >3-char alphanumeric tokens from a string for substring matching.
+
+    Lower-cased, strips LaTeX backslash commands (which often vary by source
+    rendering). Used for the raw_text substring overlap check.
+    """
+    if not s:
+        return []
+    # Strip LaTeX commands like \frac, \sqrt — they're often present in
+    # extracted JSON but rendered differently in pypdf text.
+    cleaned = re.sub(r"\\[a-zA-Z]+", " ", s)
+    # Pull alphanumeric tokens longer than 3 chars.
+    toks = re.findall(r"[A-Za-z0-9]{4,}", cleaned)
+    return [t.lower() for t in toks]
+
+
+def _has_math_markers(s: str) -> bool:
+    """Detect LaTeX/math markers in a string. Triggers the lowered (70%)
+    substring threshold because pypdf often mangles math rendering."""
+    if not s:
+        return False
+    return bool(_MATH_MARKER_RE.search(s))
+
+
+def verify_extraction(
+    question: dict[str, Any],
+    source_text: str,
+) -> VerificationResult:
+    """Run structural checks on one extracted question against the section's
+    source text slice.
+
+    See module-level Q3.5 docstring for full rules. Returns a
+    VerificationResult; does NOT mutate the input question dict.
+
+    Caller should:
+      - If result.skipped: persist the question as-is (no text-based verify
+        possible; e.g. scanned PDF with no pypdf text).
+      - If result.verified is False: REJECT the question (likely fabrication).
+      - If result.verified is True and result.stripped_fields is non-empty:
+        DEGRADE — null/remove those fields from the question before persisting.
+    """
+    # Skip path: no source text slice available (scanned PDF). Cannot
+    # text-verify — pass through and let Gemini Vision be the source of truth.
+    if not source_text or not source_text.strip():
+        return VerificationResult(verified=True, skipped=True,
+                                  reason="no source text slice available")
+
+    raw_text = (question.get("raw_text") or "").strip()
+    if not raw_text:
+        return VerificationResult(
+            verified=False,
+            reason="raw_text empty — cannot verify; rejecting",
+        )
+
+    src_lower = source_text.lower()
+    stripped: list[str] = []
+    reasons: list[str] = []
+
+    # 1) raw_text substring check — what fraction of >3-char tokens appear in source?
+    qtokens = _tokens_for_match(raw_text)
+    if not qtokens:
+        # Question is too short / pure math symbols. Treat as skipped rather
+        # than reject; can't reliably verify either way.
+        return VerificationResult(verified=True, skipped=True,
+                                  reason="question too short for token match")
+
+    matched = sum(1 for t in qtokens if t in src_lower)
+    coverage = matched / len(qtokens)
+    threshold = 0.70 if _has_math_markers(raw_text) else 0.90
+    if coverage < threshold:
+        return VerificationResult(
+            verified=False,
+            reason=(f"raw_text token coverage {coverage:.0%} < threshold "
+                    f"{threshold:.0%} ({matched}/{len(qtokens)} tokens "
+                    f"found in source)"),
+        )
+
+    # raw_text passed. Now run optional-field degradation checks.
+
+    # 2) options check — must find ≥2 option markers near question text.
+    options = question.get("options")
+    if isinstance(options, list) and len(options) >= 2:
+        # Find the question's anchor in the source (use first 5 tokens as
+        # signature; widen to 200 chars on each side).
+        anchor_toks = qtokens[:5]
+        anchor_idx = -1
+        if anchor_toks:
+            for tok in anchor_toks:
+                idx = src_lower.find(tok)
+                if idx >= 0:
+                    anchor_idx = idx
+                    break
+        if anchor_idx >= 0:
+            window_start = max(0, anchor_idx - 50)
+            window_end = min(len(src_lower), anchor_idx + 200)
+            window = source_text[window_start:window_end]
+            marker_count = len(_OPTION_MARKER_RE.findall(window))
+            if marker_count < 2:
+                stripped.append("options")
+                reasons.append(
+                    f"options stripped: only {marker_count} option markers "
+                    f"in 200-char window around question (need ≥2)"
+                )
+        else:
+            stripped.append("options")
+            reasons.append("options stripped: question anchor not found in source")
+
+    # 3) answer / solution check — must find an answer keyword near question.
+    has_answer_field = any(
+        question.get(f) for f in ("answer", "solution", "ans")
+    )
+    if has_answer_field:
+        anchor_toks = qtokens[:5]
+        anchor_idx = -1
+        if anchor_toks:
+            for tok in anchor_toks:
+                idx = src_lower.find(tok)
+                if idx >= 0:
+                    anchor_idx = idx
+                    break
+        if anchor_idx >= 0:
+            window_start = max(0, anchor_idx - 50)
+            window_end = min(len(src_lower), anchor_idx + 400)
+            window = source_text[window_start:window_end]
+            if not _ANSWER_NEAR_RE.search(window):
+                for f in ("answer", "solution", "ans"):
+                    if question.get(f):
+                        stripped.append(f)
+                reasons.append(
+                    "answer/solution stripped: no answer keyword near "
+                    "question in source"
+                )
+        else:
+            for f in ("answer", "solution", "ans"):
+                if question.get(f):
+                    stripped.append(f)
+            reasons.append(
+                "answer/solution stripped: question anchor not found in source"
+            )
+
+    # 4) q_no check — must literally appear in source.
+    q_no = question.get("q_no")
+    if q_no is not None and q_no != "":
+        q_no_str = str(q_no).strip()
+        # Match q_no with optional trailing dot/paren (e.g. "5", "5.", "(5)").
+        # Search whole source — q_no can appear anywhere on the page.
+        if q_no_str and q_no_str.lower() not in src_lower:
+            stripped.append("q_no")
+            reasons.append(f"q_no stripped: '{q_no_str}' not literally in source")
+
+    return VerificationResult(
+        verified=True,
+        stripped_fields=stripped,
+        reason="; ".join(reasons) if reasons else None,
+    )
+
+
+# ---------------------------------------------------------------------------
+# Q3.6 — deterministic_question_detector()
+# Regex-based pre-pass that scans the source text slice for printed question
+# markers and returns the authoritative expected_count + candidate_qnos.
+#
+# Architecture rule 4:
+#   expected_count comes from a deterministic regex detector run on the source
+#   slice BEFORE Gemini, NOT from schema's expected_question_count. Patterns:
+#     - line-start "\d+\." (numbered list)
+#     - "Q\.?\s*\d+" (Q.5, Q5)
+#     - "Example \d+" / "Problem \d+" / "Exercise \d+"
+#
+# Q3 uses the (count, candidate_qnos) tuple to:
+#   1. Decide if the section needs a retry: if extracted < count, run targeted retry.
+#   2. Tell the targeted retry which q_nos are missing so Gemini focuses on them.
+#
+# Sub-parts (a)(b)(c) under one parent number are NOT counted separately —
+# this matches the extractor.txt rule. Roman numerals (i)(ii)(iii) likewise.
+#
+# Returns (count, qnos). count == len(qnos). qnos are deduplicated and
+# sorted in source-order. Empty source returns (0, []).
+# ---------------------------------------------------------------------------
+
+# Patterns recognised as a TOP-LEVEL question marker. Each pattern captures
+# a normalised q_no string. ORDER MATTERS — most specific first so e.g.
+# "Example 9.1" matches before bare "9.1" picks it up.
+_DETECTOR_PATTERNS: list[tuple[str, re.Pattern[str]]] = [
+    # "Example 9.1", "EXAMPLE 9.1", "Worked Example 5", "Solved Example 2.3"
+    ("example",
+     re.compile(r"(?im)^\s*(?:WORKED\s+|SOLVED\s+)?EXAMPLE\s+(\d+(?:\.\d+)?)\b")),
+    # "Problem 5", "Practice Problem 4", "PROBLEM 7"
+    ("problem",
+     re.compile(r"(?im)^\s*(?:PRACTICE\s+)?PROBLEM\s+(\d+(?:\.\d+)?)\b")),
+    # "Exercise 8.3 Q.4" — top-level Exercise treated separately from inner items.
+    # If we see "Exercise N.M" header alone (no Q after) that's the section start;
+    # the inner questions are matched by Q.\d or \d+\. patterns below.
+    # "Q.5" / "Q5" / "Q. 5"
+    ("q_no",
+     re.compile(r"(?im)^\s*Q\.?\s*(\d+(?:\.\d+)?)\b")),
+    # "Question 5"
+    ("q_no",
+     re.compile(r"(?im)^\s*Question\s+(\d+(?:\.\d+)?)\b")),
+    # Numbered list at line start: "1.", "12.", "  3."  (not "1.5" — that has a
+    # second dot; we want a SINGLE-trailing dot, no decimals after).
+    ("numbered",
+     re.compile(r"(?m)^\s*(\d{1,3})\.(?!\d)")),
+]
+
+
+def deterministic_question_detector(source_text: str) -> tuple[int, list[str]]:
+    """Scan ``source_text`` for printed question markers and return
+    ``(count, candidate_qnos)``.
+
+    See module-level Q3.6 docstring for full rules. Empty input returns
+    ``(0, [])``. Sub-parts (a)(b)(c) and roman (i)(ii)(iii) are NOT counted.
+
+    The candidate_qnos list is deduplicated and ordered by first appearance
+    in the source. Each q_no is a normalised string (the captured number,
+    not the full marker — so "Example 9.1" yields "9.1", "Q.5" yields "5",
+    numbered list "12." yields "12").
+
+    Q3 will pass these q_nos to a targeted retry prompt to focus Gemini on
+    missing items. The full marker (e.g. "Example 9.1") is reconstructable
+    from context — the retry prompt sees the same source text.
+    """
+    if not source_text or not source_text.strip():
+        return (0, [])
+
+    seen: dict[str, int] = {}  # q_no → first-seen char offset (for ordering)
+    for kind, pat in _DETECTOR_PATTERNS:
+        for m in pat.finditer(source_text):
+            q_no = m.group(1).strip()
+            if q_no and q_no not in seen:
+                seen[q_no] = m.start()
+
+    # Order by first appearance in source.
+    ordered = sorted(seen.items(), key=lambda kv: kv[1])
+    qnos = [q for q, _ in ordered]
+    return (len(qnos), qnos)
+
+
 # ---------------------------------------------------------------------------
 # Section iteration — flatten the schema into the units we extract from.
 # Includes: every regular section, every excluded section. Excluded sections
@@ -118,7 +497,7 @@ class _Unit:
     """One extraction unit: a section or excluded section with page range."""
 
     __slots__ = ("kind", "id", "title", "page_start", "page_end",
-                 "expected", "next_title")
+                 "expected", "next_title", "skipped")
 
     def __init__(
         self,
@@ -128,6 +507,7 @@ class _Unit:
         page_start: int | None,
         page_end: int | None,
         expected: int | None,
+        skipped: bool = False,
     ) -> None:
         self.kind = kind
         self.id = ref_id
@@ -136,56 +516,180 @@ class _Unit:
         self.page_end = page_end
         self.expected = expected
         self.next_title: str | None = None
+        # When True, the unit is recorded in extraction_stats with
+        # status="skipped" but no Gemini call is made. Used for the
+        # "trust the schema's eqc=0" cost optimisation.
+        self.skipped = skipped
 
 
 def _flatten_sections(schema: BookSchema) -> list[_Unit]:
-    """Walk the schema and return units worth extracting from, in printed order.
+    """Walk the schema depth-first and emit one extraction unit per node.
 
-    A unit is worth extracting iff:
-      - it has a non-zero expected_question_count, OR
-      - it's an excluded section (almost always end-of-chapter exercises), OR
-      - expected_question_count is None (back-compat — let LLM tell us)
+    Coverage policy (changed 2026-05-05):
+      - Every schema node (section AND subsection) becomes its own unit, so
+        worked-example subsections like "EXAMPLE 9.1" get a focused Gemini
+        call instead of being buried inside a parent theory section.
+      - A parent is skipped IF its children's page ranges fully cover the
+        parent's range — otherwise we'd slice the same pages twice. If the
+        parent has any "residual" pages not covered by children (theory pages
+        sitting next to example subsections), the parent IS emitted so those
+        pages still get scanned.
+      - Leaf nodes always emit (their pages aren't covered by anyone else).
+      - Chapter wrappers ("9 Modern Physics" spanning the whole book) are
+        skipped — only their children are real extraction units.
+      - Excluded sections (chapter-end exercise blocks) appended after.
 
-    Sections with expected_question_count == 0 are skipped: schema explicitly
-    said "this is pure theory, no questions live here".
+    Why this matters: in the previous policy, "X-rays" (p4-6, mostly theory)
+    was sliced as one unit and Gemini missed EXAMPLE 9.1 sitting on p6. With
+    per-node units, EXAMPLE 9.1 gets its own narrow call ("transcribe the
+    question on p6 titled EXAMPLE 9.1") and can't be missed.
     """
     units: list[_Unit] = []
 
-    def _walk(secs: list[SchemaSection]) -> None:
-        for s in secs:
-            ec = s.expected_question_count
-            if ec is None or ec > 0:
+    def emit(node: SchemaSection, depth: int) -> None:
+        # Chapter wrapper → recurse into children only, never emit the
+        # chapter itself (would re-cover the whole book).
+        if (node.type or "").lower() == "chapter":
+            for c in node.subsections or []:
+                emit(c, depth + 1)
+            return
+        # Excluded sections inside .sections tree (rare) handled below
+        if (node.type or "").lower() == "excluded":
+            return
+
+        children = node.subsections or []
+
+        # Decide whether to emit THIS node. Skip only if children's page
+        # coverage fully includes the parent's range (no residual theory
+        # pages sit outside the children).
+        emit_self = True
+        if children and node.page_start is not None and node.page_end is not None:
+            covered: set[int] = set()
+            for c in children:
+                if c.page_start is not None and c.page_end is not None:
+                    covered.update(range(c.page_start, c.page_end + 1))
+            parent_pages = set(range(node.page_start, node.page_end + 1))
+            residual = parent_pages - covered
+            if not residual:
+                emit_self = False
+
+        if emit_self:
+            # CATEGORY A FILTER (Q1) — only sections explicitly tagged as
+            # questions in the schema get a Gemini call. Category B (theory
+            # aids: Illustration, Activity, Progress Check, Try It, etc.)
+            # and pure-theory sections are skipped because their
+            # content_types is ["theory"]. This is the architectural
+            # guarantee that questions cannot land in non-question sections.
+            #
+            # Excluded sections (chapter-end exercise banks) are appended
+            # below via a separate code path and are NOT subject to this
+            # filter — they are always extracted with verbatim printed
+            # titles per Q5.
+            is_category_a = "questions" in (node.content_types or [])
+            if is_category_a:
+                eqc = node.expected_question_count
                 units.append(_Unit(
                     kind="section",
-                    ref_id=s.id,
-                    title=s.title,
-                    page_start=s.page_start,
-                    page_end=s.page_end,
-                    expected=ec,
+                    ref_id=node.id,
+                    title=node.title,
+                    page_start=node.page_start,
+                    page_end=node.page_end,
+                    expected=eqc,
+                    skipped=False,
                 ))
-            if s.subsections:
-                _walk(s.subsections)
 
-    _walk(schema.sections)
+        for c in children:
+            emit(c, depth + 1)
 
+    for s in schema.sections:
+        emit(s, 0)
+
+    # ARCHITECTURE RULE (Q5 — locked):
+    #   Excluded section titles are passed VERBATIM from the schema into
+    #   _Unit.id and _Unit.title. NO normalization, NO reclassification, NO
+    #   keyword cleanup. The user has explicitly required: "extract them
+    #   also, add in same folders and exact same names — don't classify
+    #   based on your knowledge or create or recreate, use pure ocr".
+    #   Examples that must round-trip unchanged:
+    #     "Exercise 1.6 Multiple choice questions"
+    #     "Unit Exercise - 1"
+    #     "PRACTICE QUESTIONS"
+    #     "Crossword"
+    #   Do NOT introduce title-normalization here. If the printed wording
+    #   varies between books (e.g. some books use "Practice Problems",
+    #   others "Practice Questions"), preserve whichever the schema
+    #   captured — the schema is the source of truth, the book is too.
     for ex in schema.excluded_sections or []:
         ec = ex.expected_question_count
         # Always extract excluded blocks unless the schema explicitly said 0.
-        if ec == 0:
+        if ec == 0 and not (ex.subsections or []):
             continue
-        units.append(_Unit(
-            kind="excluded",
-            ref_id=ex.title or "",
-            title=ex.title or "",
-            page_start=ex.page_start,
-            page_end=ex.page_end,
-            expected=ec,
-        ))
+
+        children = ex.subsections or []
+        if children:
+            # Mirror the PDF: emit each printed sub-heading
+            # ("Very Short Answer", "MCQs", "Numerical Problems", …) as its
+            # own extraction unit. The parent block is NOT emitted because
+            # its pages are fully covered by its children — extracting both
+            # would produce duplicates that cross-section dedup catches but
+            # wastes Gemini calls.
+            for c in children:
+                cec = c.expected_question_count
+                if cec == 0:
+                    continue
+                units.append(_Unit(
+                    kind="excluded",
+                    # ref_id format: "<parent_title>::<child_title>" (verbatim)
+                    ref_id=f"{ex.title}::{c.title}" if c.title else (ex.title or ""),
+                    title=c.title or ex.title or "",
+                    page_start=c.page_start or ex.page_start,
+                    page_end=c.page_end or ex.page_end,
+                    expected=cec,
+                ))
+        else:
+            units.append(_Unit(
+                kind="excluded",
+                ref_id=ex.title or "",   # verbatim from schema
+                title=ex.title or "",    # verbatim from schema
+                page_start=ex.page_start,
+                page_end=ex.page_end,
+                expected=ec,
+            ))
 
     units.sort(key=lambda u: (u.page_start or 0, u.page_end or 0))
 
     for i, u in enumerate(units):
         u.next_title = units[i + 1].title if i + 1 < len(units) else None
+
+    # Page-coverage audit — warn if any pages between first and last unit
+    # are NOT covered by any unit. Helps detect schema gaps that would
+    # silently miss questions.
+    if units:
+        covered: set[int] = set()
+        for u in units:
+            ps, pe = u.page_start, u.page_end
+            if ps is not None and pe is not None:
+                for p in range(ps, pe + 1):
+                    covered.add(p)
+        first = min((u.page_start for u in units if u.page_start is not None), default=None)
+        last = max((u.page_end for u in units if u.page_end is not None), default=None)
+        if first is not None and last is not None:
+            missing = sorted(set(range(first, last + 1)) - covered)
+            if missing:
+                logger.warning(
+                    "schema page-coverage gap detected — pages NOT covered "
+                    "by any extraction unit: %s. These pages will be SKIPPED. "
+                    "Consider widening adjacent section page ranges in the schema.",
+                    missing,
+                )
+
+    n_section = sum(1 for u in units if u.kind == "section")
+    n_excluded = sum(1 for u in units if u.kind == "excluded")
+    logger.info(
+        "questions_v3: %s extraction units (%s Category A sections + %s excluded blocks). "
+        "Theory and theory-aid sections skipped per Category A filter (Q1).",
+        len(units), n_section, n_excluded,
+    )
 
     return units
 
@@ -201,13 +705,20 @@ def _build_user_prompt(unit: _Unit) -> str:
         else ""
     )
     return (
-        f"Extract every question from the section titled: \"{unit.title}\" "
-        f"(ID: {unit.id}).\n"
-        f"START extracting at the heading \"{unit.title}\" — "
-        f"include every question from that heading onwards.{stop}\n\n"
+        f"Transcribe verbatim every question-like item that is visibly printed "
+        f"in the section titled: \"{unit.title}\" (ID: {unit.id}).\n"
+        f"START at the heading \"{unit.title}\".{stop}\n\n"
         "These PDF pages may contain content from adjacent sections. "
-        "Extract ONLY the questions that belong to this section.\n"
-        "Transcribe every question verbatim — pure OCR, no summarisation.\n\n"
+        "Extract ONLY items that belong to this section.\n\n"
+        "If this section is pure theory and contains NO question-like items "
+        "(no numbered exercises, no MCQs, no labelled worked examples, no "
+        "'Try It' / 'Check Your Understanding' prompts), return "
+        "identified_total: 0 and extracted: []. That is a correct and complete "
+        "answer for a theory-only section — do NOT invent items to fill the "
+        "list.\n\n"
+        "Pure OCR only. Never use training knowledge. Never compute, complete, "
+        "or paraphrase a solution. Never invent MCQ options. Never insert a "
+        "figure placeholder for a figure not visibly on the page.\n\n"
         f"Return JSON with section_id=\"{unit.id}\" and "
         f"section_title=\"{unit.title}\"."
     )
@@ -237,19 +748,35 @@ async def _extract_unit(
     system_prompt: str,
 ) -> dict[str, Any]:
     """Returns a per-unit result dict suitable for persisting + reporting."""
-    # +1 page trailing pad: schemas frequently put a section's last question
-    # on the page that the next section "officially" starts on. Padding the
-    # slice by one page lets the LLM see the trailing question; the prompt
-    # tells it to STOP at the next-section heading, so the pad is safe.
+    # Page-padding rules:
+    # • Trailing pad +1 — sections often place their last question on the
+    #   page where the next section "officially" starts.
+    # • Leading pad −1 — example units are typically marked at a single page
+    #   (page_start == page_end) but the example body can begin on the
+    #   previous page (e.g. label "EXAMPLE 9.1" wraps in from prior page).
+    #   For these tight 1-page slices we widen by one page on each side so
+    #   Gemini reliably finds the example.
+    # The user prompt instructs the model to START at the named heading and
+    # STOP at the next, so over-wide pads stay safe — extra pages are ignored
+    # if they don't contain the section's content.
+    is_example_unit = bool(unit.id) and "example" in (unit.id or "").lower()
+    is_tight_slice = (
+        unit.page_start is not None
+        and unit.page_end is not None
+        and unit.page_end - unit.page_start <= 0
+    )
+    leading_pad = 1 if (is_example_unit and is_tight_slice and unit.page_start and unit.page_start > 1) else 0
+    start = (unit.page_start - leading_pad) if unit.page_start is not None else None
     padded_end = (unit.page_end + 1) if unit.page_end is not None else None
-    pdf_slice = _slice_pdf(pdf_bytes, unit.page_start, padded_end)
+    pdf_slice = _slice_pdf(pdf_bytes, start, padded_end)
     user_prompt = _build_user_prompt(unit)
 
     last_err = ""
     for attempt in range(1, MAX_ATTEMPTS + 1):
         try:
-            raw = await asyncio.to_thread(
-                _call_gemini_sync, pdf_slice, system_prompt, user_prompt
+            raw = await _gemini_call_with_transient_retries(
+                pdf_slice, system_prompt, user_prompt,
+                ctx=f"q-extract {unit.kind}/{unit.id}",
             )
             data = parse_json(raw)
             if not isinstance(data, dict):
@@ -289,6 +816,380 @@ async def _extract_unit(
 
 
 # ---------------------------------------------------------------------------
+# Chunked extraction for large units
+# ---------------------------------------------------------------------------
+# Threshold above which a unit gets split into smaller page-range chunks.
+# Single Gemini calls handle ~25–40 questions reliably; beyond that, the JSON
+# output gets long and error-prone. PRACTICE blocks can have 70+ questions.
+_CHUNK_THRESHOLD = 30
+_CHUNK_PAGE_SPAN = 4  # pages per chunk when splitting a large unit
+
+
+def _dedupe_extracted(items: list[dict[str, Any]]) -> list[dict[str, Any]]:
+    """DISABLED — pass-through.
+
+    Previously dropped duplicates inside a chunk-merged result (when one
+    section is split into multiple page-range Gemini calls and the same
+    question shows up in two chunks). Per user directive ("pure OCR — keep
+    even if same"), we now keep everything Gemini returned. If duplicate
+    rows appear at chunk boundaries, that's information about the page
+    slice — the user wants to see it.
+    """
+    return list(items)
+
+
+async def _extract_unit_maybe_chunked(
+    unit: _Unit,
+    pdf_bytes: bytes,
+    system_prompt: str,
+) -> dict[str, Any]:
+    """Run extraction. For large units, split by page range and merge.
+
+    Defence-in-depth: even though the JSON parser now tolerates malformed
+    LaTeX escapes, very long Gemini responses (75+ questions) are still the
+    riskiest call shape. Chunking by page range keeps each call's output
+    small and bounded, then merges + dedupes.
+    """
+    expected = unit.expected or 0
+    span = (
+        (unit.page_end - unit.page_start + 1)
+        if unit.page_start is not None and unit.page_end is not None
+        else 0
+    )
+
+    if expected <= _CHUNK_THRESHOLD or span <= _CHUNK_PAGE_SPAN:
+        return await _extract_unit(unit, pdf_bytes, system_prompt)
+
+    # Split page range into windows of _CHUNK_PAGE_SPAN pages each.
+    chunks: list[tuple[int, int]] = []
+    p = unit.page_start
+    assert unit.page_end is not None
+    while p <= unit.page_end:
+        chunks.append((p, min(p + _CHUNK_PAGE_SPAN - 1, unit.page_end)))
+        p += _CHUNK_PAGE_SPAN
+
+    logger.info(
+        "v3 chunking %s (%s) — expected=%s, span=%s pages → %s chunk(s)",
+        unit.id, unit.title, expected, span, len(chunks),
+    )
+
+    # Run chunks in parallel; each gets the SAME unit metadata but a
+    # narrowed page range. We mutate a shallow copy.
+    async def _run_chunk(ps: int, pe: int) -> dict[str, Any]:
+        from copy import copy as _copy
+        sub = _copy(unit)
+        sub.page_start = ps
+        sub.page_end = pe
+        return await _extract_unit(sub, pdf_bytes, system_prompt)
+
+    results = await asyncio.gather(
+        *[_run_chunk(ps, pe) for ps, pe in chunks],
+        return_exceptions=False,
+    )
+
+    merged_extracted: list[dict[str, Any]] = []
+    merged_rejected: list[dict[str, Any]] = []
+    identified_sum = 0
+    any_ok = False
+    last_err = ""
+    total_attempts = 0
+    for r in results:
+        identified_sum += int(r.get("identified_total") or 0)
+        merged_extracted.extend(r.get("extracted") or [])
+        merged_rejected.extend(r.get("rejected") or [])
+        total_attempts += int(r.get("attempts") or 0)
+        if r.get("ok"):
+            any_ok = True
+        elif r.get("error"):
+            last_err = r["error"]
+
+    deduped = _dedupe_extracted(merged_extracted)
+    return {
+        "ok": any_ok,
+        "attempts": total_attempts,
+        "identified_total": identified_sum,
+        "extracted": deduped,
+        "rejected": merged_rejected,
+        "rejected_count": len(merged_rejected),
+        "error": last_err if not any_ok else "",
+        "_chunked": True,
+        "_chunks": len(chunks),
+    }
+
+
+# ---------------------------------------------------------------------------
+# Q3 — verify + targeted retry wrapper
+# Wraps _extract_unit_maybe_chunked with two additional passes:
+#   1. Verification — every extracted item runs through verify_extraction()
+#      against the section's pypdf text slice. Failures REJECT the question
+#      (likely fabrication); per-field failures DEGRADE the question (strip
+#      suspect field but keep raw_text).
+#   2. Targeted retry — for excluded sections only, if verified count is
+#      below the deterministic detector count, build a retry prompt that
+#      names the missing q_nos and runs ONE more Gemini call. Verify retry
+#      results, append unique ones, then accept.
+#
+# Architecture rules 3 + 4 + 5 enforced here.
+# Cat A "section" units are NOT subject to detector-based retry — the
+# detector overcounts when multiple Cat A sections share a page (e.g.
+# Examples 1.1, 1.2, 1.3 on page 4). For Cat A units, verification still
+# runs (rule 3) but expected count stays as schema_eqc.
+# ---------------------------------------------------------------------------
+async def _run_targeted_retry(
+    unit: _Unit,
+    pdf_bytes: bytes,
+    system_prompt: str,
+    missing_qnos: list[str],
+) -> dict[str, Any]:
+    """Run one targeted retry call for the unit, naming the missing q_nos.
+
+    Single Gemini call, no chunking, max 1 retry per section. Caller is
+    responsible for verifying the retry results before accepting.
+    """
+    is_example = bool(unit.id) and "example" in (unit.id or "").lower()
+    is_tight = (
+        unit.page_start is not None
+        and unit.page_end is not None
+        and unit.page_end - unit.page_start <= 0
+    )
+    leading_pad = 1 if (
+        is_example and is_tight and unit.page_start and unit.page_start > 1
+    ) else 0
+    start = (unit.page_start - leading_pad) if unit.page_start is not None else None
+    padded_end = (unit.page_end + 1) if unit.page_end is not None else None
+    pdf_slice = _slice_pdf(pdf_bytes, start, padded_end)
+
+    qnos_str = ", ".join(missing_qnos[:50])  # cap to avoid prompt bloat
+    user_prompt = (
+        f"TARGETED RETRY pass for section: \"{unit.title}\" (ID: {unit.id}).\n\n"
+        f"On a previous pass the following question numbers were detected on "
+        f"the source pages but NOT extracted: {qnos_str}.\n\n"
+        f"Re-scan the pages and extract ONLY those numbered items. Apply the "
+        f"same OCR-only rules — verbatim transcription, no fabrication, no "
+        f"invented options/answers. If you cannot find a listed q_no on the "
+        f"page, OMIT it (do not invent a question to fill the slot).\n\n"
+        f"Return JSON with section_id=\"{unit.id}\", section_title=\"{unit.title}\", "
+        f"identified_total = number of items you found from the missing list, "
+        f"and `extracted` containing only the missing items."
+    )
+    try:
+        raw = await _gemini_call_with_transient_retries(
+            pdf_slice, system_prompt, user_prompt,
+            ctx=f"q-retry {unit.kind}/{unit.id}",
+        )
+        data = parse_json(raw)
+        if not isinstance(data, dict):
+            return {"ok": False, "extracted": [], "rejected": [], "identified_total": 0}
+        extracted = list(data.get("extracted") or [])
+        fr = filter_items(extracted)
+        return {
+            "ok": True,
+            "identified_total": int(data.get("identified_total") or 0),
+            "extracted": fr.kept,
+            "rejected": fr.rejected,
+        }
+    except Exception as e:
+        logger.warning("Q3 targeted retry failed for %s/%s: %s",
+                       unit.kind, unit.id, e)
+        return {"ok": False, "extracted": [], "rejected": [], "identified_total": 0}
+
+
+def _verify_and_degrade(
+    items: list[dict[str, Any]],
+    source_text: str,
+) -> tuple[list[dict[str, Any]], list[dict[str, Any]], int]:
+    """Run verify_extraction on each item.
+
+    Returns (verified_items, rejected_items, degraded_count).
+      - verified_items: items that passed (with stripped fields nulled)
+      - rejected_items: items that failed raw_text verification
+      - degraded_count: how many verified items had at least one stripped field
+    """
+    verified: list[dict[str, Any]] = []
+    rejected: list[dict[str, Any]] = []
+    degraded = 0
+    for item in items:
+        vr = verify_extraction(item, source_text)
+        if vr.skipped:
+            verified.append(item)
+            continue
+        if not vr.verified:
+            rejected.append({
+                **item,
+                "_q3_reject_reason": vr.reason or "verify failed",
+            })
+            continue
+        if vr.stripped_fields:
+            cleaned = {**item}
+            for f in vr.stripped_fields:
+                if f in cleaned:
+                    cleaned[f] = None
+            cleaned["_q3_stripped"] = vr.stripped_fields
+            verified.append(cleaned)
+            degraded += 1
+        else:
+            verified.append(item)
+    return verified, rejected, degraded
+
+
+async def _extract_unit_with_verify_and_retry(
+    unit: _Unit,
+    pdf_bytes: bytes,
+    system_prompt: str,
+) -> dict[str, Any]:
+    """Q3: extract + verify + targeted retry once, single entry point.
+
+    Replaces direct _extract_unit_maybe_chunked calls in the per-unit
+    pipeline. Behaviour:
+      1. Initial extraction (delegates to _extract_unit_maybe_chunked).
+      2. Verification of every extracted item against the pypdf text slice.
+      3. For excluded sections only: detector pre-count + targeted retry of
+         missing q_nos. Max 1 retry per section.
+      4. Final result has the same shape as upstream + new fields:
+         verified_count, degraded_count, detector_count,
+         authoritative_expected, _q3_retried, _q3_status.
+    """
+    # 1. Initial extraction.
+    result = await _extract_unit_maybe_chunked(unit, pdf_bytes, system_prompt)
+    if not result.get("ok"):
+        # Failed call — pass through; caller will mark as failed.
+        result["_q3_status"] = "failed"
+        return result
+
+    # 2. Pull source text slice (using ORIGINAL page range, not padded —
+    # we want clean per-section text for verify/detect).
+    source_text = _extract_section_text(pdf_bytes, unit.page_start, unit.page_end)
+
+    # 3. Verify every extracted item.
+    initial_extracted = list(result.get("extracted") or [])
+    verified_items, rejected_by_verify, degraded = _verify_and_degrade(
+        initial_extracted, source_text,
+    )
+    if rejected_by_verify:
+        logger.warning(
+            "Q3 verify rejected %d/%d items in %s/%s — sample reasons: %s",
+            len(rejected_by_verify), len(initial_extracted),
+            unit.kind, unit.id,
+            [r.get("_q3_reject_reason", "")[:80] for r in rejected_by_verify[:3]],
+        )
+
+    # 4. Compute authoritative expected count.
+    # Cat A "section" units: schema_eqc — detector overcounts on shared pages.
+    # Excluded sections (Q-banks): three-way priority:
+    #   (1) detector_count (regex on pypdf text)            — most authoritative
+    #   (2) Gemini's identified_total when self-consistent  — fallback for scanned PDFs
+    #   (3) schema_eqc (analyse-pass estimate)              — last resort, can be wrong
+    #
+    # Why fallback to identified_total: on scanned PDFs pypdf returns no
+    # text → detector=0. Schema's eqc is also a Gemini guess and can over-
+    # or under-count (e.g. Chapter 5 COMPETITION WING: schema said 107, real
+    # is 61, Gemini-extract identified=61). Using identified_total when
+    # extracted matches it gives an internally-consistent count and
+    # prevents false "partial" markings.
+    detector_count = 0
+    detector_qnos: list[str] = []
+    if source_text:
+        detector_count, detector_qnos = deterministic_question_detector(source_text)
+
+    initial_verified_count = len(verified_items)
+    identified_total = int(result.get("identified_total") or 0)
+
+    if unit.kind == "excluded":
+        if detector_count > 0:
+            # pypdf could read; detector wins
+            authoritative_expected = detector_count
+        elif (
+            identified_total > 0
+            and abs(initial_verified_count - identified_total) <= 2
+        ):
+            # Scanned section — trust Gemini's self-consistent count
+            authoritative_expected = initial_verified_count
+        else:
+            # Last resort — schema's eqc (may be wrong)
+            authoritative_expected = unit.expected or 0
+        # Mutate unit.expected so downstream stats / classify use the
+        # corrected number.
+        unit.expected = authoritative_expected
+    else:
+        authoritative_expected = unit.expected or 0
+
+    # 5. Targeted retry decision.
+    verified_count = len(verified_items)
+    needs_retry = (
+        unit.kind == "excluded"        # only retry chapter-end Q-banks
+        and authoritative_expected > 0
+        and verified_count < authoritative_expected
+        and bool(source_text)          # need text to compute missing q_nos
+        and detector_count > 0
+    )
+    retried = False
+    if needs_retry:
+        # Compute which q_nos were extracted vs which detector found.
+        extracted_qnos = set()
+        for item in verified_items:
+            for k in ("question_number", "q_no"):
+                v = (item.get(k) or "").strip()
+                if v:
+                    extracted_qnos.add(v)
+                    break
+        missing_qnos = [q for q in detector_qnos if q not in extracted_qnos]
+        if missing_qnos:
+            logger.info(
+                "Q3 targeted retry: %s/%s — verified=%d expected=%d "
+                "detector=%d missing=%s",
+                unit.kind, unit.id, verified_count, authoritative_expected,
+                detector_count, missing_qnos[:10],
+            )
+            retry_result = await _run_targeted_retry(
+                unit, pdf_bytes, system_prompt, missing_qnos,
+            )
+            retried = True
+            retry_extracted = list(retry_result.get("extracted") or [])
+            retry_verified, retry_rejected, retry_degraded = _verify_and_degrade(
+                retry_extracted, source_text,
+            )
+            # Append uniquely (avoid double-counting on overlap with first pass).
+            for item in retry_verified:
+                qno = ""
+                for k in ("question_number", "q_no"):
+                    v = (item.get(k) or "").strip()
+                    if v:
+                        qno = v
+                        break
+                if qno and qno in extracted_qnos:
+                    continue
+                if qno:
+                    extracted_qnos.add(qno)
+                verified_items.append(item)
+                if "_q3_stripped" in item:
+                    degraded += 1
+            rejected_by_verify.extend(retry_rejected)
+            verified_count = len(verified_items)
+
+    # 6. Decide _q3_status (independent of downstream _classify_unit).
+    if verified_count == 0:
+        q3_status = "empty" if authoritative_expected == 0 else "partial"
+    elif authoritative_expected and verified_count < authoritative_expected:
+        q3_status = "partial"
+    else:
+        q3_status = "complete"
+
+    # 7. Patch result. Existing consumers see the same shape; we add a few
+    # diagnostic fields. result["extracted"] is now the verified list.
+    merged_rejected = list(result.get("rejected") or []) + rejected_by_verify
+    result["extracted"] = verified_items
+    result["rejected"] = merged_rejected
+    result["rejected_count"] = len(merged_rejected)
+    result["verified_count"] = verified_count
+    result["degraded_count"] = degraded
+    result["detector_count"] = detector_count
+    result["authoritative_expected"] = authoritative_expected
+    result["_q3_retried"] = retried
+    result["_q3_status"] = q3_status
+    return result
+
+
+# ---------------------------------------------------------------------------
 # Persistence
 # ---------------------------------------------------------------------------
 def _persist_unit(
@@ -301,13 +1202,56 @@ def _persist_unit(
     """Replace existing rows for this (bank, section_ref) with the new ones.
 
     Returns the number of Question rows inserted.
+
+    ARCHITECTURE RULE (Q4 — locked):
+      `section_ref` and `section_title` for every persisted Question and
+      RejectedQuestion row MUST be stamped from `unit.id` / `unit.title`
+      respectively. NEVER from Gemini's output. The model is never trusted
+      to label its own section. Item-level fields like `question_number`
+      and `kind` are model-supplied and may differ per row, but the
+      section anchor is owned by the worker.
+
+      Do NOT add `section_ref=item.get("section_ref")` or any equivalent
+      anywhere in this function. If you need to track Gemini's claimed
+      label for diagnostics, store it under a different field name
+      (e.g. `_model_claimed_section`).
     """
+    from app.models.rejected_question import RejectedQuestion
+
     session.execute(
         delete(Question).where(
             Question.bank_id == bank_id,
             Question.section_ref == unit.id,
         )
     )
+    # Wipe pending rejects from a previous run for this section so the user
+    # sees a fresh review queue. Restored/discarded rows from earlier runs
+    # are preserved (audit trail).
+    session.execute(
+        delete(RejectedQuestion).where(
+            RejectedQuestion.bank_id == bank_id,
+            RejectedQuestion.section_ref == unit.id,
+            RejectedQuestion.status == "pending",
+        )
+    )
+
+    # Persist rejected items so the UI can offer a "Restore" action.
+    for item in result.get("rejected", []) or []:
+        raw_text = (item.get("raw_text") or "").strip()
+        if not raw_text:
+            continue
+        session.add(RejectedQuestion(
+            bank_id=bank_id,
+            book_id=book_id,
+            section_ref=unit.id,
+            section_title=unit.title,
+            page_start=item.get("page") or unit.page_start,
+            page_end=unit.page_end,
+            raw_text=raw_text,
+            reject_reason=item.get("_reject_reason") or "",
+            payload=item,
+            status="pending",
+        ))
 
     inserted = 0
     for item in result.get("extracted", []):
@@ -351,7 +1295,7 @@ def _legacy_block_status(v3_status: str) -> str:
         empty    → empty
         failed   → failed
     """
-    return {"complete": "ok"}.get(v3_status, v3_status)
+    return {"complete": "ok", "skipped": "empty"}.get(v3_status, v3_status)
 
 
 def _classify_unit(
@@ -408,99 +1352,140 @@ async def _run_v3(book_id: UUID, bank_id: UUID, job_id: UUID) -> dict[str, Any]:
         _update_job(session, job_id, status="running", progress=5,
                     message=f"v3 extraction — {total} section(s) to process")
 
-    # Process units sequentially — keeps progress predictable and SQLite happy.
-    # Concurrency is added in a follow-up step via the gemini_runtime semaphore.
+    # Lever 2 — run units in parallel. The gemini_runtime semaphore caps
+    # in-flight calls at 4, so this is safe wrt quota. Persistence and stats
+    # updates happen sequentially in the main coroutine as each unit finishes
+    # (via asyncio.as_completed), keeping SQLite single-writer-safe.
+    #
+    # Lever 1 — units flagged unit.skipped (eqc=0) bypass the Gemini call
+    # entirely and just record a "skipped" stats row, so the user can still
+    # see them in the UI and click "↺ Retry section" on any one.
     section_reports: list[dict[str, Any]] = []
     expected_total = 0
     extracted_total = 0
-    counts = {"complete": 0, "partial": 0, "empty": 0, "failed": 0}
+    counts = {"complete": 0, "partial": 0, "empty": 0, "failed": 0, "skipped": 0}
 
-    for i, unit in enumerate(units, start=1):
-        progress = 5 + int(90 * (i - 1) / max(total, 1))
-        with SyncSession() as session:
-            _update_job(
-                session, job_id,
-                progress=progress,
-                message=f"Extracting {unit.title} ({i}/{total})",
-            )
-
-        result = await _extract_unit(unit, pdf_bytes, system_prompt)
-        kept = len(result.get("extracted") or [])
-        identified = int(result.get("identified_total") or 0)
-        status = _classify_unit(unit.expected, kept, identified, bool(result.get("ok")))
-
-        with SyncSession() as session:
-            inserted = _persist_unit(session, bank_id, book_id, unit, result)
-
-        counts[status] += 1
-        expected_total += int(unit.expected or 0)
-        extracted_total += kept
-
-        section_reports.append({
-            "section_ref": unit.id,
-            "section_title": unit.title,
-            "kind": unit.kind,
-            "page_start": unit.page_start,
-            "page_end": unit.page_end,
-            "expected": unit.expected,
-            "identified": identified,
-            "extracted": kept,
-            "rejected": result.get("rejected_count", 0),
-            "rejected_items": result.get("rejected") or [],
-            "status": status,
-            "attempts": result.get("attempts", 0),
-            "error": result.get("error"),
-        })
-
-        # Persist rolling stats so the UI can show progress mid-run.
-        # We emit BOTH the new section-shaped stats and a legacy
-        # "blocks"-shaped view so the existing live extraction panel keeps
-        # rendering without a frontend rewrite.
-        legacy_blocks = [
-            {
-                "excluded_block_index": idx,
-                "title": s["section_title"],
-                "section_ref": s["section_ref"],
-                "page_start": s["page_start"],
-                "page_end": s["page_end"],
-                "identified": s["identified"],
-                "extracted": s["extracted"],
-                "missed": max(0, (s.get("expected") or s["identified"]) - s["extracted"]),
-                "status": _legacy_block_status(s["status"]),
+    async def _process(unit: _Unit) -> tuple[_Unit, dict[str, Any]]:
+        if unit.skipped:
+            return unit, {
+                "ok": True, "attempts": 0, "identified_total": 0,
+                "extracted": [], "rejected": [], "rejected_count": 0,
+                "_skipped": True,
             }
-            for idx, s in enumerate(section_reports)
-        ]
-        with SyncSession() as session:
-            _update_bank(session, bank_id, extraction_stats={
-                # New shape (v3-aware UI reads these)
-                "sections": section_reports,
-                "totals": {
-                    "expected_total": expected_total,
-                    "extracted_total": extracted_total,
-                    **counts,
-                },
-                # Legacy shape (existing UI components keep working)
-                "blocks": legacy_blocks,
-                "total_identified": sum(s["identified"] for s in section_reports),
-                "total_extracted": extracted_total,
-                "missed": sum(b["missed"] for b in legacy_blocks),
-                "worker_version": "v3",
+        # Q3: extract → verify → targeted retry (1x) for excluded sections.
+        result = await _extract_unit_with_verify_and_retry(
+            unit, pdf_bytes, system_prompt,
+        )
+        return unit, result
+
+    # Heartbeat keeps the watchdog quiet while units are still in flight.
+    # The slowest unit on a scanned PDF can run >300s, and during that
+    # window no completions happen → no _update_job → watchdog kill.
+    # The 10s daemon thread pings last_heartbeat_at independently of
+    # unit completions. It only writes the timestamp/progress field;
+    # no Gemini, no extraction logic touched.
+    with Heartbeat(
+        job_id,
+        base_msg=f"Extracting questions ({total} sections)",
+        progress=5,
+    ):
+        tasks = [asyncio.create_task(_process(u)) for u in units]
+        done = 0
+        for coro in asyncio.as_completed(tasks):
+            unit, result = await coro
+            done += 1
+            progress = 5 + int(90 * done / max(total, 1))
+            with SyncSession() as session:
+                _update_job(
+                    session, job_id,
+                    progress=progress,
+                    message=f"Extracted {unit.title} ({done}/{total})",
+                )
+
+            if result.get("_skipped"):
+                kept = 0
+                identified = 0
+                status = "skipped"
+            else:
+                kept = len(result.get("extracted") or [])
+                identified = int(result.get("identified_total") or 0)
+                status = _classify_unit(unit.expected, kept, identified, bool(result.get("ok")))
+
+                with SyncSession() as session:
+                    _persist_unit(session, bank_id, book_id, unit, result)
+
+            counts[status] = counts.get(status, 0) + 1
+            expected_total += int(unit.expected or 0)
+            extracted_total += kept
+
+            section_reports.append({
+                "section_ref": unit.id,
+                "section_title": unit.title,
+                "kind": unit.kind,
+                "page_start": unit.page_start,
+                "page_end": unit.page_end,
+                "expected": unit.expected,
+                "identified": identified,
+                "extracted": kept,
+                "rejected": result.get("rejected_count", 0),
+                "rejected_items": result.get("rejected") or [],
+                "status": status,
+                "attempts": result.get("attempts", 0),
+                "error": result.get("error"),
             })
 
-    # Cross-section dedup pass — safety net. v3's section-aligned design makes
-    # duplicates rare, but overlapping page ranges and reprinted exercises can
-    # still produce them. Earliest-page wins.
-    with SyncSession() as session:
-        dedup_stats = dedup_bank(session, bank_id)
-        if dedup_stats["dropped"]:
-            extracted_total -= dedup_stats["dropped"]
-            bank = session.get(QuestionBank, bank_id)
-            if bank is not None:
-                stats = dict(bank.extraction_stats or {})
-                stats["dedup"] = dedup_stats
-                stats.setdefault("totals", {})["extracted_total"] = extracted_total
-                bank.extraction_stats = stats
-                session.commit()
+            # Persist rolling stats so the UI can show progress mid-run. Sort by
+            # page so the order is stable across parallel completions (otherwise
+            # the section list would reshuffle on every refresh).
+            sorted_reports = sorted(
+                section_reports,
+                key=lambda s: (s.get("page_start") or 0, s.get("page_end") or 0),
+            )
+            legacy_blocks = [
+                {
+                    "excluded_block_index": idx,
+                    "title": s["section_title"],
+                    "section_ref": s["section_ref"],
+                    "page_start": s["page_start"],
+                    "page_end": s["page_end"],
+                    "identified": s["identified"],
+                    "extracted": s["extracted"],
+                    "missed": max(0, (s.get("expected") or s["identified"]) - s["extracted"]),
+                    "status": _legacy_block_status(s["status"]),
+                }
+                for idx, s in enumerate(sorted_reports)
+            ]
+            with SyncSession() as session:
+                _update_bank(session, bank_id, extraction_stats={
+                    "sections": sorted_reports,
+                    "totals": {
+                        "expected_total": expected_total,
+                        "extracted_total": extracted_total,
+                        **counts,
+                    },
+                    "blocks": legacy_blocks,
+                    "total_identified": sum(s["identified"] for s in sorted_reports),
+                    "total_extracted": extracted_total,
+                    "missed": sum(b["missed"] for b in legacy_blocks),
+                    "worker_version": "v3",
+                })
+
+    # Cross-section dedup pass — DISABLED per user directive ("pure OCR — throw
+    # even if same"). If Gemini transcribes the same text for two different
+    # sections (e.g. a reprinted exercise, or overlapping page slices), we
+    # keep BOTH. Dedup was masking real OCR/schema issues by silently
+    # dropping rows — better to surface duplicates so the user can see them
+    # and decide what to do per-section.
+    dedup_stats = None
+
+    # Auto-link example touchpoints into the parent theory blocks. Best-
+    # effort — failure here doesn't fail the bank.
+    try:
+        from app.services.example_linker import link_examples_to_theory_sync
+        with SyncSession() as session:
+            link_examples_to_theory_sync(session, book_id)
+    except Exception as e:
+        logger.warning("example_linker failed (book=%s): %s", book_id, e)
 
     # Final job status
     with SyncSession() as session:
@@ -580,6 +1565,9 @@ async def _run_section_retry(
         pdf_bytes = download_pdf(book.pdf_url or "")
         system_prompt = load_raw("question_extractor_v3")
         existing_stats = dict(bank.extraction_stats or {})
+        # Capture primitive values BEFORE the session closes — accessing
+        # `book.id` later raises DetachedInstanceError.
+        book_id_local = book.id
 
         _update_job(session, job_id, status="running", progress=10,
                     message=f"Retrying {unit.title}")
@@ -590,7 +1578,7 @@ async def _run_section_retry(
     status = _classify_unit(unit.expected, kept, identified, bool(result.get("ok")))
 
     with SyncSession() as session:
-        _persist_unit(session, bank_id, book.id, unit, result)
+        _persist_unit(session, bank_id, book_id_local, unit, result)
 
         # Update the matching section entry in extraction_stats in place
         sections = list(existing_stats.get("sections") or [])
