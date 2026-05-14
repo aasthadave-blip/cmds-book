@@ -256,6 +256,11 @@ async def patch_schema(
     book.title = validated.document_title or book.title
     book.subject = validated.subject or book.subject
     await session.flush()
+    # Ensure all attributes are loaded inside the async context — otherwise
+    # Pydantic's from_attributes=True serialization in `from_orm_book` /
+    # response_model can trigger lazy IO during the response phase →
+    # sqlalchemy.exc.MissingGreenlet: greenlet_spawn has not been called.
+    await session.refresh(book)
     return BookOut.from_orm_book(book)
 
 
