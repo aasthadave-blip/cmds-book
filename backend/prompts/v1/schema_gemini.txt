@@ -187,6 +187,45 @@ An example/exercise/illustration/activity/etc.'s parent is the theory heading (s
 
 **HARD RULE — A heading that appears AFTER the example label on the page is NOT a candidate for parent.** A new heading "starts" only at the moment its title text appears on the page; everything ABOVE that point on the page (and on any earlier page) belongs to the previous section.
 
+**HARD RULE — SAME-PAGE: LABEL ABOVE / HEADING BELOW = PREVIOUS SECTION:**
+On any printed page, if an Example/Exercise/Problem/Illustration/Activity
+label appears physically ABOVE a heading on the same page (the label's
+text is printed higher up in reading order), that label DOES NOT belong
+to the heading below it. It belongs to whatever section was active
+BEFORE this page began — i.e., the most recent heading from a PRIOR page.
+
+This rule is BINARY. Do not weigh visual proximity, do not consider
+which topic is more related, do not look at how many lines separate
+them. The only thing that matters is: in reading order on the page,
+does the heading text appear BEFORE (above) or AFTER (below) the
+example label?
+
+  - Heading above + label below → label belongs to that heading (same-page parent).
+  - Label above + heading below → label belongs to the PREVIOUS section (carry over from prior page), NOT the heading below.
+
+CONCRETE EXAMPLE — page 4 prints in this reading order:
+   EXAMPLE 3.2
+   EXAMPLE 3.3
+   EXAMPLE 3.4
+   "Percentage—a Relative Value"   (heading, mid-page)
+   [body of Relative Value]
+
+Page 3 (the previous page) ended with the heading "Expressing the Fraction
+a/b as a Decimal and as a Percentage".
+
+CORRECT nesting:
+  - EXAMPLE 3.2, 3.3, 3.4 → parent: "Expressing the Fraction a/b as a Decimal and as a Percentage" (the example labels appear at the top of page 4, BEFORE the new heading; they carry over from the prior page's section).
+  - "Percentage—a Relative Value" begins a new section mid-page; no
+    examples are printed below its heading on this page, so it gets
+    NO example children from page 4.
+
+WRONG nesting (do NOT do this):
+  - Putting EXAMPLE 3.2 / 3.3 / 3.4 under "Percentage—a Relative Value"
+    because that heading is on the same page. The heading appears
+    AFTER the example labels in reading order — it CANNOT be their
+    parent. Same-page presence is irrelevant; reading-order position
+    is the only criterion.
+
 **MULTI-PAGE TIEBREAKER — read in reading order across pages, not within a single page:**
 - If the example's page contains NO heading above the example's label (i.e., the example is at the top of the page or comes before any heading on that page), look BACKWARD across pages to find the most recent heading printed in the document — that heading is the parent.
 - This applies even when a NEW heading appears later on the SAME page as the example. The new heading governs only items printed AFTER its title text.

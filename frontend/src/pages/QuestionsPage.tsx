@@ -623,6 +623,72 @@ function QuestionList({
     return { sec, items };
   }, [detail, scopedKind, scopedSectionRef]);
 
+  // -------- Section-scoped view (sidebar click on a header) --------
+  // Hoisted above the early returns so every render calls the same hooks
+  // in the same order (React's Rules of Hooks). Previously these useMemo
+  // calls lived AFTER `if (kindScoped) return ...` and the next early
+  // return, which caused hook-count mismatch → blank screen in prod build.
+  const sectionScoped = useMemo(() => {
+    if (!scopedSectionRef || scopedKind) return null;
+    const prefix = scopedSectionRef + "::";
+    const matches = detail.sections.filter(
+      (s) => s.section_ref === scopedSectionRef || s.section_ref.startsWith(prefix),
+    );
+    if (matches.length === 0) return null;
+    return matches;
+  }, [detail, scopedSectionRef, scopedKind]);
+
+  type BlockStat = NonNullable<typeof detail.stats>["blocks"][number];
+  const blocksBySection = useMemo(() => {
+    const blocks: BlockStat[] = detail.stats?.blocks ?? [];
+    const out: Record<string, BlockStat[]> = {};
+    for (const b of blocks) {
+      const key = b.section_ref || "__unlinked__";
+      (out[key] ||= []).push(b);
+    }
+    return out;
+  }, [detail.stats]);
+
+  const v3StatsBySection = useMemo(() => {
+    const out: Record<string, ExtractionSectionStats> = {};
+    for (const s of detail.stats?.sections ?? []) {
+      out[s.section_ref] = s;
+    }
+    return out;
+  }, [detail.stats]);
+
+  const schemaOrder = useMemo(() => {
+    const out: { sectionRef: string; depth: number; title: string }[] = [];
+    const walk = (secs: SchemaSection[], depth: number) => {
+      for (const s of secs) {
+        if ((s.type ?? "section") !== "excluded") {
+          out.push({ sectionRef: s.id, depth, title: s.title });
+        }
+        if (s.subsections && s.subsections.length > 0) {
+          walk(s.subsections, depth + 1);
+        }
+      }
+    };
+    walk(bookSchema?.sections ?? [], 0);
+    return out;
+  }, [bookSchema]);
+
+  const scoped = useMemo(() => {
+    if (!excludedBlockRef) return null;
+    const filteredSections = detail.sections
+      .map((sec) => ({
+        ...sec,
+        questions: sec.questions.filter(
+          (q) => q.excluded_block_ref === excludedBlockRef,
+        ),
+      }))
+      .filter((sec) => sec.questions.length > 0);
+    const blockStat = (detail.stats?.blocks ?? []).find(
+      (b) => `ex-${b.excluded_block_index}` === excludedBlockRef,
+    );
+    return { sections: filteredSections, blockStat };
+  }, [detail, excludedBlockRef]);
+
   if (kindScoped) {
     const label = KIND_LABEL[scopedKind!] ?? scopedKind!;
     return (
@@ -662,22 +728,6 @@ function QuestionList({
       </>
     );
   }
-
-  // -------- Section-scoped view (sidebar click on a header) --------
-  // When only a section ref is selected (no kind, no excluded block), show
-  // every question whose section_ref matches OR starts with "<ref>::" so a
-  // parent click reveals all subsections combined. This replaces the old
-  // type-bucket (MCQ/Exercise) filtering — we just show every question
-  // verbatim under the chosen header, mirroring the PDF layout.
-  const sectionScoped = useMemo(() => {
-    if (!scopedSectionRef || scopedKind) return null;
-    const prefix = scopedSectionRef + "::";
-    const matches = detail.sections.filter(
-      (s) => s.section_ref === scopedSectionRef || s.section_ref.startsWith(prefix),
-    );
-    if (matches.length === 0) return null;
-    return matches;
-  }, [detail, scopedSectionRef, scopedKind]);
 
   if (sectionScoped) {
     const totalQ = sectionScoped.reduce((n, s) => n + s.questions.length, 0);
@@ -727,65 +777,6 @@ function QuestionList({
       </>
     );
   }
-
-  // Index block stats by section_ref for per-section retry context
-  type BlockStat = NonNullable<typeof detail.stats>["blocks"][number];
-  const blocksBySection = useMemo(() => {
-    const blocks: BlockStat[] = detail.stats?.blocks ?? [];
-    const out: Record<string, BlockStat[]> = {};
-    for (const b of blocks) {
-      const key = b.section_ref || "__unlinked__";
-      (out[key] ||= []).push(b);
-    }
-    return out;
-  }, [detail.stats]);
-
-  // v3 per-section stats by section_ref — drives status badge + rejected list + retry CTA
-  const v3StatsBySection = useMemo(() => {
-    const out: Record<string, ExtractionSectionStats> = {};
-    for (const s of detail.stats?.sections ?? []) {
-      out[s.section_ref] = s;
-    }
-    return out;
-  }, [detail.stats]);
-
-  // Schema-driven order: walk book.schema_ depth-first to get the printed order
-  // and depth of every section. Question stats overlay onto this hierarchy.
-  // This makes the Questions page mirror the theory schema view (titles +
-  // nesting) instead of a flat list of section_refs.
-  const schemaOrder = useMemo(() => {
-    const out: { sectionRef: string; depth: number; title: string }[] = [];
-    const walk = (secs: SchemaSection[], depth: number) => {
-      for (const s of secs) {
-        if ((s.type ?? "section") !== "excluded") {
-          out.push({ sectionRef: s.id, depth, title: s.title });
-        }
-        if (s.subsections && s.subsections.length > 0) {
-          walk(s.subsections, depth + 1);
-        }
-      }
-    };
-    walk(bookSchema?.sections ?? [], 0);
-    return out;
-  }, [bookSchema]);
-
-  // When a specific excluded block is selected, scope everything to questions
-  // that came from that block (and the stats row for it).
-  const scoped = useMemo(() => {
-    if (!excludedBlockRef) return null;
-    const filteredSections = detail.sections
-      .map((sec) => ({
-        ...sec,
-        questions: sec.questions.filter(
-          (q) => q.excluded_block_ref === excludedBlockRef,
-        ),
-      }))
-      .filter((sec) => sec.questions.length > 0);
-    const blockStat = (detail.stats?.blocks ?? []).find(
-      (b) => `ex-${b.excluded_block_index}` === excludedBlockRef,
-    );
-    return { sections: filteredSections, blockStat };
-  }, [detail, excludedBlockRef]);
 
   if (scoped) {
     return (

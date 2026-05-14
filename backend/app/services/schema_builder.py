@@ -98,13 +98,13 @@ def _run_gemini_schema(pdf_bytes: bytes, schema_prompt: str) -> dict:
         model=GEMINI_MODEL,
         timeout_s=300,
         max_output_tokens=32000,
-        # temperature=0.0 → greedy decoding for maximum cross-run
-        # consistency. Eliminates most schema variance between Analyse
-        # runs on the same PDF (e.g. local vs prod producing different
-        # wrappers or different heading splits). Same understanding,
-        # same speed, same cost — just locks token selection to the
-        # most probable path.
-        temperature=0.0,
+        # temperature=0.1 — slight sampling variance helps Gemini find
+        # rule-compliant interpretations on ambiguous page-spanning
+        # cases. Pure greedy (0.0) was observed to lock into wrong
+        # most-probable answers on specific PDF layouts; 0.1 gives
+        # enough wiggle room to find the binary-rule-compliant
+        # interpretation while still being highly deterministic.
+        temperature=0.1,
         display_name="textbook_chapter.pdf",
     )
     return parse_json(raw)
