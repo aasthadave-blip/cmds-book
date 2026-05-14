@@ -1,4 +1,4 @@
-import { useState, useMemo } from "react";
+import { useState, useMemo, useEffect } from "react";
 import {
   useApprove,
   useBook,
@@ -62,9 +62,14 @@ export function SchemaPage() {
       return false;
     }
   });
-  // Re-sync when the user switches books
-  useMemo(() => {
-    if (!freezeKey) return;
+  // Re-sync when the user switches books — useEffect (not useMemo) so
+  // the setState happens AFTER render, not during. setState during
+  // render via useMemo caused render loops + unresponsive clicks.
+  useEffect(() => {
+    if (!freezeKey) {
+      setSchemaFrozenState(false);
+      return;
+    }
     try {
       setSchemaFrozenState(localStorage.getItem(freezeKey) === "1");
     } catch {
@@ -370,7 +375,15 @@ export function SchemaPage() {
                           setJustFroze(true);
                           setTimeout(() => setJustFroze(false), 2000);
                         },
-                        onError: () => setFreezeInFlight(false),
+                        onError: (err) => {
+                          setFreezeInFlight(false);
+                          console.error("Freeze schema PATCH failed:", err);
+                          window.alert(
+                            "Freeze failed — schema couldn't be saved.\n\n" +
+                              ((err as Error)?.message ?? String(err)) +
+                              "\n\nCheck the browser DevTools Network tab for the response body."
+                          );
+                        },
                       },
                     );
                   } else {
