@@ -1,8 +1,8 @@
 import { create } from "zustand";
 import type { UUID } from "../api/client";
 
-export type View = "library" | "upload" | "schema" | "reader" | "regen" | "settings" | "questions";
-export type BookLens = "theory" | "questions";
+export type View = "library" | "upload" | "schema" | "reader" | "regen" | "settings" | "questions" | "images";
+export type BookLens = "theory" | "questions" | "images";
 
 interface UIState {
   view: View;
@@ -19,6 +19,9 @@ interface UIState {
   bookLens: BookLens;
   // Selected kind folder inside Questions lens (e.g. "example", "exercise")
   selectedKind: string | null;
+  // Figures pipeline (additive — no overlap with Q/T state)
+  selectedFigureId: UUID | null;
+  selectedFigureSectionRef: string | null;
   setView: (v: View) => void;
   selectBook: (id: UUID | null) => void;
   selectSection: (id: UUID | null) => void;
@@ -30,6 +33,8 @@ interface UIState {
   selectExcludedBlock: (ref: string | null, sectionRef?: string | null) => void;
   setBookLens: (lens: BookLens) => void;
   selectKind: (sectionRef: string | null, kind: string | null) => void;
+  selectFigure: (figureId: UUID | null) => void;
+  selectFigureSection: (sectionRef: string | null) => void;
 }
 
 export const useUI = create<UIState>((set) => ({
@@ -44,6 +49,8 @@ export const useUI = create<UIState>((set) => ({
   selectedExcludedBlockRef: null,
   bookLens: "theory",
   selectedKind: null,
+  selectedFigureId: null,
+  selectedFigureSectionRef: null,
   setView: (view) => set({ view }),
   selectBook: (id) =>
     set({
@@ -84,4 +91,7 @@ export const useUI = create<UIState>((set) => ({
       selectedKind: kind,
       selectedExcludedBlockRef: null,
     }),
+  selectFigure: (figureId) => set({ selectedFigureId: figureId }),
+  selectFigureSection: (sectionRef) =>
+    set({ selectedFigureSectionRef: sectionRef, selectedFigureId: null }),
 }));

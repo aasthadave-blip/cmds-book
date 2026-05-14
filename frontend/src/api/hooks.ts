@@ -28,6 +28,13 @@ export const qk = {
   questionRegens: (bookId: UUID) => ["books", bookId, "question-regenerations"] as const,
   questionRegen: (id: UUID) => ["question-regenerations", id] as const,
   regenQuestions: (id: UUID) => ["question-regenerations", id, "questions"] as const,
+  // Figures pipeline v2 (additive)
+  bookFigures: (bookId: UUID) => ["books", bookId, "figures-v2"] as const,
+  figure: (id: UUID) => ["figures-v2", id] as const,
+  bookFigureRefs: (bookId: UUID, sectionRef?: string, ctx?: string) =>
+    ["books", bookId, "figure-references", sectionRef ?? "all", ctx ?? "all"] as const,
+  bookFigureRegens: (bookId: UUID, sectionRef?: string) =>
+    ["books", bookId, "figure-regenerations", sectionRef ?? "all"] as const,
 };
 
 export function useBooks() {
@@ -444,6 +451,141 @@ export function useSaveProviderKeys() {
       api.saveProviderKeys(name, keys),
     onSuccess: () => {
       void qc.invalidateQueries({ queryKey: qk.providers() });
+    },
+  });
+}
+
+// ============================================================
+// Figures pipeline v2 hooks (NEW — additive)
+// ============================================================
+
+import type { FigureRegenParams } from "./client";
+
+export function useBookFigures(bookId: UUID | null, opts?: { pollMs?: number }) {
+  return useQuery({
+    queryKey: qk.bookFigures(bookId ?? ""),
+    queryFn: () => api.listFigures(bookId!),
+    enabled: !!bookId,
+    refetchInterval: opts?.pollMs,
+  });
+}
+
+export function useFigure(figureId: UUID | null, opts?: { pollMs?: number }) {
+  return useQuery({
+    queryKey: qk.figure(figureId ?? ""),
+    queryFn: () => api.getFigure(figureId!),
+    enabled: !!figureId,
+    refetchInterval: opts?.pollMs,
+  });
+}
+
+export function useBookFigureRefs(
+  bookId: UUID | null,
+  opts?: { sectionRef?: string; context?: "theory" | "question" },
+) {
+  return useQuery({
+    queryKey: qk.bookFigureRefs(bookId ?? "", opts?.sectionRef, opts?.context),
+    queryFn: () => api.listFigureReferences(bookId!, opts),
+    enabled: !!bookId,
+  });
+}
+
+export function useBookFigureRegenerations(
+  bookId: UUID | null,
+  opts?: { sectionRef?: string; pollMs?: number },
+) {
+  return useQuery({
+    queryKey: qk.bookFigureRegens(bookId ?? "", opts?.sectionRef),
+    queryFn: () => api.listFigureRegenerations(bookId!, { sectionRef: opts?.sectionRef }),
+    enabled: !!bookId,
+    refetchInterval: opts?.pollMs,
+  });
+}
+
+export function useExtractFiguresV2() {
+  const qc = useQueryClient();
+  return useMutation({
+    mutationFn: ({ bookId }: { bookId: UUID }) => api.extractFiguresV2(bookId),
+    onSuccess: (_data, vars) => {
+      void qc.invalidateQueries({ queryKey: qk.bookFigures(vars.bookId) });
+    },
+  });
+}
+
+export function useRegenerateFiguresSection() {
+  const qc = useQueryClient();
+  return useMutation({
+    mutationFn: ({
+      bookId,
+      sectionRef,
+      params,
+    }: {
+      bookId: UUID;
+      sectionRef: string;
+      params: FigureRegenParams;
+    }) => api.regenerateFiguresSection(bookId, sectionRef, params),
+    onSuccess: (_data, vars) => {
+      void qc.invalidateQueries({ queryKey: qk.bookFigures(vars.bookId) });
+      void qc.invalidateQueries({ queryKey: qk.bookFigureRegens(vars.bookId) });
+    },
+  });
+}
+
+export function useDiscardFigureRegen() {
+  const qc = useQueryClient();
+  return useMutation({
+    mutationFn: ({ figureId }: { figureId: UUID; bookId: UUID }) =>
+      api.discardFigureRegen(figureId),
+    onSuccess: (_data, vars) => {
+      void qc.invalidateQueries({ queryKey: qk.figure(vars.figureId) });
+      void qc.invalidateQueries({ queryKey: qk.bookFigures(vars.bookId) });
+    },
+  });
+}
+
+// 0016 — approval workflow (Q5 "Approve & move to Regenerated")
+export function useApproveSectionFigures() {
+  const qc = useQueryClient();
+  return useMutation({
+    mutationFn: ({ bookId, sectionRef }: { bookId: UUID; sectionRef: string }) =>
+      api.approveSectionFigures(bookId, sectionRef),
+    onSuccess: (_data, vars) => {
+      void qc.invalidateQueries({ queryKey: qk.bookFigures(vars.bookId) });
+    },
+  });
+}
+
+export function useUnapproveSectionFigures() {
+  const qc = useQueryClient();
+  return useMutation({
+    mutationFn: ({ bookId, sectionRef }: { bookId: UUID; sectionRef: string }) =>
+      api.unapproveSectionFigures(bookId, sectionRef),
+    onSuccess: (_data, vars) => {
+      void qc.invalidateQueries({ queryKey: qk.bookFigures(vars.bookId) });
+    },
+  });
+}
+
+export function useApproveFigure() {
+  const qc = useQueryClient();
+  return useMutation({
+    mutationFn: ({ figureId }: { figureId: UUID; bookId: UUID }) =>
+      api.approveOneFigure(figureId),
+    onSuccess: (_data, vars) => {
+      void qc.invalidateQueries({ queryKey: qk.figure(vars.figureId) });
+      void qc.invalidateQueries({ queryKey: qk.bookFigures(vars.bookId) });
+    },
+  });
+}
+
+export function useUnapproveFigure() {
+  const qc = useQueryClient();
+  return useMutation({
+    mutationFn: ({ figureId }: { figureId: UUID; bookId: UUID }) =>
+      api.unapproveOneFigure(figureId),
+    onSuccess: (_data, vars) => {
+      void qc.invalidateQueries({ queryKey: qk.figure(vars.figureId) });
+      void qc.invalidateQueries({ queryKey: qk.bookFigures(vars.bookId) });
     },
   });
 }

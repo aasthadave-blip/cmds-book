@@ -7,6 +7,7 @@ import { ReaderPage } from "./pages/ReaderPage";
 import { RegenPage } from "./pages/RegenPage";
 import { SettingsPage } from "./pages/SettingsPage";
 import { QuestionsPage } from "./pages/QuestionsPage";
+import { FiguresPage } from "./pages/FiguresPage";
 import { useUI } from "./stores/ui";
 
 export default function App() {
@@ -23,6 +24,7 @@ export default function App() {
         {view === "regen" && <RegenPage />}
         {view === "settings" && <SettingsPage />}
         {view === "questions" && <QuestionsPage />}
+        {view === "images" && <FiguresPage />}
       </main>
     </div>
   );

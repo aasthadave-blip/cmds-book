@@ -7,21 +7,62 @@ import { JobProgress } from "../components/JobProgress";
 import { BlockRenderer } from "../components/BlockRenderer";
 import { RegenReviewPage } from "./RegenReviewPage";
 
-// Walk the schema and collect leaf sections in document order.
-// A leaf = section with no non-excluded subsections. These are the units
-// the backend actually regenerates (containers are skipped server-side).
-function collectLeafSections(schema: BookSchema | null | undefined): SchemaSection[] {
+// Walk the schema and collect display nodes for the regen picker.
+// Mirrors the Theory sidebar's filter (Sidebar.tsx SectionList):
+//  - Include ALL non-excluded schema nodes (parents AND leaves) so users see
+//    the same tree as the sidebar (e.g. a container like "Percentage" shows
+//    up alongside its children).
+//  - Exclude question-kind sections (Examples, Exercises, Problems, etc.) —
+//    they belong to the Question Bank, not theory regeneration.
+//
+// Each display node carries its theory-leaf descendants so we can cascade a
+// parent tick into the underlying leaf IDs. The backend still only receives
+// leaf IDs (per its existing "containers are skipped server-side" behaviour).
+//
+// Keep this regex in sync with Sidebar.tsx's QUESTION_KIND_RE.
+const QUESTION_KIND_RE =
+  /[.\-](?:worked-example|solved-example|practice-problem|in-text-question|intext-question|example|exercise|problem)(?:[.\-]\d[\w.-]*)?$/;
+
+function isQuestionKind(id: string): boolean {
+  return QUESTION_KIND_RE.test(id);
+}
+
+interface DisplayNode {
+  id: string;
+  title: string;
+  depth: number;
+  leafIds: string[];   // theory-leaf descendants (the node itself if it is a leaf)
+}
+
+function collectTheoryLeavesUnder(node: SchemaSection): string[] {
+  if (node.type === "excluded" || isQuestionKind(node.id)) return [];
+  const liveKids = (node.subsections || []).filter(
+    (c) => c.type !== "excluded" && !isQuestionKind(c.id),
+  );
+  if (liveKids.length === 0) return [node.id];
+  const out: string[] = [];
+  for (const c of liveKids) out.push(...collectTheoryLeavesUnder(c));
+  return out;
+}
+
+function collectTheoryDisplay(
+  schema: BookSchema | null | undefined,
+): DisplayNode[] {
   if (!schema) return [];
-  const out: SchemaSection[] = [];
-  const walk = (nodes: SchemaSection[]) => {
+  const out: DisplayNode[] = [];
+  const walk = (nodes: SchemaSection[], depth: number) => {
     for (const n of nodes) {
-      if (n.type === "excluded") continue;
-      const liveKids = (n.subsections || []).filter((c) => c.type !== "excluded");
-      if (liveKids.length === 0) out.push(n);
-      walk(n.subsections || []);
+      if (n.type === "excluded" || isQuestionKind(n.id)) continue;
+      out.push({
+        id: n.id,
+        title: n.title,
+        depth,
+        leafIds: collectTheoryLeavesUnder(n),
+      });
+      walk(n.subsections || [], depth + 1);
     }
   };
-  walk(schema.sections || []);
+  walk(schema.sections || [], 0);
   return out;
 }
 
@@ -94,7 +135,12 @@ export function RegenPage() {
   const regen = useRegenerate();
   const { data: job } = useJob(jobId);
 
-  const leafSections = useMemo(() => collectLeafSections(book?.schema_), [book?.schema_]);
+  const displayNodes = useMemo(() => collectTheoryDisplay(book?.schema_), [book?.schema_]);
+  const allLeafIds = useMemo(() => {
+    const seen = new Set<string>();
+    for (const n of displayNodes) for (const lid of n.leafIds) seen.add(lid);
+    return Array.from(seen);
+  }, [displayNodes]);
 
   if (!book) {
     return (
@@ -120,16 +166,37 @@ export function RegenPage() {
   // How many leaves would actually be regenerated given the current selection.
   // null = "all leaves" (backend default). Empty Set = nothing selected (disable submit).
   const effectiveCount =
-    selectedSectionIds === null ? leafSections.length : selectedSectionIds.size;
+    selectedSectionIds === null ? allLeafIds.length : selectedSectionIds.size;
   const nothingSelected = selectedSectionIds !== null && selectedSectionIds.size === 0;
 
-  function toggleSection(id: string) {
+  // Tick state for a display node: "all" / "some" / "none" — counts only the
+  // leaves under this node so parents indeterminate-render correctly when
+  // partial.
+  function nodeSelectionState(node: DisplayNode): "all" | "some" | "none" {
+    if (node.leafIds.length === 0) return "none";
+    const selected = selectedSectionIds;
+    if (selected === null) return "all";
+    let hit = 0;
+    for (const lid of node.leafIds) if (selected.has(lid)) hit++;
+    if (hit === 0) return "none";
+    if (hit === node.leafIds.length) return "all";
+    return "some";
+  }
+
+  // Toggle a display node — flips ALL its theory-leaf descendants together.
+  // Backend still only receives leaf IDs; parents are display-only cascades.
+  function toggleNode(node: DisplayNode) {
+    if (node.leafIds.length === 0) return;
     setSelectedSectionIds((prev) => {
-      // First interaction: seed with "all selected" then toggle off this one.
-      const base = prev ?? new Set(leafSections.map((s) => s.id));
+      // First interaction: seed with "all selected" then toggle this subtree.
+      const base = prev ?? new Set(allLeafIds);
       const next = new Set(base);
-      if (next.has(id)) next.delete(id);
-      else next.add(id);
+      const state = nodeSelectionState(node);
+      if (state === "all") {
+        for (const lid of node.leafIds) next.delete(lid);
+      } else {
+        for (const lid of node.leafIds) next.add(lid);
+      }
       return next;
     });
   }
@@ -247,11 +314,11 @@ export function RegenPage() {
                   <textarea className="inp" value={p.custom_instructions ?? ""} onChange={(e) => setP({ ...p, custom_instructions: e.target.value || null })} rows={3} placeholder="e.g. Emphasise real-world applications, use SI units only" />
                 </div>
 
-                {leafSections.length > 0 && (
+                {displayNodes.length > 0 && (
                   <div className="card">
                     <div style={{ display: "flex", alignItems: "center", justifyContent: "space-between", marginBottom: 8 }}>
                       <div className="clbl" style={{ margin: 0 }}>
-                        Sections to regenerate · {effectiveCount} of {leafSections.length}
+                        Sections to regenerate · {effectiveCount} of {allLeafIds.length}
                       </div>
                       <div style={{ display: "flex", gap: 6 }}>
                         <button type="button" className="btn bg" style={{ padding: "3px 10px", fontSize: "0.72rem" }} onClick={selectAll}>
@@ -263,28 +330,35 @@ export function RegenPage() {
                       </div>
                     </div>
                     <div style={{ maxHeight: 260, overflowY: "auto", border: "1px solid var(--border)", borderRadius: 7, padding: 6 }}>
-                      {leafSections.map((s) => {
-                        const effectiveSelected =
-                          selectedSectionIds === null || selectedSectionIds.has(s.id);
+                      {displayNodes.map((n) => {
+                        const state = nodeSelectionState(n);
+                        const checked = state === "all";
+                        const indeterminate = state === "some";
+                        const isContainer = n.leafIds.length > 1 || (n.leafIds.length === 1 && n.leafIds[0] !== n.id);
                         return (
                           <label
-                            key={s.id}
+                            key={n.id}
                             style={{
                               display: "flex", alignItems: "center", gap: 8,
                               padding: "4px 8px", borderRadius: 5, cursor: "pointer",
                               fontSize: "0.78rem", color: "var(--text2)",
+                              paddingLeft: 8 + n.depth * 16,
+                              fontWeight: isContainer ? 600 : 400,
                             }}
                           >
                             <input
                               type="checkbox"
-                              checked={effectiveSelected}
-                              onChange={() => toggleSection(s.id)}
+                              checked={checked}
+                              ref={(el) => {
+                                if (el) el.indeterminate = indeterminate;
+                              }}
+                              onChange={() => toggleNode(n)}
                             />
                             <span style={{ fontFamily: "var(--mono)", color: "var(--text3)", fontSize: "0.72rem", minWidth: 40 }}>
-                              {s.id}
+                              {n.id}
                             </span>
                             <span style={{ overflow: "hidden", textOverflow: "ellipsis", whiteSpace: "nowrap" }}>
-                              {s.title}
+                              {n.title}
                             </span>
                           </label>
                         );
@@ -302,7 +376,7 @@ export function RegenPage() {
                   <button type="submit" className="btn bp" disabled={regen.isPending || nothingSelected}>
                     {regen.isPending
                       ? "Starting…"
-                      : `✨ Start regeneration${effectiveCount !== leafSections.length ? ` (${effectiveCount} section${effectiveCount === 1 ? "" : "s"})` : ""}`}
+                      : `✨ Start regeneration${effectiveCount !== allLeafIds.length ? ` (${effectiveCount} section${effectiveCount === 1 ? "" : "s"})` : ""}`}
                   </button>
                 </div>
               </form>

@@ -48,6 +48,7 @@ export interface SchemaSection {
   title: string;
   type: "chapter" | "section" | "subsection" | "excluded";
   content_types: string[];
+  expected_question_count?: number;
   subsections: SchemaSection[];
 }
 
@@ -606,4 +607,201 @@ export const api = {
       `/api/providers/${name}/keys`,
       { method: "POST", body: JSON.stringify(keys) },
     ),
+
+  // ===========================================================
+  // Figures pipeline v2 (NEW — additive)
+  // ===========================================================
+  extractFiguresV2: (bookId: UUID) =>
+    req<FigureExtractStartResponse>(
+      `/api/books/${bookId}/extract-figures-v2`,
+      { method: "POST" },
+    ),
+  listFigures: (bookId: UUID) =>
+    req<FigureListResponse>(`/api/books/${bookId}/figures`),
+  getFigure: (figureId: UUID) =>
+    req<FigureDetail>(`/api/figures/${figureId}`),
+  // Image URLs — used directly in <img src> (no JSON parse needed)
+  figureImageUrl: (figureId: UUID, variant: FigureVariant = "auto") =>
+    `${API_BASE}/api/figures/${figureId}/image?variant=${variant}`,
+  regenerateFiguresSection: (
+    bookId: UUID,
+    sectionRef: string,
+    params: FigureRegenParams,
+  ) =>
+    req<FigureRegenStartResponse>(
+      `/api/books/${bookId}/sections/${encodeURIComponent(sectionRef)}/regenerate-figures`,
+      { method: "POST", body: JSON.stringify(params) },
+    ),
+  discardFigureRegen: (figureId: UUID) =>
+    req<{ figure_id: UUID; status: string }>(
+      `/api/figures/${figureId}/discard-regen`,
+      { method: "POST" },
+    ),
+  approveSectionFigures: (bookId: UUID, sectionRef: string) =>
+    req<{ section_ref: string; approved: number; skipped_without_regen: number; approved_at: string }>(
+      `/api/books/${bookId}/sections/${encodeURIComponent(sectionRef)}/figures/approve`,
+      { method: "POST" },
+    ),
+  unapproveSectionFigures: (bookId: UUID, sectionRef: string) =>
+    req<{ section_ref: string; unapproved: number }>(
+      `/api/books/${bookId}/sections/${encodeURIComponent(sectionRef)}/figures/unapprove`,
+      { method: "POST" },
+    ),
+  approveOneFigure: (figureId: UUID) =>
+    req<{ figure_id: UUID; approved_at: string }>(
+      `/api/figures/${figureId}/approve`,
+      { method: "POST" },
+    ),
+  unapproveOneFigure: (figureId: UUID) =>
+    req<{ figure_id: UUID; status: string }>(
+      `/api/figures/${figureId}/unapprove`,
+      { method: "POST" },
+    ),
+  listFigureReferences: (
+    bookId: UUID,
+    opts?: { sectionRef?: string; context?: "theory" | "question" },
+  ) => {
+    const qs = new URLSearchParams();
+    if (opts?.sectionRef) qs.set("section_ref", opts.sectionRef);
+    if (opts?.context) qs.set("context", opts.context);
+    const tail = qs.toString() ? `?${qs.toString()}` : "";
+    return req<FigureReferencesResponse>(
+      `/api/books/${bookId}/figure-references${tail}`,
+    );
+  },
+  listFigureRegenerations: (
+    bookId: UUID,
+    opts?: { sectionRef?: string },
+  ) => {
+    const qs = new URLSearchParams();
+    if (opts?.sectionRef) qs.set("section_ref", opts.sectionRef);
+    const tail = qs.toString() ? `?${qs.toString()}` : "";
+    return req<FigureRegenerationsResponse>(
+      `/api/books/${bookId}/figure-regenerations${tail}`,
+    );
+  },
 };
+
+// ============================================================
+// Figures pipeline v2 — types (NEW — additive)
+// ============================================================
+
+export type FigureVariant = "original" | "regenerated" | "auto";
+
+export interface FigureReference {
+  id: UUID;
+  figure_id: UUID;
+  section_ref: string;
+  context: "theory" | "question";
+  question_id: UUID | null;
+  placeholder_text: string | null;
+  link_method: string;
+}
+
+export interface Figure {
+  id: UUID;
+  book_id: UUID;
+  section_id: string;
+  figure_id_text: string | null;
+  figure_number: string | null;
+  normalized_label: string | null;
+  caption: string | null;
+  description: string | null;
+  page_number: number | null;
+  bounding_box: number[] | null;
+  semantic_type: string;
+  tags: string[];
+  status: string;
+  regen_status: "none" | "extracting" | "ready" | "failed";
+  regen_version: number;
+  has_original: boolean;
+  has_regen: boolean;
+  regen_meta: Record<string, unknown> | null;
+  context_hint: string | null;
+  // 0016 — approval workflow
+  approved_at: string | null;
+  is_approved: boolean;
+  references?: FigureReference[] | null;
+  created_at: string | null;
+}
+
+export interface FigureDetail extends Figure {
+  references: FigureReference[];
+}
+
+export interface FigureSectionGroup {
+  section_ref: string;
+  figures: Figure[];
+  contexts: ("theory" | "question")[];
+  n_theory: number;
+  n_question: number;
+  // 0016 — regen + approval counts for sidebar badges
+  n_regen: number;
+  n_approved: number;
+}
+
+export interface FigureListResponse {
+  book_id: UUID;
+  sections: FigureSectionGroup[];
+  total_figures: number;
+}
+
+export interface FigureReferencesResponse {
+  book_id: UUID;
+  section_ref: string | null;
+  context: "theory" | "question" | null;
+  references: FigureReference[];
+}
+
+export interface FigureExtractStartResponse {
+  book_id: UUID;
+  job_id: UUID;
+  status: string;
+}
+
+export interface FigureRegenParams {
+  style?: "enhanced" | "original";
+  custom_instructions?: string | null;
+  watermark_clean?: boolean;
+  overlay?: boolean;
+  image_model?: string | null;
+  ocr_model?: string | null;
+}
+
+export interface FigureRegenStartResponse {
+  book_id: UUID;
+  section_ref: string;
+  job_id: UUID;
+  status: string;
+  params: FigureRegenParams;
+}
+
+export interface FigureRegenerationRow {
+  id: UUID;
+  book_id: UUID;
+  figure_id: UUID;
+  section_id: string;
+  image_url: string | null;
+  style_params: Record<string, unknown> | null;
+  model_used: string | null;
+  status: string;
+  created_at: string | null;
+}
+
+export interface FigureRegenerationRun {
+  section_id: string;
+  started_at: string | null;
+  total: number;
+  succeeded: number;
+  failed: number;
+  model_used: string | null;
+  style_params: Record<string, unknown> | null;
+  rows: FigureRegenerationRow[];
+}
+
+export interface FigureRegenerationsResponse {
+  book_id: UUID;
+  section_ref: string | null;
+  total_attempts: number;
+  runs: FigureRegenerationRun[];
+}

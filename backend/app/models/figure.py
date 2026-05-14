@@ -34,5 +34,24 @@ class Figure(Base):
         DateTime(timezone=True), server_default=func.now(), nullable=False
     )
 
+    # ----- Figures pipeline v2 additions (migration 0015) -----
+    image_bytes: Mapped[bytes | None] = mapped_column(sa.LargeBinary, nullable=True)
+    regen_image_bytes: Mapped[bytes | None] = mapped_column(sa.LargeBinary, nullable=True)
+    mime_type: Mapped[str | None] = mapped_column(sa.String(64), default="image/png")
+    regen_version: Mapped[int] = mapped_column(sa.Integer, default=0, nullable=False)
+    regen_status: Mapped[str] = mapped_column(sa.String(32), default="none", nullable=False)
+    figure_id_text: Mapped[str | None] = mapped_column(sa.String(64), nullable=True)
+    normalized_label: Mapped[str | None] = mapped_column(sa.String(64), nullable=True)
+    source_hash: Mapped[str | None] = mapped_column(sa.String(64), nullable=True)
+    regen_cache_key: Mapped[str | None] = mapped_column(sa.String(64), nullable=True)
+    context_hint: Mapped[str | None] = mapped_column(sa.String(32), nullable=True)
+    regen_meta: Mapped[dict | None] = mapped_column(sa.JSON, nullable=True)
+    # 0016 — Q5 approval workflow. Set when user clicks "Approve & move to
+    # Regenerated"; cleared on Unapprove. ✨ Regenerated folder filters
+    # to rows where approved_at IS NOT NULL.
+    approved_at: Mapped[datetime | None] = mapped_column(
+        DateTime(timezone=True), nullable=True,
+    )
+
     book = relationship("Book", back_populates="figures")
     regenerations = relationship("FigureRegeneration", back_populates="figure", cascade="all, delete-orphan")

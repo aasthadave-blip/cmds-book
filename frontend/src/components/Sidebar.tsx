@@ -8,8 +8,14 @@ import {
   useRegenQuestions,
   useQuestionBanks,
   useQuestions,
+  useBookFigures,
 } from "../api/hooks";
-import type { Section, QuestionKind, QuestionBankSectionGroup } from "../api/client";
+import type {
+  Section,
+  QuestionKind,
+  QuestionBankSectionGroup,
+  FigureSectionGroup,
+} from "../api/client";
 import { useUI } from "../stores/ui";
 
 export function Sidebar() {
@@ -193,6 +199,20 @@ function BookFolders({ bookId }: { bookId: string }) {
             </span>
           )}
         </button>
+        {/* Figures pipeline v2 lens — additive, no behavior change to
+            theory/questions tabs. Clicking jumps straight to the figures
+            page (no inline tree — figures get their own full-width view). */}
+        <button
+          className={`sb-lens ${bookLens === "images" ? "active" : ""}`}
+          onClick={() => {
+            setBookLens("images");
+            setView("images");
+          }}
+          style={lensBtnStyle(bookLens === "images")}
+          title="Images — extracted figures + regenerated variants"
+        >
+          🖼 Images
+        </button>
       </div>
       {inFlightRetry && bookLens === "questions" && (
         <div
@@ -220,6 +240,12 @@ function BookFolders({ bookId }: { bookId: string }) {
             </>
           )}
         </>
+      ) : bookLens === "images" ? (
+        // 🖼 Images mode — same shape as Theory/Questions tab:
+        // schema-mirrored tree (filtered to figure-containing nodes)
+        // followed by a ✨ Regenerated subtree (filtered to nodes that
+        // have at least one approved variant).
+        <FiguresLens bookId={bookId} />
       ) : (
         <>
           {!latestBank && (
@@ -830,5 +856,311 @@ function QuestionFlatNode({ section }: { section: QuestionBankSectionGroup }) {
         <span className="tcnt">{totalCount}</span>
       </button>
     </div>
+  );
+}
+
+
+// ============================================================
+// 🖼 FiguresLens — schema-mirrored tree for the Images tab sidebar.
+//
+// Mirrors the Theory + Questions sidebar shape exactly:
+//   - Top tree:  schema, filtered to nodes containing ≥1 extracted figure
+//   - ✨ Regenerated subtree (only shown when ≥1 approved variant exists):
+//     same shape, filtered to nodes containing ≥1 approved regen
+//
+// Click a leaf node → sets selectedFigureSectionRef + ensures view="images"
+// so the FiguresPage main panel renders that section's figure cards.
+// ============================================================
+
+function FiguresLens({ bookId }: { bookId: string }) {
+  const { data: book } = useBook(bookId);
+  const { data: figData } = useBookFigures(bookId);
+
+  const sections = figData?.sections ?? [];
+  const totalApproved = sections.reduce((n, s) => n + s.n_approved, 0);
+  const totalExtracted = figData?.total_figures ?? 0;
+
+  if (totalExtracted === 0) {
+    return (
+      <div style={{ padding: "8px 14px", fontSize: "0.7rem", color: "var(--text3)" }}>
+        <div style={{ fontWeight: 600, marginBottom: 4, color: "var(--text2)" }}>
+          🖼 No figures yet
+        </div>
+        <div style={{ lineHeight: 1.5 }}>
+          Click <b>🖼 Extract figures</b> in the main panel to run the pipeline.
+        </div>
+      </div>
+    );
+  }
+
+  return (
+    <div>
+      <FiguresTreeSidebar
+        bookId={bookId}
+        schema={book?.schema_ as FiguresSchemaLike | undefined}
+        sections={sections}
+        mode="original"
+      />
+      {totalApproved > 0 && (
+        <>
+          <div className="sb-lbl" style={{ marginTop: 6 }}>✨ Regenerated</div>
+          <FiguresTreeSidebar
+            bookId={bookId}
+            schema={book?.schema_ as FiguresSchemaLike | undefined}
+            sections={sections.filter((s) => s.n_approved > 0)}
+            mode="regenerated"
+          />
+        </>
+      )}
+    </div>
+  );
+}
+
+// Schema-mirrored tree for figures (separate from QuestionsLens to avoid
+// coupling). Filters nodes to those whose section_ref appears in
+// `byRef` (either original mode → all sections-with-figures, or
+// regenerated mode → only sections with ≥1 approved variant).
+
+type FiguresSchemaNodeLike = {
+  id: string;
+  title: string;
+  type?: string;
+  subsections?: FiguresSchemaNodeLike[];
+};
+type FiguresSchemaLike = { sections?: FiguresSchemaNodeLike[] };
+
+type FiguresTreeNodeShape = {
+  id: string;
+  title: string;
+  depth: number;
+  children: FiguresTreeNodeShape[];
+  group: FigureSectionGroup | null;
+};
+
+function buildFiguresSidebarTree(
+  schema: FiguresSchemaLike | undefined,
+  byRef: Map<string, FigureSectionGroup>,
+): FiguresTreeNodeShape[] {
+  if (!schema?.sections) {
+    // No schema available — just emit a flat list of the sections we have.
+    return [...byRef.entries()].map(([ref, g]) => ({
+      id: ref,
+      title: ref,
+      depth: 0,
+      children: [],
+      group: g,
+    }));
+  }
+  function walk(node: FiguresSchemaNodeLike, depth: number): FiguresTreeNodeShape | null {
+    const kids = (node.subsections ?? [])
+      .map((c) => walk(c, depth + 1))
+      .filter((c): c is FiguresTreeNodeShape => c !== null);
+    const group = byRef.get(node.id) ?? null;
+    if (!group && kids.length === 0) return null;
+    return {
+      id: node.id,
+      title: node.title ?? node.id,
+      depth,
+      children: kids,
+      group,
+    };
+  }
+  const out: FiguresTreeNodeShape[] = [];
+  for (const s of schema.sections ?? []) {
+    const built = walk(s, 0);
+    if (built) out.push(built);
+  }
+  // Append orphans not in schema
+  const inTree = new Set<string>();
+  function collect(n: FiguresTreeNodeShape) {
+    inTree.add(n.id);
+    n.children.forEach(collect);
+  }
+  out.forEach(collect);
+  for (const [ref, g] of byRef) {
+    if (!inTree.has(ref)) {
+      out.push({ id: ref, title: ref, depth: 0, children: [], group: g });
+    }
+  }
+  return out;
+}
+
+function FiguresTreeSidebar({
+  bookId,
+  schema,
+  sections,
+  mode,
+}: {
+  bookId: string;
+  schema: FiguresSchemaLike | undefined;
+  sections: FigureSectionGroup[];
+  mode: "original" | "regenerated";
+}) {
+  const byRef = useMemo(() => {
+    const m = new Map<string, FigureSectionGroup>();
+    for (const s of sections) m.set(s.section_ref, s);
+    return m;
+  }, [sections]);
+  const tree = useMemo(
+    () => buildFiguresSidebarTree(schema, byRef),
+    [schema, byRef],
+  );
+  return (
+    <>
+      {tree.map((n) => (
+        <FiguresTreeRow
+          key={`${mode}-${n.id}`}
+          node={n}
+          mode={mode}
+          bookId={bookId}
+        />
+      ))}
+    </>
+  );
+}
+
+function FiguresTreeRow({
+  node,
+  mode,
+  bookId,
+}: {
+  node: FiguresTreeNodeShape;
+  mode: "original" | "regenerated";
+  bookId: string;
+}) {
+  const hasChildren = node.children.length > 0;
+  const [open, setOpen] = useState(node.depth < 2);
+  const {
+    view,
+    selectedFigureSectionRef,
+    selectFigureSection,
+    setView,
+    setBookLens,
+  } = useUI();
+  const isLeafWithGroup = !!node.group;
+  const isActive =
+    view === "images"
+    && selectedFigureSectionRef === node.id
+    && isLeafWithGroup;
+
+  // Subtree figure count for badge
+  const subtreeCount = useMemo(() => {
+    let n = node.group?.figures.length ?? 0;
+    function add(c: FiguresTreeNodeShape) {
+      n += c.group?.figures.length ?? 0;
+      c.children.forEach(add);
+    }
+    node.children.forEach(add);
+    return n;
+  }, [node]);
+
+  const navigate = () => {
+    if (!isLeafWithGroup) return;
+    selectFigureSection(node.id);
+    setBookLens("images");
+    setView("images");
+  };
+
+  // Suppress unused-var warning for bookId (kept in signature for parity
+  // with other lens components + future per-book filtering hooks)
+  void bookId;
+
+  return (
+    <div>
+      <div
+        className={`tn ${isActive ? "active" : ""}`}
+        style={{
+          paddingLeft: 10 + Math.min(node.depth, 4) * 10,
+          display: "flex",
+          alignItems: "center",
+          cursor: "pointer",
+        }}
+        onClick={isLeafWithGroup ? navigate : undefined}
+        title={node.title}
+      >
+        <span
+          className={`tarr ${open ? "o" : ""}`}
+          onClick={(e) => {
+            e.stopPropagation();
+            if (hasChildren) setOpen((o) => !o);
+          }}
+          style={{ cursor: hasChildren ? "pointer" : "default" }}
+        >
+          {hasChildren ? "▸" : " "}
+        </span>
+        <span className="tico">
+          {isLeafWithGroup ? "🖼" : hasChildren ? "📂" : "📄"}
+        </span>
+        <span
+          className="tlbl"
+          style={{ fontSize: node.depth === 0 ? "0.78rem" : "0.72rem" }}
+        >
+          {node.title}
+        </span>
+        {node.group && (
+          <span style={{ display: "flex", gap: 2 }}>
+            {mode === "regenerated" ? (
+              <FigChip kind="approved" count={node.group.n_approved} />
+            ) : (
+              <>
+                {node.group.n_theory > 0 && (
+                  <FigChip kind="theory" count={node.group.n_theory} />
+                )}
+                {node.group.n_question > 0 && (
+                  <FigChip kind="question" count={node.group.n_question} />
+                )}
+              </>
+            )}
+          </span>
+        )}
+        <span className="tcnt">{subtreeCount}</span>
+      </div>
+      {open && hasChildren && (
+        <>
+          {node.children.map((c) => (
+            <FiguresTreeRow
+              key={`${mode}-${c.id}`}
+              node={c}
+              mode={mode}
+              bookId={bookId}
+            />
+          ))}
+        </>
+      )}
+    </div>
+  );
+}
+
+function FigChip({
+  kind,
+  count,
+}: {
+  kind: "theory" | "question" | "approved";
+  count: number;
+}) {
+  const palette = {
+    theory: { bg: "rgba(26,54,110,0.12)", color: "var(--accent)", label: "T" },
+    question: { bg: "rgba(155,89,182,0.12)", color: "#9b59b6", label: "Q" },
+    approved: { bg: "rgba(46,204,113,0.14)", color: "#16a085", label: "✓" },
+  } as const;
+  const s = palette[kind];
+  return (
+    <span
+      style={{
+        display: "inline-flex",
+        alignItems: "center",
+        padding: "0 4px",
+        borderRadius: 3,
+        fontSize: "0.55rem",
+        fontWeight: 600,
+        background: s.bg,
+        color: s.color,
+        textTransform: "uppercase",
+        letterSpacing: 0.3,
+      }}
+    >
+      {s.label}
+      {count > 1 && <span style={{ opacity: 0.7, marginLeft: 2 }}>×{count}</span>}
+    </span>
   );
 }

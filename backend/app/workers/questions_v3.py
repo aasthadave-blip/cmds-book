@@ -825,17 +825,47 @@ _CHUNK_THRESHOLD = 30
 _CHUNK_PAGE_SPAN = 4  # pages per chunk when splitting a large unit
 
 
-def _dedupe_extracted(items: list[dict[str, Any]]) -> list[dict[str, Any]]:
-    """DISABLED — pass-through.
+def _normalize_for_strict_match(s: str) -> str:
+    """Aggressive whitespace + punctuation collapse for 100% dedup match.
 
-    Previously dropped duplicates inside a chunk-merged result (when one
-    section is split into multiple page-range Gemini calls and the same
-    question shows up in two chunks). Per user directive ("pure OCR — keep
-    even if same"), we now keep everything Gemini returned. If duplicate
-    rows appear at chunk boundaries, that's information about the page
-    slice — the user wants to see it.
+    Treats `"What is x?"` and `" what  is  x ? "` as equal, but keeps
+    different LaTeX expressions and different numbers distinct. We only
+    drop *cosmetic* differences (whitespace, case, trailing punctuation),
+    not content.
     """
-    return list(items)
+    import re as _re
+    s = (s or "").lower()
+    s = _re.sub(r"\s+", " ", s).strip()
+    # Drop trailing/leading punctuation noise only (preserve internal)
+    s = s.strip(" .,:;!?“”‘’\"'")
+    return s
+
+
+def _dedupe_extracted(items: list[dict[str, Any]]) -> list[dict[str, Any]]:
+    """Per-section 100% dedup — keep only the first occurrence when two
+    extracted items have IDENTICAL normalized raw_text.
+
+    Used after chunk-merge so the same question on a page-range boundary
+    that Gemini returned twice doesn't produce two DB rows. Strict
+    equality only — even a one-character difference is treated as a
+    distinct item (handles legitimate variants like "x² + 5x = 0" vs
+    "x² + 6x = 0").
+
+    Replaces the looser fingerprint-based dedup we used to have (which
+    collapsed structurally-similar items and ate legitimate variants).
+    """
+    seen: set[str] = set()
+    out: list[dict[str, Any]] = []
+    for it in items:
+        key = _normalize_for_strict_match(it.get("raw_text") or "")
+        if not key:
+            out.append(it)  # empty raw_text — keep it, let QC catch later
+            continue
+        if key in seen:
+            continue  # exact duplicate, drop silently
+        seen.add(key)
+        out.append(it)
+    return out
 
 
 async def _extract_unit_maybe_chunked(

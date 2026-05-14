@@ -11,6 +11,7 @@ from fastapi.responses import FileResponse
 
 from app.api import (
     books,
+    figures as figures_v2,
     jobs,
     providers,
     qa,
@@ -74,6 +75,9 @@ app.include_router(question_regenerations.books_router)
 app.include_router(question_regenerations.banks_router)
 app.include_router(question_regenerations.regens_router)
 app.include_router(qa.router)
+# Figures pipeline v2
+app.include_router(figures_v2.books_router)
+app.include_router(figures_v2.figures_router)
 
 
 if settings.STORAGE_BACKEND == "local":
@@ -96,6 +100,7 @@ from app.workers import questions as _question_tasks  # noqa: E402, F401
 from app.workers import questions_v2 as _question_v2_tasks  # noqa: E402, F401
 from app.workers import questions_v3 as _question_v3_tasks  # noqa: E402, F401
 from app.workers import qa as _qa_tasks  # noqa: E402, F401
+from app.workers import figures_tasks as _figures_v2_tasks  # noqa: E402, F401
 
 
 _watchdog_task: "asyncio.Task[None] | None" = None
@@ -260,6 +265,22 @@ async def recover_orphaned_jobs() -> None:
 
                 elif job.type == "extract_figures":
                     dispatch("extract_figures", str(book.id), str(job.id))
+
+                elif job.type == "extract_figures_v2":
+                    # Figures pipeline v2 — new package at app/services/figures
+                    dispatch("extract_figures_v2", str(book.id), str(job.id))
+
+                elif job.type == "regenerate_figures_v2_section":
+                    # Section-scoped figure regen — we don't have the
+                    # original section_ref / params in the Job row alone,
+                    # so we skip silent recovery and let the user re-trigger
+                    # from the UI (same pattern as extract_questions_v3
+                    # retry — the user owns the params).
+                    logger.warning(
+                        "Skipping recovery of regenerate_figures_v2_section "
+                        "job %s — user must re-trigger from UI",
+                        job.id,
+                    )
 
                 elif job.type == "regen_figures":
                     dispatch("regenerate_figures", str(book.id), str(job.id))

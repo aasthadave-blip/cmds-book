@@ -6,7 +6,10 @@ import {
   useJob,
   usePatchSchema,
   useQuestionBanks,
+  useQuestions,
   useQuestionStructure,
+  useBookFigures,
+  useExtractFiguresV2,
   useReExtractSection,
   useSections,
 } from "../api/hooks";
@@ -36,6 +39,13 @@ export function SchemaPage() {
   const [lens, setLens] = useState<"theory" | "questions">("theory");
   const { data: job } = useJob(jobId);
   const latestBank = banks?.[0] ?? null;
+  // Figures pipeline trigger from the Schema page button.
+  const { data: figData } = useBookFigures(selectedBookId);
+  const extractFiguresMutation = useExtractFiguresV2();
+  const { data: latestBankDetail } = useQuestions(
+    latestBank?.status === "ready" ? latestBank.id : null,
+    { bankStatus: latestBank?.status },
+  );
 
   const rail: RailStep = jobId
     ? job?.status === "succeeded"
@@ -293,6 +303,12 @@ export function SchemaPage() {
                     onChangeType={(id, type) =>
                       updateSection(id, (s) => ({ ...s, type }))
                     }
+                    onChangeContentTypes={(id, content_types) =>
+                      updateSection(id, (s) => ({ ...s, content_types }))
+                    }
+                    onChangeEqc={(id, expected_question_count) =>
+                      updateSection(id, (s) => ({ ...s, expected_question_count }))
+                    }
                     onDelete={deleteSection}
                   />
                 </div>
@@ -370,6 +386,43 @@ export function SchemaPage() {
                     ? "❓ Re-run Question Extraction"
                     : "❓ Extract Questions"}
               </button>
+              {/* Figures pipeline v2 — independent of theory/questions.
+                  Click triggers per-section figure extraction (if none yet)
+                  and lands the user on the /images view to watch progress.
+                  Re-extraction must be done explicitly from the FiguresPage
+                  ("↻ Re-extract figures") to avoid accidental wipes. */}
+              <button
+                className="btn bg"
+                disabled={!selectedBookId || extractFiguresMutation.isPending}
+                title={
+                  (figData?.total_figures ?? 0) > 0
+                    ? "Open the Images view — figures already extracted; use Re-extract there to wipe + redo"
+                    : "Trigger figure extraction and open the Images view"
+                }
+                onClick={() => {
+                  if (!selectedBookId) return;
+                  const total = figData?.total_figures ?? 0;
+                  if (total === 0) {
+                    // First-time extract — fire the job, then navigate.
+                    extractFiguresMutation.mutate(
+                      { bookId: selectedBookId },
+                      {
+                        onSettled: () => setView("images"),
+                      },
+                    );
+                  } else {
+                    // Already has figures — just navigate; user can
+                    // explicitly re-extract from FiguresPage.
+                    setView("images");
+                  }
+                }}
+              >
+                {extractFiguresMutation.isPending
+                  ? "Starting extraction…"
+                  : (figData?.total_figures ?? 0) > 0
+                    ? "🖼 Figures & Images"
+                    : "🖼 Extract Figures & Images"}
+              </button>
               <button className="btn bg" onClick={() => setView("upload")}>
                 Back
               </button>
@@ -406,7 +459,7 @@ export function SchemaPage() {
               >
                 Extraction Summary
               </div>
-              <V3SummaryTable stats={latestBank.stats} />
+              <V3SummaryTable stats={latestBank.stats} sections={latestBankDetail?.sections} />
             </div>
           )}
         </div>
@@ -453,12 +506,16 @@ function SchemaTreeView({
   sections,
   onRename,
   onChangeType,
+  onChangeContentTypes,
+  onChangeEqc,
   onDelete,
   depth = 0,
 }: {
   sections: SchemaSection[];
   onRename: (id: string, title: string) => void;
   onChangeType: (id: string, type: SchemaSection["type"]) => void;
+  onChangeContentTypes: (id: string, content_types: string[]) => void;
+  onChangeEqc: (id: string, expected_question_count: number) => void;
   onDelete: (id: string) => void;
   depth?: number;
 }) {
@@ -521,6 +578,60 @@ function SchemaTreeView({
               <option value="subsection">subsection</option>
               <option value="excluded">excluded</option>
             </select>
+            {(() => {
+              const isCatA = (s.content_types ?? []).includes("questions");
+              return (
+                <>
+                  <button
+                    type="button"
+                    onClick={() =>
+                      onChangeContentTypes(s.id, isCatA ? ["theory"] : ["questions"])
+                    }
+                    title={
+                      isCatA
+                        ? "Category A — assessment item (extractor will OCR questions). Click to switch to Cat B (theory aid)."
+                        : "Category B — theory aid (extractor skips). Click to switch to Cat A (questions)."
+                    }
+                    style={{
+                      fontSize: "0.6rem",
+                      fontWeight: 600,
+                      padding: "1px 6px",
+                      border: "1px solid var(--border)",
+                      borderRadius: 8,
+                      background: isCatA ? "var(--accent, #5b5bd6)" : "var(--surface)",
+                      color: isCatA ? "#fff" : "var(--text3)",
+                      cursor: "pointer",
+                      letterSpacing: 0.4,
+                    }}
+                  >
+                    {isCatA ? "Cat A" : "Cat B"}
+                  </button>
+                  {isCatA && (
+                    <input
+                      type="number"
+                      min={0}
+                      value={s.expected_question_count ?? 0}
+                      onChange={(e) => {
+                        const n = Math.max(0, parseInt(e.target.value || "0", 10) || 0);
+                        onChangeEqc(s.id, n);
+                      }}
+                      title="Expected question count for this section"
+                      style={{
+                        width: 44,
+                        fontSize: "0.62rem",
+                        padding: "1px 4px",
+                        border: "1px solid var(--border)",
+                        borderRadius: 4,
+                        background: "var(--surface)",
+                        color: "var(--text2)",
+                        textAlign: "right",
+                        fontFamily: "var(--sans)",
+                      }}
+                    />
+                  )}
+                </>
+              );
+            })()}
             <button
               type="button"
               onClick={() => onDelete(s.id)}
@@ -542,6 +653,8 @@ function SchemaTreeView({
               sections={s.subsections}
               onRename={onRename}
               onChangeType={onChangeType}
+              onChangeContentTypes={onChangeContentTypes}
+              onChangeEqc={onChangeEqc}
               onDelete={onDelete}
               depth={depth + 1}
             />

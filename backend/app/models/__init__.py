@@ -1,5 +1,6 @@
 from app.models.book import Book
 from app.models.figure import Figure
+from app.models.figure_reference import FigureReference
 from app.models.figure_regeneration import FigureRegeneration
 from app.models.job import Job
 from app.models.qa_run import QARun
@@ -18,6 +19,7 @@ __all__ = [
     "Job",
     "UserProviderKey",
     "Figure",
+    "FigureReference",
     "FigureRegeneration",
     "QuestionBank",
     "QuestionRegeneration",

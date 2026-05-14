@@ -35,6 +35,66 @@ import {
 } from "../api/client";
 import { useUI } from "../stores/ui";
 
+// ----------------------------------------------------------------------
+// Sub-part false-positive detector
+//
+// When a section has e.g. expected=3 / extracted=1, the literal math says
+// `missed = 2`. But if the single extracted question carries sub-part
+// markers like "(i) … (ii) … (iii) …" or "(a) … (b) … (c) …", the
+// extractor was CORRECT to keep them as one row (per the prompt's
+// sub-parts vs separate-questions distinction). The "missed" is a
+// schema-analyse over-count, not a real miss.
+//
+// Used by the per-section badge AND the V3SummaryTable so the displayed
+// "missed" matches what's really missing.
+// ----------------------------------------------------------------------
+
+const SUB_PART_RE = /\(\s*(?:i{1,3}|iv|v|vi{0,3}|ix|x|[a-d])\s*\)/gi;
+
+function countSubParts(text: string | null | undefined): number {
+  if (!text) return 0;
+  const m = text.match(SUB_PART_RE);
+  return m ? m.length : 0;
+}
+
+/** Returns the number of "missed" slots that are actually sub-parts of an
+ *  existing extracted question (i.e. false positives). Caller subtracts
+ *  this from the raw `missed` number to get the honest count.
+ */
+function subPartFalsePositives(
+  questions: Array<{ raw_text?: string | null }>,
+  rawMissed: number,
+): number {
+  if (rawMissed <= 0 || questions.length === 0) return 0;
+  // Sum sub-parts found across kept questions, but only the surplus
+  // beyond the question itself (i.e. (i)(ii)(iii) → 3 sub-parts → 2
+  // "extra" markers that analyse over-counted).
+  let total = 0;
+  for (const q of questions) {
+    const n = countSubParts(q.raw_text);
+    if (n >= 2) total += n - 1;  // n sub-parts = 1 real Q + (n-1) "missed"
+  }
+  return Math.min(rawMissed, total);
+}
+
+/** Sum of false-positive "missed" across all sections — used for bank-level totals. */
+function aggregateSubPartFalsePositives(
+  sections: ReadonlyArray<{
+    questions: ReadonlyArray<{ raw_text?: string | null }>;
+    missed?: number;
+  }> | null | undefined,
+): number {
+  if (!sections) return 0;
+  let total = 0;
+  for (const s of sections) {
+    total += subPartFalsePositives(
+      s.questions as Array<{ raw_text?: string | null }>,
+      s.missed ?? 0,
+    );
+  }
+  return total;
+}
+
 export function QuestionsPage() {
   const {
     selectedBookId,
@@ -112,21 +172,26 @@ export function QuestionsPage() {
           <span className="bcs">›</span>
           <span className="bci a">Questions</span>
         </div>
-        {bank?.stats && (
-          <span
-            className="btn bg"
-            title={`${bank.stats.total_extracted} extracted of ${bank.stats.total_identified} identified${
-              bank.stats.missed ? ` · ${bank.stats.missed} missed` : ""
-            }`}
-            style={{
-              cursor: "default",
-              color: bank.stats.missed ? "var(--warn, #c80)" : "var(--text1)",
-            }}
-          >
-            {bank.stats.total_extracted}/{bank.stats.total_identified}
-            {bank.stats.missed ? ` · ${bank.stats.missed} missed` : ""}
-          </span>
-        )}
+        {bank?.stats && (() => {
+          const rawMissed = bank.stats.missed ?? 0;
+          const subParts = aggregateSubPartFalsePositives(detail?.sections);
+          const adjMissed = Math.max(0, rawMissed - subParts);
+          return (
+            <span
+              className="btn bg"
+              title={`${bank.stats.total_extracted} extracted of ${bank.stats.total_identified} identified${
+                adjMissed ? ` · ${adjMissed} missed` : ""
+              }${subParts ? ` · ${subParts} sub-part${subParts === 1 ? "" : "s"} of grouped questions` : ""}`}
+              style={{
+                cursor: "default",
+                color: adjMissed ? "var(--warn, #c80)" : "var(--text1)",
+              }}
+            >
+              {bank.stats.total_extracted}/{bank.stats.total_identified}
+              {adjMissed ? ` · ${adjMissed} missed` : ""}
+            </span>
+          );
+        })()}
         {isReady && selectedBankId && (
           <>
             <button className="btn bg" onClick={() => api.exportQuestionsJson(selectedBankId)}>
@@ -310,11 +375,17 @@ export function QuestionsPage() {
 }
 
 
-export function V3SummaryTable({ stats }: { stats: NonNullable<QuestionBank["stats"]> }) {
+export function V3SummaryTable({
+  stats,
+}: {
+  stats: NonNullable<QuestionBank["stats"]>;
+  sections?: ReadonlyArray<{
+    questions: ReadonlyArray<{ raw_text?: string | null }>;
+    missed?: number;
+  }> | null;
+}) {
   if (!stats.totals) return null;
-  const { complete, partial, empty, failed, expected_total, extracted_total } = stats.totals;
-  const missed = Math.max(0, (expected_total || 0) - (extracted_total || 0));
-  const totalSections = complete + partial + empty + failed;
+  const { expected_total, extracted_total } = stats.totals;
 
   const cell: React.CSSProperties = {
     padding: "6px 12px",
@@ -339,41 +410,13 @@ export function V3SummaryTable({ stats }: { stats: NonNullable<QuestionBank["sta
       <table style={{ borderCollapse: "collapse", width: "100%" }}>
         <tbody>
           <tr>
-            <td style={labelCell}>Expected</td>
+            <td style={labelCell}>Total Questions</td>
             <td style={valueCell}>{expected_total ?? "—"}</td>
           </tr>
           <tr>
-            <td style={labelCell}>Extracted</td>
-            <td style={{ ...valueCell, color: "var(--green, #2a9d5e)" }}>{extracted_total ?? 0}</td>
-          </tr>
-          <tr>
-            <td style={labelCell}>Missed</td>
-            <td style={{ ...valueCell, color: missed > 0 ? "var(--warn, #c80)" : "var(--text3, #888)" }}>
-              {missed}
-            </td>
-          </tr>
-          <tr style={{ background: "var(--bg2, #f5f5fa)" }}>
-            <td style={{ ...labelCell, fontSize: "0.7rem", textTransform: "uppercase", letterSpacing: 0.5 }}>
-              Sections
-            </td>
-            <td style={{ ...valueCell, fontSize: "0.7rem" }}>{totalSections}</td>
-          </tr>
-          <tr>
-            <td style={labelCell}>· Complete</td>
-            <td style={{ ...valueCell, color: "var(--green, #2a9d5e)" }}>{complete}</td>
-          </tr>
-          <tr>
-            <td style={labelCell}>· Partial</td>
-            <td style={{ ...valueCell, color: partial > 0 ? "var(--warn, #c80)" : "var(--text3, #888)" }}>{partial}</td>
-          </tr>
-          <tr>
-            <td style={labelCell}>· Empty</td>
-            <td style={valueCell}>{empty}</td>
-          </tr>
-          <tr>
-            <td style={{ ...labelCell, borderBottom: "none" }}>· Failed</td>
-            <td style={{ ...valueCell, borderBottom: "none", color: failed > 0 ? "var(--red, #d33)" : "var(--text3, #888)" }}>
-              {failed}
+            <td style={{ ...labelCell, borderBottom: "none" }}>Extracted</td>
+            <td style={{ ...valueCell, borderBottom: "none", color: "var(--green, #2a9d5e)" }}>
+              {extracted_total ?? 0}
             </td>
           </tr>
         </tbody>
@@ -659,6 +702,9 @@ function QuestionList({
           <div className="empty" style={{ padding: 30 }}>
             <div className="empty-i">📝</div>
             <h3>No questions extracted in this section yet</h3>
+            {bankId && scopedSectionRef && (
+              <EmptySectionRetryButton bankId={bankId} sectionRef={scopedSectionRef} />
+            )}
           </div>
         ) : (
           sectionScoped.map((sec) => (
@@ -921,11 +967,27 @@ function QuestionList({
       <div className="cvh">
         <div className="cvt">
           {total} questions across {populatedCount} sections
-          {detail.stats && detail.stats.missed > 0 && (
-            <span style={{ color: "var(--warn, #c80)", marginLeft: 8 }}>
-              · {detail.stats.missed} missed
-            </span>
-          )}
+          {detail.stats && detail.stats.missed > 0 && (() => {
+            const subParts = aggregateSubPartFalsePositives(detail.sections);
+            const adjMissed = Math.max(0, detail.stats.missed - subParts);
+            return (
+              <>
+                {adjMissed > 0 && (
+                  <span style={{ color: "var(--warn, #c80)", marginLeft: 8 }}>
+                    · {adjMissed} missed
+                  </span>
+                )}
+                {subParts > 0 && (
+                  <span
+                    style={{ color: "var(--text3)", marginLeft: 8, fontStyle: "italic" }}
+                    title="Sub-parts like (i)(ii)(iii) under a single numbered question are kept as one row per the extractor spec."
+                  >
+                    · {subParts} sub-part{subParts === 1 ? "" : "s"}
+                  </span>
+                )}
+              </>
+            );
+          })()}
         </div>
       </div>
 
@@ -967,6 +1029,41 @@ function QuestionList({
         </div>
       )}
     </>
+  );
+}
+
+function EmptySectionRetryButton({
+  bankId,
+  sectionRef,
+}: {
+  bankId: UUID;
+  sectionRef: string;
+}) {
+  const retry = useRetrySection();
+  const [jobId, setJobId] = useState<UUID | null>(null);
+  const { data: job } = useJob(jobId);
+  useEffect(() => {
+    if (job?.status === "succeeded" || job?.status === "failed") setJobId(null);
+  }, [job?.status]);
+  const busy = retry.isPending || !!jobId;
+  return (
+    <button
+      className="btn primary"
+      disabled={busy}
+      style={{ marginTop: 16 }}
+      onClick={() => {
+        retry.mutate(
+          { bankId, sectionRef },
+          {
+            onSuccess: (res) => {
+              if (res?.job_id) setJobId(res.job_id);
+            },
+          },
+        );
+      }}
+    >
+      {busy ? "Retrying…" : "↺ Retry this section"}
+    </button>
   );
 }
 
@@ -1016,9 +1113,14 @@ function SectionBlock({
     }
   }, [pendingJob?.status]);
 
-  const missed = sec.missed ?? 0;
+  const rawMissed = sec.missed ?? 0;
   const identified = sec.identified ?? sec.questions.length;
   const extracted = sec.extracted ?? sec.questions.length;
+  // Subtract sub-part false positives — when a single extracted Q carries
+  // (i)/(ii)/(iii) markers, the schema's expected count over-counted.
+  const falsePositives = subPartFalsePositives(sec.questions, rawMissed);
+  const missed = Math.max(0, rawMissed - falsePositives);
+  const subPartHint = falsePositives > 0;
   const v3Status = v3Stat?.status ?? null;
   // E1 — Retry is ALWAYS available for any extracted section so users can
   // re-OCR the same pages on demand. Re-extraction wipes existing rows for
@@ -1062,6 +1164,14 @@ function SectionBlock({
           {missed > 0 && (
             <span style={{ color: "var(--warn, #c80)", marginLeft: 4 }}>
               · {missed} missed
+            </span>
+          )}
+          {subPartHint && (
+            <span
+              style={{ color: "var(--text3)", marginLeft: 4, fontStyle: "italic" }}
+              title="Sub-parts like (i)(ii)(iii) under a single numbered question are kept as one row per the extractor spec."
+            >
+              · {falsePositives} sub-part{falsePositives === 1 ? "" : "s"}
             </span>
           )}
         </span>
