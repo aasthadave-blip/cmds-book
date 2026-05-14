@@ -173,7 +173,14 @@ function BookFolders({ bookId }: { bookId: string }) {
       >
         <button
           className={`sb-lens ${bookLens === "theory" ? "active" : ""}`}
-          onClick={() => setBookLens("theory")}
+          onClick={() => {
+            // Sync the page view with the sidebar lens — otherwise the
+            // currently-mounted page (e.g. QuestionsPage) stays rendered
+            // while the sidebar shows theory sections, causing a blank
+            // state until the user refreshes. Mirrors Images button.
+            setBookLens("theory");
+            setView("reader");
+          }}
           style={lensBtnStyle(bookLens === "theory")}
           title="Theory — extracted section content"
         >
@@ -181,7 +188,10 @@ function BookFolders({ bookId }: { bookId: string }) {
         </button>
         <button
           className={`sb-lens ${bookLens === "questions" ? "active" : ""}`}
-          onClick={() => setBookLens("questions")}
+          onClick={() => {
+            setBookLens("questions");
+            setView("questions");
+          }}
           disabled={!latestBank}
           style={lensBtnStyle(bookLens === "questions", !latestBank)}
           title={
