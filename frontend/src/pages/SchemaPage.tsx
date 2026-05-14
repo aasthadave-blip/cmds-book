@@ -47,6 +47,50 @@ export function SchemaPage() {
     { bankStatus: latestBank?.status },
   );
 
+  // Per-book "schema frozen" gate — persisted in localStorage so it
+  // survives reload. When frozen, the schema editor is read-only and
+  // all 3 extraction CTAs (Theory / Questions / Figures) are disabled
+  // until the user explicitly unfreezes. Pure frontend gate — pipelines
+  // already read the saved schema from the DB; the freeze just prevents
+  // accidental edits + accidental triggers on an unfinalized hierarchy.
+  const freezeKey = selectedBookId ? `schema_frozen_${selectedBookId}` : "";
+  const [schemaFrozen, setSchemaFrozenState] = useState<boolean>(() => {
+    if (!freezeKey) return false;
+    try {
+      return localStorage.getItem(freezeKey) === "1";
+    } catch {
+      return false;
+    }
+  });
+  // Re-sync when the user switches books
+  useMemo(() => {
+    if (!freezeKey) return;
+    try {
+      setSchemaFrozenState(localStorage.getItem(freezeKey) === "1");
+    } catch {
+      setSchemaFrozenState(false);
+    }
+  }, [freezeKey]);
+  function setSchemaFrozen(v: boolean) {
+    if (!freezeKey) return;
+    setSchemaFrozenState(v);
+    try {
+      if (v) localStorage.setItem(freezeKey, "1");
+      else localStorage.removeItem(freezeKey);
+    } catch {
+      /* ignore */
+    }
+  }
+  // Local in-flight flag for the Freeze button — keeps the CTA in a
+  // committed visual state during the PATCH so the label doesn't
+  // flicker back to "Freeze schema" briefly between the mutation
+  // settling and our schemaFrozen state update.
+  const [freezeInFlight, setFreezeInFlight] = useState(false);
+  // Brief "✓ Frozen!" flash after a successful freeze, so the user
+  // sees a clear confirmation even though the steady-state label is
+  // "🔒 Frozen · click to unfreeze".
+  const [justFroze, setJustFroze] = useState(false);
+
   const rail: RailStep = jobId
     ? job?.status === "succeeded"
       ? "done"
@@ -163,6 +207,15 @@ export function SchemaPage() {
 
   function deleteSection(id: string) {
     mutateSchema((arr) => walkDelete(arr, id));
+  }
+
+  // Manual rearrange via drag-and-drop. The user grabs a row's drag
+  // handle and drops it onto another row → the dragged row becomes a
+  // child of the drop target. No-op if user drops onto self or onto
+  // own descendant (would create a cycle).
+  function moveSectionUnder(dragId: string, dropTargetId: string) {
+    if (dragId === dropTargetId) return;
+    mutateSchema((arr) => moveUnderAt(arr, dragId, dropTargetId));
   }
 
   function addRootSection() {
@@ -293,10 +346,114 @@ export function SchemaPage() {
               >
                 ⬇ Download
               </button>
+              {/* Freeze CTA — gates all 3 extraction triggers below. */}
+              <button
+                type="button"
+                onClick={() => {
+                  if (freezeInFlight) return;
+                  if (schemaFrozen) {
+                    if (window.confirm("Unfreeze schema? You'll be able to edit again — but extraction triggers will be disabled until you re-freeze.")) {
+                      setSchemaFrozen(false);
+                    }
+                    return;
+                  }
+                  // Freezing: persist the current schema first so downstream
+                  // pipelines use the exact version the user is freezing.
+                  setFreezeInFlight(true);
+                  if (current && selectedBookId) {
+                    patch.mutate(
+                      { bookId: selectedBookId, schema: current },
+                      {
+                        onSuccess: () => {
+                          setSchemaFrozen(true);
+                          setFreezeInFlight(false);
+                          setJustFroze(true);
+                          setTimeout(() => setJustFroze(false), 2000);
+                        },
+                        onError: () => setFreezeInFlight(false),
+                      },
+                    );
+                  } else {
+                    setSchemaFrozen(true);
+                    setFreezeInFlight(false);
+                    setJustFroze(true);
+                    setTimeout(() => setJustFroze(false), 2000);
+                  }
+                }}
+                className="btn"
+                style={{
+                  fontSize: "0.7rem",
+                  padding: "3px 10px",
+                  background: justFroze
+                    ? "var(--green, #2a9d5e)"
+                    : schemaFrozen
+                      ? "var(--green, #2a9d5e)"
+                      : freezeInFlight
+                        ? "var(--text3, #888)"
+                        : "var(--accent, #5b6cff)",
+                  color: "#fff",
+                  marginLeft: "auto",
+                  cursor: freezeInFlight ? "wait" : "pointer",
+                  transition: "background 0.18s ease",
+                }}
+                disabled={freezeInFlight}
+                title={
+                  schemaFrozen
+                    ? "Schema is frozen — extraction will use this exact hierarchy. Click to unfreeze and edit again."
+                    : "Save current edits and freeze the schema. Required before triggering extraction."
+                }
+              >
+                {freezeInFlight
+                  ? "Freezing… please wait"
+                  : justFroze
+                    ? "✓ Schema frozen!"
+                    : schemaFrozen
+                      ? "🔒 Frozen · click to unfreeze"
+                      : "🔒 Freeze schema"}
+              </button>
             </div>
+
+            {schemaFrozen && (
+              <div
+                style={{
+                  margin: "8px 0",
+                  padding: "8px 12px",
+                  borderRadius: 6,
+                  background: "rgba(42,157,94,0.10)",
+                  border: "1px solid rgba(42,157,94,0.35)",
+                  color: "var(--green, #2a9d5e)",
+                  fontSize: "0.74rem",
+                }}
+              >
+                🔒 Schema frozen — extraction will use this exact hierarchy. Unfreeze if you need to edit.
+              </div>
+            )}
+            {!schemaFrozen && (
+              <div
+                style={{
+                  margin: "8px 0",
+                  padding: "8px 12px",
+                  borderRadius: 6,
+                  background: "rgba(91,108,255,0.08)",
+                  border: "1px solid rgba(91,108,255,0.25)",
+                  color: "var(--text2)",
+                  fontSize: "0.74rem",
+                }}
+              >
+                ⚠️ Edit the hierarchy as needed (drag rows to nest under, toggle Cat A/B, etc.), then click <b>🔒 Freeze schema</b> to enable extraction.
+              </div>
+            )}
+
             {lens === "theory" ? (
               <>
-                <div className="sbox">
+                <div
+                  className="sbox"
+                  style={{
+                    pointerEvents: schemaFrozen ? "none" : undefined,
+                    opacity: schemaFrozen ? 0.7 : 1,
+                  }}
+                  title={schemaFrozen ? "Schema is frozen — unfreeze to edit" : undefined}
+                >
                   <SchemaTreeView
                     sections={current.sections}
                     onRename={(id, title) => updateSection(id, (s) => ({ ...s, title }))}
@@ -310,13 +467,19 @@ export function SchemaPage() {
                       updateSection(id, (s) => ({ ...s, expected_question_count }))
                     }
                     onDelete={deleteSection}
+                    onDropUnder={moveSectionUnder}
                   />
                 </div>
                 <button
                   type="button"
                   className="btn bg"
                   onClick={addRootSection}
-                  style={{ fontSize: "0.7rem", padding: "4px 10px" }}
+                  disabled={schemaFrozen}
+                  style={{
+                    fontSize: "0.7rem",
+                    padding: "4px 10px",
+                    opacity: schemaFrozen ? 0.4 : 1,
+                  }}
                 >
                   + Add section
                 </button>
@@ -361,15 +524,23 @@ export function SchemaPage() {
               <button
                 className="btn bp"
                 onClick={onApprove}
-                disabled={approve.isPending || patch.isPending}
-                title="Run theory extraction on all non-excluded sections"
+                disabled={approve.isPending || patch.isPending || !schemaFrozen}
+                title={
+                  !schemaFrozen
+                    ? "Freeze the schema first — extraction must run against a finalized hierarchy"
+                    : "Run theory extraction on all non-excluded sections"
+                }
               >
                 ✓ Approve & Extract Theory
               </button>
               <button
                 className="btn bg"
-                disabled={createBank.isPending || !selectedBookId}
-                title="OCR all questions/exercises from excluded blocks (independent of theory)"
+                disabled={createBank.isPending || !selectedBookId || !schemaFrozen}
+                title={
+                  !schemaFrozen
+                    ? "Freeze the schema first"
+                    : "OCR all questions/exercises from excluded blocks (independent of theory)"
+                }
                 onClick={() => {
                   if (!selectedBookId) return;
                   createBank.mutate(selectedBookId, {
@@ -393,11 +564,13 @@ export function SchemaPage() {
                   ("↻ Re-extract figures") to avoid accidental wipes. */}
               <button
                 className="btn bg"
-                disabled={!selectedBookId || extractFiguresMutation.isPending}
+                disabled={!selectedBookId || extractFiguresMutation.isPending || !schemaFrozen}
                 title={
-                  (figData?.total_figures ?? 0) > 0
-                    ? "Open the Images view — figures already extracted; use Re-extract there to wipe + redo"
-                    : "Trigger figure extraction and open the Images view"
+                  !schemaFrozen
+                    ? "Freeze the schema first"
+                    : (figData?.total_figures ?? 0) > 0
+                      ? "Open the Images view — figures already extracted; use Re-extract there to wipe + redo"
+                      : "Trigger figure extraction and open the Images view"
                 }
                 onClick={() => {
                   if (!selectedBookId) return;
@@ -509,6 +682,7 @@ function SchemaTreeView({
   onChangeContentTypes,
   onChangeEqc,
   onDelete,
+  onDropUnder,
   depth = 0,
 }: {
   sections: SchemaSection[];
@@ -517,8 +691,11 @@ function SchemaTreeView({
   onChangeContentTypes: (id: string, content_types: string[]) => void;
   onChangeEqc: (id: string, expected_question_count: number) => void;
   onDelete: (id: string) => void;
+  /** Drag-and-drop: the user dropped `dragId` onto `dropTargetId`. */
+  onDropUnder: (dragId: string, dropTargetId: string) => void;
   depth?: number;
 }) {
+  const [dragOverId, setDragOverId] = useState<string | null>(null);
   return (
     <>
       {sections.map((s) => (
@@ -533,8 +710,56 @@ function SchemaTreeView({
                     ? "sse"
                     : "ssu"
             }
-            style={{ display: "flex", alignItems: "center", gap: 6 }}
+            style={{
+              display: "flex",
+              alignItems: "center",
+              gap: 6,
+              // Visual cue when something is being dragged over this row —
+              // means "drop here to nest dragged item under this section".
+              background: dragOverId === s.id ? "var(--accent-soft, rgba(91,108,255,0.12))" : undefined,
+              outline: dragOverId === s.id ? "1px dashed var(--accent, #5b6cff)" : undefined,
+              borderRadius: dragOverId === s.id ? 4 : undefined,
+            }}
+            onDragOver={(e) => {
+              if (e.dataTransfer.types.includes("text/x-section-id")) {
+                e.preventDefault();
+                e.dataTransfer.dropEffect = "move";
+                if (dragOverId !== s.id) setDragOverId(s.id);
+              }
+            }}
+            onDragLeave={(e) => {
+              // Only clear when actually leaving the row (not entering a child)
+              if (e.currentTarget === e.target) setDragOverId(null);
+            }}
+            onDrop={(e) => {
+              const dragId = e.dataTransfer.getData("text/x-section-id");
+              setDragOverId(null);
+              if (dragId && dragId !== s.id) {
+                e.preventDefault();
+                onDropUnder(dragId, s.id);
+              }
+            }}
           >
+            <span
+              draggable
+              onDragStart={(e) => {
+                e.dataTransfer.setData("text/x-section-id", s.id);
+                e.dataTransfer.effectAllowed = "move";
+              }}
+              title="Drag onto another section to nest under it"
+              style={{
+                cursor: "grab",
+                color: "var(--text3)",
+                fontSize: "0.85rem",
+                userSelect: "none",
+                padding: "0 4px 0 0",
+                opacity: 0.5,
+              }}
+              onMouseEnter={(e) => (e.currentTarget.style.opacity = "1")}
+              onMouseLeave={(e) => (e.currentTarget.style.opacity = "0.5")}
+            >
+              ⋮⋮
+            </span>
             <input
               value={s.title}
               onChange={(e) => onRename(s.id, e.target.value)}
@@ -656,6 +881,7 @@ function SchemaTreeView({
               onChangeContentTypes={onChangeContentTypes}
               onChangeEqc={onChangeEqc}
               onDelete={onDelete}
+              onDropUnder={onDropUnder}
               depth={depth + 1}
             />
           )}
@@ -807,6 +1033,85 @@ function walkDelete(sections: SchemaSection[], id: string): SchemaSection[] {
   return sections
     .filter((s) => s.id !== id)
     .map((s) => ({ ...s, subsections: walkDelete(s.subsections, id) }));
+}
+
+// ---------------------------------------------------------------------------
+// Manual rearrange — drag-and-drop helper.
+// User drags a row's handle and drops it onto another row → the dragged row
+// becomes a child of the drop target. Returns a NEW tree. The schema PATCH
+// endpoint accepts any valid tree and all 3 extractors (theory / questions /
+// figures) walk the saved schema in pre-order, so manual ordering is
+// canonical downstream.
+// ---------------------------------------------------------------------------
+
+/** True if `ancestorId` is the same as `nodeId` or any ancestor of `nodeId`. */
+function isDescendantOf(
+  sections: SchemaSection[],
+  nodeId: string,
+  ancestorId: string,
+): boolean {
+  for (const s of sections) {
+    if (s.id === ancestorId) {
+      // Walk this subtree — return true if nodeId is anywhere inside it
+      const stack: SchemaSection[] = [s];
+      while (stack.length) {
+        const cur = stack.pop()!;
+        if (cur.id === nodeId) return true;
+        for (const c of cur.subsections || []) stack.push(c);
+      }
+      return false;
+    }
+    if (isDescendantOf(s.subsections || [], nodeId, ancestorId)) return true;
+  }
+  return false;
+}
+
+/** Remove `id` from wherever it lives in the tree and return [extracted, tree]. */
+function extractNode(
+  sections: SchemaSection[],
+  id: string,
+): [SchemaSection | null, SchemaSection[]] {
+  let extracted: SchemaSection | null = null;
+  const out: SchemaSection[] = [];
+  for (const s of sections) {
+    if (s.id === id) {
+      extracted = s;
+      continue;
+    }
+    const [extInChild, newChildren] = extractNode(s.subsections || [], id);
+    if (extInChild) extracted = extInChild;
+    out.push({ ...s, subsections: newChildren });
+  }
+  return [extracted, out];
+}
+
+/** Append `node` as the last child of `parentId`. */
+function appendAsChild(
+  sections: SchemaSection[],
+  parentId: string,
+  node: SchemaSection,
+): SchemaSection[] {
+  return sections.map((s) => {
+    if (s.id === parentId) {
+      return { ...s, subsections: [...(s.subsections || []), node] };
+    }
+    return { ...s, subsections: appendAsChild(s.subsections || [], parentId, node) };
+  });
+}
+
+/** Drop `dragId` under `dropTargetId`. No-op if drop target is the dragged
+ *  node itself or any of its descendants (would create a cycle). */
+function moveUnderAt(
+  sections: SchemaSection[],
+  dragId: string,
+  dropTargetId: string,
+): SchemaSection[] {
+  if (dragId === dropTargetId) return sections;
+  // Reject cycles: dropTarget must not be a descendant of dragged node.
+  if (isDescendantOf(sections, dropTargetId, dragId)) return sections;
+  const [node, withoutNode] = extractNode(sections, dragId);
+  if (!node) return sections;
+  return appendAsChild(withoutNode, dropTargetId, node);
 }
 
 function countSections(sections: SchemaSection[]): number {
