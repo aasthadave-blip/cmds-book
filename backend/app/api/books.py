@@ -256,6 +256,18 @@ async def patch_schema(
     book.title = validated.document_title or book.title
     book.subject = validated.subject or book.subject
     await session.flush()
+    # Auto-relink theory chips so that manual schema edits (drag-drop in
+    # the editor that moves an Example/Exercise to a different parent)
+    # take effect on the theory page WITHOUT requiring a re-extract.
+    # Non-fatal: if linker fails, the schema PATCH still succeeds.
+    try:
+        from app.services.example_linker import link_examples_to_theory
+        await link_examples_to_theory(session, book.id)
+    except Exception as e:
+        import logging as _logging
+        _logging.getLogger(__name__).warning(
+            "post-patch chip relink failed (book=%s): %s", book.id, e,
+        )
     # Ensure all attributes are loaded inside the async context — otherwise
     # Pydantic's from_attributes=True serialization in `from_orm_book` /
     # response_model can trigger lazy IO during the response phase →

@@ -93,6 +93,37 @@ def _split_question_id(section_id: str) -> tuple[str, str, str] | None:
     return None
 
 
+def _build_parent_map_from_schema(schema: dict | None) -> dict[str, str]:
+    """Walk the live book.schema_ tree and return {child_section_id:
+    parent_section_id} for every child.
+
+    This is the source of truth for chip placement AFTER schema edits in
+    the editor. If a user drag-drops Example 3.8 under "(A) ..." in the
+    schema editor, this map reflects that immediately — overriding the
+    older ID-based parent inference (which would still resolve to the
+    original parent baked into the id string).
+
+    Returns empty dict if `schema` is None or has no sections.
+    """
+    out: dict[str, str] = {}
+    if not schema or not isinstance(schema, dict):
+        return out
+
+    def walk(parent_id: str | None, nodes: list) -> None:
+        if not isinstance(nodes, list):
+            return
+        for n in nodes:
+            if not isinstance(n, dict):
+                continue
+            child_id = n.get("id")
+            if isinstance(child_id, str) and parent_id is not None:
+                out[child_id] = parent_id
+            walk(child_id if isinstance(child_id, str) else parent_id, n.get("subsections") or [])
+
+    walk(None, schema.get("sections") or [])
+    return out
+
+
 def _split_example_id(section_id: str) -> tuple[str, str] | None:
     """Backward-compat: return (parent_id, num) if this is a question-kind
     child, else None. Drops the kind (callers wanting kind use _split_question_id)."""
@@ -217,7 +248,23 @@ async def link_examples_to_theory(
     dict for logging/return-to-API.
 
     Idempotent: safe to call repeatedly.
+
+    Parent-resolution priority:
+      1. Live `book.schema_` tree (the user's edited hierarchy, including
+         any drag-drop in the schema editor) — wins if the child's
+         section_id appears in the schema map.
+      2. Fallback to the section_id naming convention (e.g.
+         "<parent>-example-9.1" → parent "<parent>"). Used only when the
+         schema doesn't have the child mapped (orphans, legacy data).
     """
+    from app.models.book import Book
+
+    # Load the book so we can read its current schema tree
+    book = await session.get(Book, book_id)
+    schema_parent_map: dict[str, str] = {}
+    if book is not None and book.schema is not None:
+        schema_parent_map = _build_parent_map_from_schema(book.schema)
+
     sections = (
         await session.execute(
             select(Section).where(Section.book_id == book_id)
@@ -250,9 +297,29 @@ async def link_examples_to_theory(
         parsed = _split_question_id(c.section_id)
         if parsed is None:
             continue
-        # parsed = (parent_id, kind, num)
-        children_with_parsed.append((c, parsed[0], parsed[1], parsed[2]))
+        # parsed = (id_parent_id, kind, num). Live-schema tree wins over
+        # the ID-derived parent so manual drag-drop in the schema editor
+        # moves the chip to the new parent.
+        effective_parent = schema_parent_map.get(c.section_id) or parsed[0]
+        children_with_parsed.append((c, effective_parent, parsed[1], parsed[2]))
     children_with_parsed.sort(key=lambda t: (t[1], _num_sort_key(t[3])))
+
+    # Strip any old chips for these children from EVERY parent before
+    # re-injecting. This makes chip-position updates visible after a
+    # drag-drop in the schema editor.
+    affected_child_ids: set[str] = {c.section_id for c, *_ in children_with_parsed}
+    for sec in sections:
+        if not sec.blocks:
+            continue
+        original = list(sec.blocks)
+        cleaned = [
+            b for b in original
+            if not (isinstance(b, dict)
+                    and b.get("t") == "question_ref"
+                    and b.get("section_id") in affected_child_ids)
+        ]
+        if cleaned != original:
+            sec.blocks = cleaned
 
     for child, parent_id, kind, num in children_with_parsed:
         parent = by_id.get(parent_id)
@@ -301,6 +368,12 @@ def link_examples_to_theory_sync(session, book_id: UUID) -> dict:
     is identical to the async version.
     """
     from sqlalchemy import select as _select  # local import to keep module light
+    from app.models.book import Book as _Book
+
+    book = session.get(_Book, book_id)
+    schema_parent_map: dict[str, str] = {}
+    if book is not None and book.schema is not None:
+        schema_parent_map = _build_parent_map_from_schema(book.schema)
 
     sections = session.execute(
         _select(Section).where(Section.book_id == book_id)
@@ -332,9 +405,29 @@ def link_examples_to_theory_sync(session, book_id: UUID) -> dict:
         parsed = _split_question_id(c.section_id)
         if parsed is None:
             continue
-        # parsed = (parent_id, kind, num)
-        children_with_parsed.append((c, parsed[0], parsed[1], parsed[2]))
+        # parsed = (id_parent_id, kind, num). Live-schema tree wins over
+        # the ID-derived parent so manual drag-drop in the schema editor
+        # moves the chip to the new parent.
+        effective_parent = schema_parent_map.get(c.section_id) or parsed[0]
+        children_with_parsed.append((c, effective_parent, parsed[1], parsed[2]))
     children_with_parsed.sort(key=lambda t: (t[1], _num_sort_key(t[3])))
+
+    # Strip any old chips for these children from EVERY parent before
+    # re-injecting. This makes chip-position updates visible after a
+    # drag-drop in the schema editor.
+    affected_child_ids: set[str] = {c.section_id for c, *_ in children_with_parsed}
+    for sec in sections:
+        if not sec.blocks:
+            continue
+        original = list(sec.blocks)
+        cleaned = [
+            b for b in original
+            if not (isinstance(b, dict)
+                    and b.get("t") == "question_ref"
+                    and b.get("section_id") in affected_child_ids)
+        ]
+        if cleaned != original:
+            sec.blocks = cleaned
 
     for child, parent_id, kind, num in children_with_parsed:
         parent = by_id.get(parent_id)
