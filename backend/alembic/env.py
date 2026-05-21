@@ -3,6 +3,7 @@
 from logging.config import fileConfig
 
 from alembic import context
+import sqlalchemy as sa
 from sqlalchemy import engine_from_config, pool
 
 from app.core.config import settings
@@ -27,6 +28,11 @@ def run_migrations_offline() -> None:
         literal_binds=True,
         dialect_opts={"paramstyle": "named"},
         compare_type=True,
+        # Default alembic_version column is VARCHAR(32). Our revision names
+        # are longer (e.g. "0004_figures_and_figure_regenerations" = 37
+        # chars). SQLite ignored the length, Postgres rejects it with
+        # StringDataRightTruncation. Widen the column.
+        version_table_pk_type=sa.String(128),
     )
     with context.begin_transaction():
         context.run_migrations()
@@ -43,6 +49,7 @@ def run_migrations_online() -> None:
             connection=connection,
             target_metadata=target_metadata,
             compare_type=True,
+            version_table_pk_type=sa.String(128),
         )
         with context.begin_transaction():
             context.run_migrations()
