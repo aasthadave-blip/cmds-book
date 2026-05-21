@@ -8,6 +8,7 @@ by overriding these in ``.env`` when running the Docker stack.
 from functools import lru_cache
 from typing import Literal
 
+from pydantic import field_validator, model_validator
 from pydantic_settings import BaseSettings, SettingsConfigDict
 
 
@@ -65,9 +66,36 @@ class Settings(BaseSettings):
     def anthropic_use_agent(self) -> bool:
         return self.anthropic_effective_mode == "agent"
 
-    # Database — defaults to SQLite under ./cmds.db for zero-infra local runs
+    # Database — defaults to SQLite under ./cmds.db for zero-infra local runs.
+    # Railway / Heroku inject a generic "postgresql://..." (or sometimes the
+    # legacy "postgres://...") DSN — SQLAlchemy's async engine needs the
+    # explicit "+asyncpg" dialect, and the sync engine needs "+psycopg2".
+    # We rewrite below so the deploy "just works" when only DATABASE_URL is
+    # set in env.
     DATABASE_URL: str = "sqlite+aiosqlite:///./cmds.db"
     SYNC_DATABASE_URL: str = "sqlite:///./cmds.db"
+
+    @field_validator("DATABASE_URL")
+    @classmethod
+    def _normalize_async_db_url(cls, v: str) -> str:
+        if v.startswith("postgres://"):       # Railway legacy form
+            v = "postgresql://" + v[len("postgres://"):]
+        if v.startswith("postgresql://"):     # add async dialect
+            return "postgresql+asyncpg://" + v[len("postgresql://"):]
+        return v
+
+    @model_validator(mode="after")
+    def _derive_sync_db_url(self) -> "Settings":
+        # If SYNC_DATABASE_URL is still the SQLite default but the async URL
+        # was switched to Postgres (Railway), derive the sync URL from the
+        # async one so workers (which use SyncSession) can also connect.
+        is_default_sync = self.SYNC_DATABASE_URL == "sqlite:///./cmds.db"
+        if is_default_sync and self.DATABASE_URL.startswith("postgresql+asyncpg://"):
+            self.SYNC_DATABASE_URL = (
+                "postgresql+psycopg2://"
+                + self.DATABASE_URL[len("postgresql+asyncpg://"):]
+            )
+        return self
 
     # Task executor — "inline" runs tasks in-process (no Celery needed);
     # "celery" dispatches to a worker over Redis.
