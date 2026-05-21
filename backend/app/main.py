@@ -12,6 +12,8 @@ from fastapi.responses import FileResponse
 from app.api import (
     books,
     figures as figures_v2,
+    final_draft,
+    final_merge,
     jobs,
     providers,
     qa,
@@ -78,6 +80,8 @@ app.include_router(qa.router)
 # Figures pipeline v2
 app.include_router(figures_v2.books_router)
 app.include_router(figures_v2.figures_router)
+app.include_router(final_merge.router)
+app.include_router(final_draft.router)
 
 
 if settings.STORAGE_BACKEND == "local":

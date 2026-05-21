@@ -1,0 +1,823 @@
+"""Final Merge — Phase 2.
+
+Combines extracted theory blocks, question-bank questions, and embedded
+figures into a single unified document, ordered by the book's schema.
+Pure composition — no new AI calls, no new extraction. Reuses existing
+embedder placement decisions.
+
+Surface (returned dict shape):
+
+    {
+        "book": { "id", "title", "subject" },
+        "sections": [
+            {
+                "section_id", "section_title", "depth",
+                "blocks": [ {Block dict} ... ],
+                "embedded_figures": [ {figure dict, theory context} ... ],
+                "questions": [ {Question dict + embedded_figures} ... ]
+            },
+            ...
+        ],
+        "unattached_figures": [ ... ]  # informational: not in the merge
+    }
+
+The frontend renders this with the same components used by Reader (theory
+blocks + embedded figures) and Questions tab (question cards + embedded
+figures). Exporters consume the same dict to produce MD / DOCX.
+"""
+
+from __future__ import annotations
+
+import logging
+from typing import Any
+from uuid import UUID
+
+from sqlalchemy import select
+from sqlalchemy.ext.asyncio import AsyncSession
+
+from app.models.book import Book
+from app.models.figure import Figure
+from app.models.figure_reference import FigureReference
+from app.models.question import Question
+from app.models.question_bank import QuestionBank
+from app.models.question_regeneration import QuestionRegeneration
+from app.models.regeneration import Regeneration
+from app.models.section import Section
+from app.schemas.analyser import BookSchema
+from app.services.chunk_builder import flatten_sections
+
+logger = logging.getLogger(__name__)
+
+
+def _extract_image_regen_hint(q: Question) -> dict[str, Any] | None:
+    """Phase 4 — surface the multimodal regen verdict if present.
+    Returns {"needed": True, "reason": "..."} when the regen LLM flagged
+    that the attached image no longer matches the new question text,
+    else None.
+    """
+    qc = getattr(q, "qc_local", None)
+    if not isinstance(qc, dict):
+        return None
+    ir = qc.get("image_regen")
+    if not isinstance(ir, dict) or not ir.get("needed"):
+        return None
+    return {"needed": True, "reason": ir.get("reason") or ""}
+
+
+# ---------------------------------------------------------------------------
+# Chip ↔ Question merge
+# ---------------------------------------------------------------------------
+
+import re as _re
+
+_NUM_RE = _re.compile(r"(\d+(?:\.\d+)+|\d+)")
+
+
+def _extract_number(s: str | None) -> str | None:
+    """Pull the first 'X.Y[.Z…]' or bare integer out of a string. Used to
+    match chip.label/number to question.exercise_ref/question_number."""
+    if not s:
+        return None
+    m = _NUM_RE.search(str(s))
+    return m.group(1) if m else None
+
+
+def _chip_number(block: dict[str, Any]) -> str | None:
+    t = block.get("t")
+    if t not in ("example_ref", "exercise_ref", "question_ref"):
+        return None
+    # Prefer the chip's explicit number, fall back to extracting from label
+    n = _extract_number(block.get("number")) or _extract_number(block.get("label"))
+    if n:
+        return n
+    # Last resort: extract from section_id suffix (e.g. "-example-4.18")
+    return _extract_number(block.get("section_id"))
+
+
+def _question_number(q: dict[str, Any]) -> str | None:
+    """A question may carry the number in question_number, exercise_ref,
+    or its own section_ref (worked-example subsections encode it in the id)."""
+    return (
+        _extract_number(q.get("question_number"))
+        or _extract_number(q.get("exercise_ref"))
+        or _extract_number((q.get("section_ref") or "").split("-")[-1])
+        or _extract_number(q.get("section_ref"))
+    )
+
+
+_EXAMPLE_HEADING_RE = _re.compile(
+    r"^\s*(?:worked\s+)?example\s+\d+(?:\.\d+)*",
+    _re.IGNORECASE,
+)
+
+
+def _is_example_heading_block(block: dict[str, Any]) -> tuple[bool, str | None]:
+    """Detect a block that opens a worked-example range. Returns
+    (is_example_heading, extracted_number)."""
+    if not isinstance(block, dict):
+        return (False, None)
+    t = block.get("t")
+    if t == "example":
+        # Native example block — number is in label
+        num = _extract_number(block.get("label") or "")
+        if num:
+            return (True, num)
+        return (False, None)
+    if t in ("h2", "h3", "h4"):
+        text = (block.get("c") or "").strip()
+        if _EXAMPLE_HEADING_RE.match(text):
+            return (True, _extract_number(text))
+    return (False, None)
+
+
+def _find_example_ranges(blocks: list[Any]) -> list[tuple[int, int, str]]:
+    """Walk blocks linearly. For each EXAMPLE heading, return
+    (start_idx, end_idx_exclusive, number). The range extends from the
+    heading through subsequent blocks until we hit:
+      - another non-SOLUTION heading
+      - a Key Point (kp) block (usually a section-level transition)
+      - end of blocks
+    The "SOLUTION" sub-heading is treated as part of the example, not a
+    range-terminator.
+    """
+    ranges: list[tuple[int, int, str]] = []
+    i = 0
+    n = len(blocks)
+    while i < n:
+        is_ex, num = _is_example_heading_block(blocks[i])
+        if not is_ex or not num:
+            i += 1
+            continue
+        j = i + 1
+        while j < n:
+            b = blocks[j]
+            if not isinstance(b, dict):
+                j += 1
+                continue
+            t = b.get("t")
+            if t in ("h2", "h3", "h4"):
+                txt = (b.get("c") or "").strip().lower()
+                if txt == "solution":
+                    j += 1
+                    continue  # SOLUTION sub-heading is part of the example
+                break  # any other heading ends the range
+            if t == "kp":
+                break  # Key Point boxes usually indicate a transition
+            # Don't extend over another EXAMPLE heading either
+            is_ex2, _ = _is_example_heading_block(b)
+            if is_ex2:
+                break
+            j += 1
+        ranges.append((i, j, num))
+        i = j
+    return ranges
+
+
+def _drop_in_section_worked_examples(
+    section: dict[str, Any],
+) -> dict[str, Any]:
+    """Find in-section worked-example block ranges and drop them when a
+    matching question with solution_text exists in the same section. The
+    question gets inlined at the dropped range's anchor position.
+
+    Conservative — only fires when:
+      (a) An EXAMPLE heading block (h3 "Example X.Y" / native example
+          block) is detected by ``_find_example_ranges``.
+      (b) A question (inlined or standalone) shares the same X.Y number.
+      (c) That question has non-empty solution_text (otherwise blocks ARE
+          the only copy of the solution; do not drop).
+
+    Index remapping: figures + remaining inlined-question anchors are
+    shifted to match the new (shorter) blocks list.
+    """
+    blocks = section.get("blocks") or []
+    standalone = section.get("questions") or []
+    inlined = section.get("inlined_questions_by_block_idx") or {}
+    inlined_qs = [q for qs in inlined.values() for q in qs]
+    all_qs = inlined_qs + standalone
+    if not blocks or not all_qs:
+        return section
+
+    ranges = _find_example_ranges(blocks)
+    if not ranges:
+        return section
+
+    q_by_num: dict[str, dict[str, Any]] = {}
+    for q in all_qs:
+        n = _question_number(q)
+        if n and (q.get("solution_text") or "").strip():
+            # First wins (deterministic; small chance of multiple Q with
+            # same number, in which case any is fine for dedup purpose)
+            q_by_num.setdefault(n, q)
+
+    drops: list[tuple[int, int, str]] = [
+        (s, e, num) for s, e, num in ranges if num in q_by_num
+    ]
+    if not drops:
+        return section
+
+    drop_set: set[int] = set()
+    for s, e, _ in drops:
+        for k in range(s, e):
+            drop_set.add(k)
+
+    new_blocks: list[Any] = []
+    old_to_new: list[int | None] = []
+    new_idx = -1
+    for i, b in enumerate(blocks):
+        if i in drop_set:
+            old_to_new.append(None)
+        else:
+            new_idx += 1
+            new_blocks.append(b)
+            old_to_new.append(new_idx)
+
+    # Remap figure indices
+    figs = section.get("embedded_figures") or []
+    new_figs: list[Any] = []
+    for f in figs:
+        idx = f.get("placement_block_idx")
+        if idx is None:
+            new_figs.append(f)
+        elif 0 <= idx < len(old_to_new):
+            mapped = old_to_new[idx]
+            if mapped is None:
+                new_figs.append({**f, "placement_block_idx": None})
+            else:
+                new_figs.append({**f, "placement_block_idx": mapped})
+        else:
+            new_figs.append(f)
+
+    # Remap existing inlined-question anchors
+    new_inlined: dict[str, list[dict[str, Any]]] = {}
+    for k, qs in inlined.items():
+        try:
+            ki = int(k)
+        except (TypeError, ValueError):
+            continue
+        if ki < 0:
+            new_inlined.setdefault(str(ki), []).extend(qs)
+            continue
+        if 0 <= ki < len(old_to_new):
+            mapped = old_to_new[ki]
+            target = str(mapped) if mapped is not None else "-1"
+            new_inlined.setdefault(target, []).extend(qs)
+        else:
+            new_inlined.setdefault(str(ki), []).extend(qs)
+
+    # Add the matched questions at their dropped-range's anchor
+    consumed_q_ids: set[str] = set()
+    for s, e, num in drops:
+        q = q_by_num[num]
+        qid = str(q.get("id") or "")
+        if qid in consumed_q_ids:
+            continue
+        consumed_q_ids.add(qid)
+        # Find the last surviving block index BEFORE the drop range
+        anchor_old = s - 1
+        anchor_new_idx = -1
+        while anchor_old >= 0:
+            if anchor_old < len(old_to_new) and old_to_new[anchor_old] is not None:
+                anchor_new_idx = old_to_new[anchor_old]  # type: ignore[assignment]
+                break
+            anchor_old -= 1
+        anchor_key = str(anchor_new_idx) if anchor_new_idx >= 0 else "-1"
+        new_inlined.setdefault(anchor_key, []).append(q)
+
+    # Remove the matched questions from standalone (if they were there)
+    new_standalone = [
+        q for q in standalone if str(q.get("id") or "") not in consumed_q_ids
+    ]
+    # Also strip them from new_inlined positions where they came from
+    # (they might have been in inlined originally; we just re-anchored them)
+    if consumed_q_ids:
+        scrubbed: dict[str, list[dict[str, Any]]] = {}
+        for k, qs in new_inlined.items():
+            kept = [
+                q for q in qs if str(q.get("id") or "") not in consumed_q_ids
+            ]
+            if kept:
+                scrubbed[k] = kept
+        # Now re-add at the drop-range anchors (we lost them in the scrub)
+        for s, e, num in drops:
+            q = q_by_num[num]
+            qid = str(q.get("id") or "")
+            anchor_old = s - 1
+            anchor_new_idx = -1
+            while anchor_old >= 0:
+                if (
+                    anchor_old < len(old_to_new)
+                    and old_to_new[anchor_old] is not None
+                ):
+                    anchor_new_idx = old_to_new[anchor_old]  # type: ignore[assignment]
+                    break
+                anchor_old -= 1
+            anchor_key = str(anchor_new_idx) if anchor_new_idx >= 0 else "-1"
+            scrubbed.setdefault(anchor_key, []).append(q)
+        new_inlined = scrubbed
+
+    out = dict(section)
+    out["blocks"] = new_blocks
+    out["embedded_figures"] = new_figs
+    out["inlined_questions_by_block_idx"] = new_inlined
+    out["questions"] = new_standalone
+    return out
+
+
+def _looks_like_worked_example_section(section: dict[str, Any]) -> bool:
+    """Heuristic: is this a section that contains exactly one worked
+    example? Used to decide whether the remaining theory blocks can be
+    safely dropped after the chip↔question merge (since they're just the
+    OCR'd solution that the question's solution_text already carries).
+    Deterministic, pure string match — no AI."""
+    sid = (section.get("section_id") or "").lower()
+    title = (section.get("section_title") or "").lower()
+    if "-example-" in sid or sid.startswith("example-"):
+        return True
+    if title.startswith("example ") or title.startswith("worked example"):
+        return True
+    return False
+
+
+def _drop_solution_duplicate_blocks(section: dict[str, Any]) -> dict[str, Any]:
+    """For worked-example sections, the section's blocks are typically
+    just the OCR'd solution to a single worked example. If that section
+    also has a question (inlined or standalone) carrying its own
+    solution_text, the blocks are a duplicate of the question's solution.
+    Drop them — the question card renders the solution cleanly with
+    KaTeX.
+
+    Deterministic rule (no AI): triggered ONLY when
+      (a) section_id / title looks like a worked example, AND
+      (b) the section has exactly one associated question, AND
+      (c) that question has non-empty solution_text.
+
+    The single-question constraint keeps the rule conservative — sections
+    with multiple questions or mixed content are left untouched.
+    """
+    if not _looks_like_worked_example_section(section):
+        return section
+    inlined = section.get("inlined_questions_by_block_idx") or {}
+    standalone = section.get("questions") or []
+    inlined_qs: list[dict[str, Any]] = []
+    for qs in inlined.values():
+        inlined_qs.extend(qs)
+    total_questions = len(inlined_qs) + len(standalone)
+    if total_questions != 1:
+        return section
+    the_q = (inlined_qs or standalone)[0]
+    if not (the_q.get("solution_text") or "").strip():
+        return section
+    out = dict(section)
+    out["blocks"] = []
+    # Preserve trailing figures only (placement_block_idx=None); drop the rest
+    figs = section.get("embedded_figures") or []
+    out["embedded_figures"] = [
+        f for f in figs if f.get("placement_block_idx") is None
+    ]
+    # If the question was standalone (no chip-merge happened), move it to
+    # the inlined anchor "-1" so the frontend renders it consistently.
+    if not inlined_qs and standalone:
+        out["inlined_questions_by_block_idx"] = {"-1": list(standalone)}
+        out["questions"] = []
+    else:
+        # Collapse all inlined positions to "-1" since there are no blocks left.
+        flat: list[dict[str, Any]] = []
+        for qs in inlined.values():
+            flat.extend(qs)
+        out["inlined_questions_by_block_idx"] = {"-1": flat}
+    return out
+
+
+def _merge_chips_with_questions(section: dict[str, Any]) -> dict[str, Any]:
+    """Within a single section, match each chip block to a same-numbered
+    question. For each match: drop the chip block, record the question's
+    inline position. The matched question is also removed from the
+    standalone ``questions`` list so it renders ONCE (inline at the chip).
+
+    Returns a NEW section dict with these fields possibly updated:
+        - blocks: chips for matched pairs removed
+        - embedded_figures: placement_block_idx remapped to surviving block indices
+        - questions: matched questions filtered out
+        - inlined_questions_by_block_idx: dict[str(new_after_idx), question]
+          (key is "-1" for "before any block")
+
+    Unmatched chips (chip with no same-numbered question in this section)
+    are left in place — they still serve as informational pointers.
+    """
+    blocks: list[dict[str, Any]] = list(section.get("blocks") or [])
+    questions: list[dict[str, Any]] = list(section.get("questions") or [])
+    figures: list[dict[str, Any]] = list(section.get("embedded_figures") or [])
+
+    if not blocks or not questions:
+        section["inlined_questions_by_block_idx"] = {}
+        return section
+
+    # Match chip indices to question indices by number
+    used_q: set[int] = set()
+    matches: list[tuple[int, int]] = []  # (chip_block_idx, question_idx)
+    for bi, b in enumerate(blocks):
+        cn = _chip_number(b)
+        if not cn:
+            continue
+        for qi, q in enumerate(questions):
+            if qi in used_q:
+                continue
+            if _question_number(q) == cn:
+                matches.append((bi, qi))
+                used_q.add(qi)
+                break
+
+    if not matches:
+        section["inlined_questions_by_block_idx"] = {}
+        return section
+
+    dropped_chip_idx: dict[int, int] = {bi: qi for bi, qi in matches}
+
+    # Build new blocks list (without matched chips) and track old→new mapping
+    new_blocks: list[dict[str, Any]] = []
+    old_to_new: list[int | None] = []
+    new_idx = -1
+    # Also record where each dropped chip's question should inline. The
+    # convention: inline AFTER the new block at index `anchor`, where
+    # anchor is the last surviving block before the dropped chip. If the
+    # chip was the very first block, anchor is -1 (= inline at start).
+    inlined: dict[int, list[dict[str, Any]]] = {}
+    for old_idx, b in enumerate(blocks):
+        if old_idx in dropped_chip_idx:
+            old_to_new.append(None)
+            anchor = new_idx  # last survivor's new index
+            inlined.setdefault(anchor, []).append(
+                questions[dropped_chip_idx[old_idx]]
+            )
+        else:
+            new_idx += 1
+            new_blocks.append(b)
+            old_to_new.append(new_idx)
+
+    # Remap figure placement_block_idx
+    new_figures: list[dict[str, Any]] = []
+    for f in figures:
+        idx = f.get("placement_block_idx")
+        if idx is None:
+            new_figures.append(f)
+            continue
+        if 0 <= idx < len(old_to_new):
+            mapped = old_to_new[idx]
+            if mapped is None:
+                # Figure was anchored to a dropped chip — demote to trailing
+                new_figures.append({**f, "placement_block_idx": None})
+            else:
+                new_figures.append({**f, "placement_block_idx": mapped})
+        else:
+            new_figures.append(f)
+
+    # Filter out matched questions
+    new_questions = [q for qi, q in enumerate(questions) if qi not in used_q]
+
+    # Convert int keys to str (JSON serialisable, frontend reads as string)
+    inlined_str = {str(k): v for k, v in inlined.items()}
+
+    out = dict(section)
+    out["blocks"] = new_blocks
+    out["embedded_figures"] = new_figures
+    out["questions"] = new_questions
+    out["inlined_questions_by_block_idx"] = inlined_str
+    return out
+
+
+def _figure_dict(
+    ref: FigureReference,
+    fig: Figure,
+) -> dict[str, Any]:
+    """Render-ready figure dict, shape compatible with EmbeddedFigure on
+    the frontend. Variant: regen if approved, else original."""
+    variant = "regen" if (fig.regen_image_bytes and fig.approved_at) else "original"
+    return {
+        "ref_id": str(ref.id),
+        "figure_id": str(fig.id),
+        "label": fig.figure_number or ref.placeholder_text or "",
+        "caption": fig.caption or "",
+        "variant": variant,
+        "image_url": f"/api/figures/{fig.id}/image?variant=auto",
+        "placement_kind": ref.placement_kind or "appended",
+        "placement_block_idx": ref.placement_block_idx,
+        "placement_char_offset": ref.placement_char_offset,
+    }
+
+
+async def build_final_merge(
+    session: AsyncSession,
+    book_id: UUID,
+    *,
+    prefer_regen: bool = True,
+) -> dict[str, Any]:
+    """Compose the final merged document for a book.
+
+    When ``prefer_regen`` is True (default), regenerated content overrides
+    the original wherever available — per-section for theory, per-bank for
+    questions, per-figure for images (variant=regen if approved). Sections
+    without any regen fall back to the original Section.blocks. Mix is
+    fine: some sections regen, others original.
+    """
+    book = await session.get(Book, book_id)
+    if book is None:
+        raise ValueError(f"Book {book_id} not found")
+
+    # 1. Schema → ordered sections
+    if not book.schema:
+        # No schema means no order — return book metadata with empty body
+        return {
+            "book": {
+                "id": str(book.id),
+                "title": book.title or "",
+                "subject": book.subject or "",
+            },
+            "sections": [],
+            "unattached_figures": [],
+        }
+    try:
+        schema_obj = BookSchema(**book.schema)
+    except Exception as e:
+        logger.warning("Schema parse failed for book %s: %s", book_id, e)
+        return {
+            "book": {
+                "id": str(book.id),
+                "title": book.title or "",
+                "subject": book.subject or "",
+            },
+            "sections": [],
+            "unattached_figures": [],
+        }
+    ordered_schema_sections = flatten_sections(schema_obj)
+
+    # 2. Bulk-load Section rows (theory blocks)
+    sec_rows = (
+        await session.execute(
+            select(Section).where(Section.book_id == book_id)
+        )
+    ).scalars().all()
+    section_by_id = {s.section_id: s for s in sec_rows}
+
+    # 2b. Theory regen overlay — for each section_id, find the LATEST
+    # regen that contains blocks for it. The regen-side blocks_by_section
+    # is filtered to user-saved sections after `/regenerations/{id}/save`
+    # is called, so presence here means the user opted in for this section.
+    theory_regen_blocks: dict[str, list[dict]] = {}
+    theory_regen_meta: dict[str, dict[str, Any]] = {}
+    if prefer_regen:
+        regens = (
+            await session.execute(
+                select(Regeneration)
+                .where(Regeneration.book_id == book_id)
+                .order_by(Regeneration.created_at.desc())
+            )
+        ).scalars().all()
+        for r in regens:
+            bbs = r.blocks_by_section or {}
+            if not isinstance(bbs, dict):
+                continue
+            for sid, blocks in bbs.items():
+                if sid in theory_regen_blocks:
+                    continue  # already covered by newer regen
+                if not isinstance(blocks, list) or not blocks:
+                    continue
+                theory_regen_blocks[sid] = blocks
+                theory_regen_meta[sid] = {
+                    "regen_id": str(r.id),
+                    "regen_created_at": r.created_at.isoformat() if r.created_at else None,
+                }
+
+    # 3. Bulk-load figure_references for this book (split by context, exclude
+    #    hidden + unattached).
+    all_refs = (
+        await session.execute(
+            select(FigureReference).where(FigureReference.book_id == book_id)
+        )
+    ).scalars().all()
+    fig_ids = {r.figure_id for r in all_refs}
+    figs = (
+        await session.execute(
+            select(Figure).where(Figure.id.in_(fig_ids))
+        )
+    ).scalars().all() if fig_ids else []
+    fig_by_id = {f.id: f for f in figs}
+
+    theory_by_section: dict[str, list[dict[str, Any]]] = {}
+    question_figures_by_qid: dict[str, list[dict[str, Any]]] = {}
+    unattached_figs: list[dict[str, Any]] = []
+
+    for r in all_refs:
+        f = fig_by_id.get(r.figure_id)
+        if f is None:
+            continue
+        d = _figure_dict(r, f)
+        if r.is_hidden:
+            continue
+        if r.placement_kind == "unattached":
+            d2 = {**d, "context": r.context, "section_ref": r.section_ref,
+                  "page_number": f.page_number}
+            unattached_figs.append(d2)
+            continue
+        if r.context == "theory":
+            theory_by_section.setdefault(r.section_ref, []).append(d)
+        elif r.context == "question":
+            if r.question_id is not None:
+                question_figures_by_qid.setdefault(str(r.question_id), []).append(d)
+
+    for k, lst in theory_by_section.items():
+        lst.sort(key=lambda d: (
+            d.get("placement_block_idx") if d.get("placement_block_idx") is not None else 10**9
+        ))
+    for k, lst in question_figures_by_qid.items():
+        lst.sort(key=lambda d: (
+            d.get("placement_char_offset") if d.get("placement_char_offset") is not None else 10**9
+        ))
+
+    # 4. Bulk-load questions. Prefer the latest "saved" question
+    # regeneration's variant questions over originals when prefer_regen is
+    # on; questions are scoped per section_ref where the regen applied.
+    latest_bank = (
+        await session.execute(
+            select(QuestionBank)
+            .where(QuestionBank.book_id == book_id)
+            .where(QuestionBank.status == "ready")
+            .order_by(QuestionBank.created_at.desc())
+            .limit(1)
+        )
+    ).scalars().first()
+
+    saved_qregen = None
+    qregen_section_scope: set[str] | None = None
+    if prefer_regen:
+        saved_qregen = (
+            await session.execute(
+                select(QuestionRegeneration)
+                .where(QuestionRegeneration.book_id == book_id)
+                .where(QuestionRegeneration.status == "saved")
+                .order_by(QuestionRegeneration.created_at.desc())
+                .limit(1)
+            )
+        ).scalars().first()
+        if saved_qregen and saved_qregen.scope == "sections":
+            qregen_section_scope = set(saved_qregen.section_refs or [])
+
+    questions_by_section: dict[str, list[Question]] = {}
+    # First load originals (latest ready bank, regen_id IS NULL) — these are
+    # the baseline. Regen variants replace per-section below.
+    if latest_bank is not None:
+        qs = (
+            await session.execute(
+                select(Question)
+                .where(Question.bank_id == latest_bank.id)
+                .where(Question.regen_id.is_(None))
+                .where(Question.is_hidden.is_(False))
+                .order_by(Question.section_ref, Question.page_start, Question.created_at)
+            )
+        ).scalars().all()
+        for q in qs:
+            if q.section_ref:
+                questions_by_section.setdefault(q.section_ref, []).append(q)
+
+    # Now overlay saved regen questions per section (replacing originals
+    # for that section).
+    if saved_qregen is not None:
+        regen_qs = (
+            await session.execute(
+                select(Question)
+                .where(Question.regen_id == saved_qregen.id)
+                .where(Question.is_hidden.is_(False))
+                .order_by(Question.section_ref, Question.created_at)
+            )
+        ).scalars().all()
+        # Determine which sections to overlay
+        if qregen_section_scope is None:
+            # Bank-scope regen — overlay every section that has regen qs
+            sections_to_overlay = {q.section_ref for q in regen_qs if q.section_ref}
+        else:
+            sections_to_overlay = qregen_section_scope
+        # Clear originals for those sections
+        for sid in sections_to_overlay:
+            questions_by_section[sid] = []
+        for q in regen_qs:
+            if q.section_ref and q.section_ref in sections_to_overlay:
+                questions_by_section.setdefault(q.section_ref, []).append(q)
+
+    # 5. Assemble ordered sections
+    out_sections: list[dict[str, Any]] = []
+    for ss in ordered_schema_sections:
+        sec_row = section_by_id.get(ss.id)
+        # Prefer regen blocks if available; fall back to original blocks
+        regen_blocks = theory_regen_blocks.get(ss.id) if prefer_regen else None
+        if regen_blocks:
+            blocks = regen_blocks
+            block_source = "regen"
+        else:
+            blocks = (sec_row.blocks if sec_row and sec_row.blocks else []) or []
+            block_source = "original"
+        section_figures = theory_by_section.get(ss.id, [])
+        # Skip purely empty sections (no theory body, no questions, no figs)
+        section_questions = questions_by_section.get(ss.id, [])
+        if not blocks and not section_figures and not section_questions:
+            continue
+
+        question_dicts: list[dict[str, Any]] = []
+        for q in section_questions:
+            qd = {
+                "id": str(q.id),
+                "question_number": q.question_number,
+                "exercise_ref": q.exercise_ref,
+                "section_ref": q.section_ref,
+                "page_start": q.page_start,
+                "question_type": q.question_type,
+                "raw_text": q.raw_text or "",
+                "has_solution": bool(q.has_solution),
+                "solution_text": q.solution_text or "",
+                "kind": q.kind,
+                "embedded_figures": question_figures_by_qid.get(str(q.id), []),
+                "image_regen_hint": _extract_image_regen_hint(q),
+            }
+            question_dicts.append(qd)
+
+        out_sections.append({
+            "section_id": ss.id,
+            "section_title": ss.title,
+            "level": ss.level,
+            "blocks": blocks,
+            "block_source": block_source,
+            "regen_meta": theory_regen_meta.get(ss.id),
+            "embedded_figures": section_figures,
+            "questions": question_dicts,
+        })
+
+    # End-of-chapter banks (e.g. "PRACTICE QUESTIONS - CLASSROOM WING").
+    # These live in the schema's ``excluded_sections`` list — excluded from
+    # THEORY extraction, but their questions are extracted into the question
+    # bank with the section_ref set to the excluded section's title verbatim.
+    # Auto-append them to the final merge so the chapter feels complete.
+    # User can remove them individually from the Composer if they want.
+    used_excluded_titles: set[str] = set()
+    for ex in getattr(schema_obj, "excluded_sections", []) or []:
+        title = (ex.title or "").strip()
+        if not title:
+            continue
+        qs = questions_by_section.get(title, [])
+        if not qs:
+            continue  # excluded section with no extracted questions → skip
+        used_excluded_titles.add(title)
+        # Build question dicts (same shape as regular sections)
+        question_dicts: list[dict[str, Any]] = []
+        for q in qs:
+            question_dicts.append({
+                "id": str(q.id),
+                "question_number": q.question_number,
+                "exercise_ref": q.exercise_ref,
+                "section_ref": q.section_ref,
+                "page_start": q.page_start,
+                "question_type": q.question_type,
+                "raw_text": q.raw_text or "",
+                "has_solution": bool(q.has_solution),
+                "solution_text": q.solution_text or "",
+                "kind": q.kind,
+                "embedded_figures": question_figures_by_qid.get(str(q.id), []),
+                "image_regen_hint": _extract_image_regen_hint(q),
+            })
+        out_sections.append({
+            "section_id": title,
+            "section_title": title,
+            "level": 0,
+            "blocks": [],
+            "block_source": "original",
+            "regen_meta": None,
+            "embedded_figures": [],
+            "questions": question_dicts,
+        })
+
+    # Final pass: within each section, match chip placeholders with their
+    # actual question entities and inline the question at the chip's spot
+    # (dropping the chip + the duplicate standalone question). Idempotent
+    # for sections that have no chips or no questions.
+    merged_sections = [_merge_chips_with_questions(s) for s in out_sections]
+    # Second pass: for worked-example sections where the merge ran and
+    # the inlined question carries solution_text, drop the now-redundant
+    # OCR'd solution blocks. Deterministic, structural signal only.
+    merged_sections = [_drop_solution_duplicate_blocks(s) for s in merged_sections]
+    # Third pass: for REGULAR sections that contain inline EXAMPLE block
+    # ranges, drop those ranges when a matching same-numbered question
+    # with solution_text exists. Handles the "EXAMPLE 8.8 inside Pith
+    # Ball Electroscope section" case where the example is a sub-region
+    # of a larger section. Deterministic — no AI.
+    merged_sections = [_drop_in_section_worked_examples(s) for s in merged_sections]
+
+    return {
+        "book": {
+            "id": str(book.id),
+            "title": book.title or "",
+            "subject": book.subject or "",
+        },
+        "sections": merged_sections,
+        "unattached_figures": unattached_figs,
+    }
+
+
+__all__ = ["build_final_merge"]

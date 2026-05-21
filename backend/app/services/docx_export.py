@@ -85,6 +85,33 @@ _LATEX_TO_UNICODE: list[tuple[str, str]] = [
     (r"\neq", "≠"),
     (r"\ne", "≠"),
     (r"\to", "→"),
+    # Set theory
+    (r"\cup", "∪"),
+    (r"\cap", "∩"),
+    (r"\subseteq", "⊆"),
+    (r"\supseteq", "⊇"),
+    (r"\subset", "⊂"),
+    (r"\supset", "⊃"),
+    (r"\notin", "∉"),
+    (r"\in", "∈"),
+    (r"\emptyset", "∅"),
+    (r"\varnothing", "∅"),
+    # Logic / quantifiers
+    (r"\forall", "∀"),
+    (r"\exists", "∃"),
+    (r"\lnot", "¬"),
+    (r"\neg", "¬"),
+    (r"\land", "∧"),
+    (r"\lor", "∨"),
+    # More misc
+    (r"\partial", "∂"),
+    (r"\nabla", "∇"),
+    (r"\sum", "∑"),
+    (r"\prod", "∏"),
+    (r"\int", "∫"),
+    (r"\oint", "∮"),
+    (r"\ldots", "…"),
+    (r"\cdots", "⋯"),
     # Greek letters most commonly seen in math prose
     (r"\alpha", "α"), (r"\beta", "β"), (r"\gamma", "γ"),
     (r"\delta", "δ"), (r"\epsilon", "ε"), (r"\theta", "θ"),
@@ -117,31 +144,100 @@ def _normalise_math_prose(text: str) -> str:
     super/subscripts so the rendered docx reads naturally. Applied to
     text after stripping `$...$` math wrappers (math chunks go through
     this too — the rendered italic stays, just with proper symbols)."""
-    for tex, uni in _LATEX_TO_UNICODE:
-        text = text.replace(tex, uni)
+    # Structural LaTeX commands that don't have a single Unicode codepoint
+    # but can be rewritten plainly. Done BEFORE the simple substitutions so
+    # any greek letters inside survive.
+    #   \frac{a}{b}        → (a)/(b)         (parens added when needed)
+    #   \dfrac, \tfrac     → same as \frac
+    #   \sqrt[n]{x}        → ⁿ√(x)
+    #   \sqrt{x}           → √(x)
+    #   \text{x}, \mathrm{x}, \mathbf{x}, \operatorname{x} → x
+    #   \left, \right      → dropped (display-size hints only)
+    def _drop_text(m: re.Match[str]) -> str:
+        return m.group(1)
 
-    # Single-character super/subscripts. Only convert when EVERY char in
-    # the match has a Unicode super/sub equivalent — otherwise the mixed
-    # result looks worse than the original LaTeX.
-    # NOTE: str.maketrans() returns a dict keyed by character ORDINALS,
-    # not strs, so membership checks must use ord(ch).
-    def _sup(m: re.Match[str]) -> str:
+    text = re.sub(r"\\(?:text|mathrm|mathbf|mathit|operatorname)\{([^{}]*)\}", _drop_text, text)
+    text = re.sub(r"\\left\b", "", text)
+    text = re.sub(r"\\right\b", "", text)
+
+    def _frac(m: re.Match[str]) -> str:
+        num = m.group(1).strip()
+        den = m.group(2).strip()
+        wrap = lambda s: s if len(s) == 1 and s.isalnum() else f"({s})"
+        return f"{wrap(num)}/{wrap(den)}"
+
+    def _sqrt(m: re.Match[str]) -> str:
+        return f"√({m.group(1)})"
+
+    def _nthroot(m: re.Match[str]) -> str:
+        n = m.group(1)
+        body = m.group(2)
+        sup = {"2": "²", "3": "³", "4": "⁴", "5": "⁵"}.get(n.strip(), n.strip())
+        return f"{sup}√({body})"
+
+    # super/subscript helpers (defined here so they can run INSIDE the
+    # fixpoint loop below — running them first unblocks sqrt/frac when
+    # the args contain `x^{2}` style braces).
+    def _sup_inner(m: re.Match[str]) -> str:
         body = m.group(1) or m.group(2) or ""
         if body and all(ord(ch) in _SUP_MAP for ch in body):
             return body.translate(_SUP_MAP)
         return m.group(0)
 
-    def _sub(m: re.Match[str]) -> str:
+    def _sub_inner(m: re.Match[str]) -> str:
         body = m.group(1) or m.group(2) or ""
         if body and all(ord(ch) in _SUB_MAP for ch in body):
             return body.translate(_SUB_MAP)
         return m.group(0)
 
-    # x^{2}, x^{n+1}, x^2, x^n
-    text = re.sub(r"\^\{([^{}]{1,4})\}|\^([0-9a-zA-Z+\-=()])", _sup, text)
-    # x_{1}, x_{i}, x_1, x_n
-    text = re.sub(r"_\{([^{}]{1,4})\}|_([0-9a-zA-Z+\-=()])", _sub, text)
-    return text
+    # Single fixpoint loop covering super/subscripts + sqrt + frac.
+    # ORDER MATTERS: super/subscripts must run FIRST so `\sqrt{b^{2}-4ac}`
+    # becomes `\sqrt{b²-4ac}` (no inner braces) and the sqrt regex
+    # (`[^{}]*`) can then match it. Same logic for frac with `\sqrt`
+    # inside. Iterating to fixpoint handles arbitrary nesting.
+    for _ in range(8):
+        prev = text
+        # 1. single-char super/subscripts (e.g. b^{2} → b²)
+        text = re.sub(
+            r"\^\{([^{}]{1,4})\}|\^([0-9a-zA-Z+\-=()])", _sup_inner, text
+        )
+        text = re.sub(
+            r"_\{([^{}]{1,4})\}|_([0-9a-zA-Z+\-=()])", _sub_inner, text
+        )
+        # 2. roots
+        text = re.sub(r"\\sqrt\[([^\]]+)\]\{([^{}]*)\}", _nthroot, text)
+        text = re.sub(r"\\sqrt\{([^{}]*)\}", _sqrt, text)
+        # 3. fractions
+        text = re.sub(r"\\(?:d|t)?frac\{([^{}]*)\}\{([^{}]*)\}", _frac, text)
+        if text == prev:
+            break
+
+    for tex, uni in _LATEX_TO_UNICODE:
+        text = text.replace(tex, uni)
+
+    # super/subscript handling is now done INSIDE the fixpoint loop above
+    # — needs to run before sqrt/frac so inner braces from `x^{2}` don't
+    # block the outer regexes. Keeping a second pass here is redundant.
+
+    # Final XML safety pass — python-docx rejects control characters that
+    # XML 1.0 disallows. JSON-escape collisions in the source data leave
+    # behind \v / \f / \b / \x01-\x08 / \x0E-\x1F etc. These are usually
+    # the tail of stripped LaTeX commands (e.g. `\vec` → `\x0B + ec`).
+    # Strip them so the docx renders cleanly.
+    return _sanitize_xml(text)
+
+
+# XML 1.0 valid chars: \t \n \r and >= \x20 (except surrogates / FFFE / FFFF)
+_XML_INVALID_RE = re.compile(
+    r"[\x00-\x08\x0B\x0C\x0E-\x1F\x7F]"
+)
+
+def _sanitize_xml(text: str) -> str:
+    """Strip characters that python-docx / XML 1.0 can't accept. Replaces
+    them with a single space so the surrounding text stays readable."""
+    if not text:
+        return text
+    return _XML_INVALID_RE.sub(" ", text)
 
 
 def _extract_tables_from_text(text: str):
@@ -202,6 +298,11 @@ def _set_default_font(doc: Document) -> None:
 def _render_inline(p, text: str) -> None:
     """Add inline runs to paragraph p. Math chunks render italic;
     figure placeholders render as muted bracketed callouts."""
+    # Defensive XML safety — strip any control chars before passing
+    # anything to python-docx (which raises ValueError on them). Also
+    # caught by _normalise_math_prose's tail, but inline paths can
+    # bypass that (e.g. table cells) so we do it here too.
+    text = _sanitize_xml(text or "")
     # First substitute figure placeholders → bracketed callouts (still
     # processed inline so they stay in flow with surrounding prose).
     parts: list[tuple[str, str]] = []  # (kind, content) kind in {text, math, fig}
@@ -291,6 +392,7 @@ class _DocBuilder:
         self._last_heading = ""
 
     def title(self, text: str) -> None:
+        text = _sanitize_xml(text or "")
         p = self.doc.add_paragraph()
         p.alignment = WD_ALIGN_PARAGRAPH.CENTER
         p.paragraph_format.space_after = Pt(10)
@@ -301,6 +403,7 @@ class _DocBuilder:
 
     def group_header(self, text: str) -> None:
         """Big divider — WORKED EXAMPLES, JEE SPECIAL WING, etc."""
+        text = _sanitize_xml(text or "")
         if _norm(text) == _norm(self._last_heading):
             return
         p = self.doc.add_paragraph()
@@ -315,6 +418,7 @@ class _DocBuilder:
 
     def section_heading(self, text: str) -> None:
         """Section-level heading — EXAMPLE 4.7, Introduction, etc."""
+        text = _sanitize_xml(text or "")
         if _norm(text) == _norm(self._last_heading):
             return
         h = self.doc.add_paragraph()
@@ -328,6 +432,7 @@ class _DocBuilder:
         self._last_heading = text
 
     def sub_heading(self, text: str) -> None:
+        text = _sanitize_xml(text or "")
         if _norm(text) == _norm(self._last_heading):
             return
         p = self.doc.add_paragraph()
@@ -345,9 +450,10 @@ class _DocBuilder:
         p.paragraph_format.space_after = Pt(space_after_pt)
         if left_indent_cm:
             p.paragraph_format.left_indent = Cm(left_indent_cm)
-        _render_inline(p, text.strip())
+        _render_inline(p, (text or "").strip())
 
     def equation(self, text: str) -> None:
+        text = _sanitize_xml(text or "")
         p = self.doc.add_paragraph()
         p.alignment = WD_ALIGN_PARAGRAPH.CENTER
         p.paragraph_format.space_before = Pt(4)
@@ -486,6 +592,8 @@ class _DocBuilder:
         p.paragraph_format.space_after = Pt(10)
 
     def figure_callout(self, label: str, caption: str = "") -> None:
+        label = _sanitize_xml(label or "")
+        caption = _sanitize_xml(caption or "")
         p = self.doc.add_paragraph()
         p.alignment = WD_ALIGN_PARAGRAPH.CENTER
         text = f"[Figure: {label}"
@@ -496,6 +604,48 @@ class _DocBuilder:
         r.italic = True
         r.font.size = Pt(9)
         r.font.color.rgb = MUTED
+
+    def image(self, image_bytes: bytes, label: str = "", caption: str = "",
+              max_width_inches: float = 5.0) -> None:
+        """Embed a figure binary in the doc. Centered, capped at
+        ``max_width_inches`` so big images don't overflow the page.
+        Label + caption render as a centred italic figcaption below."""
+        if not image_bytes:
+            return
+        label = _sanitize_xml(label or "")
+        caption = _sanitize_xml(caption or "")
+        from docx.shared import Inches
+        p = self.doc.add_paragraph()
+        p.alignment = WD_ALIGN_PARAGRAPH.CENTER
+        p.paragraph_format.space_before = Pt(6)
+        p.paragraph_format.space_after = Pt(2)
+        run = p.add_run()
+        try:
+            run.add_picture(io.BytesIO(image_bytes), width=Inches(max_width_inches))
+        except Exception:
+            # Fall back to text callout if python-docx fails to read the bytes
+            self.figure_callout(label or "image", caption)
+            return
+        if label or caption:
+            cap = self.doc.add_paragraph()
+            cap.alignment = WD_ALIGN_PARAGRAPH.CENTER
+            cap.paragraph_format.space_after = Pt(6)
+            if label:
+                r1 = cap.add_run(label)
+                r1.bold = True
+                r1.italic = True
+                r1.font.size = Pt(9)
+                r1.font.color.rgb = MUTED
+            if label and caption:
+                r2 = cap.add_run(" — ")
+                r2.italic = True
+                r2.font.size = Pt(9)
+                r2.font.color.rgb = MUTED
+            if caption:
+                r3 = cap.add_run(caption)
+                r3.italic = True
+                r3.font.size = Pt(9)
+                r3.font.color.rgb = MUTED
 
     def to_bytes(self) -> bytes:
         buf = io.BytesIO()
@@ -714,4 +864,158 @@ def build_theory_docx(
         for blk in blocks:
             _render_theory_block(b, blk, title_key, last_sub)
         b.section_gap()
+    return b.to_bytes()
+
+
+# ---------------------------------------------------------------------------
+# Final Draft rendering — Phase 3 Composer output
+# ---------------------------------------------------------------------------
+# Walks the FinalDraft.items ordered list and routes each item to the
+# right _DocBuilder method, reusing the polished formatting that
+# build_theory_docx + build_questions_docx use:
+#   - Section headings styled consistently
+#   - Theory blocks (p/h3/eq/def/kp/list/table/example) routed through
+#     _render_theory_block so paragraphs, equations, key-points, lists,
+#     tables, and worked-examples all look identical to the standalone
+#     theory export.
+#   - Questions routed through _render_question so MCQs split options,
+#     solutions get the right typography, embedded figures embed as
+#     images via the new _DocBuilder.image method.
+#   - Figures embed binaries (not text callouts) at section level.
+#   - Custom text blocks render as plain paragraphs.
+
+def _render_paragraph_with_tables(b: _DocBuilder, text: str) -> None:
+    """Render a paragraph that MAY contain embedded pipe-tables. Splits
+    on the table markers via `_extract_tables_from_text` so each table
+    becomes a real Word table; surrounding prose becomes plain paragraphs.
+    Used for `p` blocks (which often carry OCR'd value-tables inline)."""
+    if not text or not text.strip():
+        return
+    chunks = list(_extract_tables_from_text(text.strip()))
+    if not any(k == "table" for k, _ in chunks):
+        b.paragraph(text.strip())
+        return
+    for kind, payload in chunks:
+        if kind == "text":
+            if payload.strip():
+                b.paragraph(payload.strip())
+        else:  # table
+            headers, rows = payload
+            b.table(headers, rows)
+
+
+def _render_block_item(b: _DocBuilder, block: dict[str, Any],
+                       title_key: str, last_sub: list[str]) -> None:
+    """Like _render_theory_block but tolerates the v2 block types the
+    Composer might receive (kp / def / *_ref). Also extracts inline
+    pipe-tables from `p` blocks so they render as real Word tables."""
+    t = block.get("t")
+    if t == "p":
+        _render_paragraph_with_tables(b, block.get("c") or "")
+        return
+    if t == "def":
+        # Definition: term in bold, body underneath
+        term = (block.get("term") or "").strip()
+        body = (block.get("c") or "").strip()
+        if term:
+            b.sub_heading(f"Definition — {term}")
+        if body:
+            b.paragraph(body, left_indent_cm=0.4)
+        return
+    if t in ("example_ref", "exercise_ref", "question_ref"):
+        # In a final-merged doc these should usually have been dropped by
+        # the chip↔question dedup. If one slips through, render as a small
+        # italic pointer so the user can spot it and remove via Composer.
+        kind = {
+            "example_ref": "Worked example",
+            "exercise_ref": "Exercise",
+            "question_ref": "Question",
+        }[t]
+        label = block.get("label") or block.get("number") or ""
+        p = b.doc.add_paragraph()
+        r = p.add_run(f"→ {kind}: {label}")
+        r.italic = True
+        r.font.size = Pt(9)
+        r.font.color.rgb = MUTED
+        return
+    # Delegate to the existing theory renderer for the standard types
+    _render_theory_block(b, block, title_key, last_sub)
+
+
+def _render_custom_text(b: _DocBuilder, content: str) -> None:
+    """Render a user-added custom_text item. Splits on blank lines so
+    each paragraph is its own block. Inline markdown ($math$, bold) is
+    handled by _render_inline which mirrors what paragraphs use."""
+    if not content:
+        return
+    for chunk in re.split(r"\n\s*\n", content.strip()):
+        chunk = chunk.strip()
+        if not chunk:
+            continue
+        p = b.doc.add_paragraph()
+        p.paragraph_format.space_after = Pt(6)
+        _render_inline(p, chunk)
+
+
+def build_final_draft_docx(
+    book_title: str,
+    items: list[dict[str, Any]],
+    figure_bytes_map: dict[str, bytes],
+) -> bytes:
+    """Walk the FinalDraft items list and render a polished Word doc.
+
+    ``figure_bytes_map`` is keyed by figure_id (str). The caller is
+    responsible for materialising the image bytes (variant=regen if
+    approved, else original) before invoking this function so this
+    module stays sync-only.
+    """
+    b = _DocBuilder()
+    b.title(book_title or "Final Draft")
+
+    current_section_key = ""
+    last_sub = [""]
+    for it in items:
+        t = it.get("type")
+        if t == "section_heading":
+            title = (it.get("title") or it.get("section_id") or "").strip()
+            # Use section_heading for ALL section items so the typography
+            # matches the theory/questions exports (13pt NAVY, normal-case,
+            # consistent spacing). The composer's level field is positional
+            # info; the visual style stays uniform — Word handles outline
+            # hierarchy via paragraph styles, not size escalation.
+            b.section_heading(title)
+            current_section_key = _norm(title)
+            last_sub = [""]
+            continue
+        if t == "block":
+            _render_block_item(b, it.get("block") or {}, current_section_key, last_sub)
+            continue
+        if t == "figure":
+            f = it.get("figure") or {}
+            fid = str(f.get("figure_id") or "")
+            data = figure_bytes_map.get(fid)
+            if data:
+                b.image(data, label=f.get("label") or "", caption=f.get("caption") or "")
+            else:
+                b.figure_callout(f.get("label") or "image", f.get("caption") or "")
+            continue
+        if t == "question":
+            q = dict(it.get("question") or {})
+            # Embed any question-attached figures right after the prompt
+            # so they live with the question card in the output. We do
+            # this by injecting them inline via _DocBuilder.image after
+            # _render_question runs.
+            _render_question(b, q)
+            for f in q.get("embedded_figures") or []:
+                fid = str(f.get("figure_id") or "")
+                data = figure_bytes_map.get(fid)
+                if data:
+                    b.image(data, label=f.get("label") or "", caption=f.get("caption") or "")
+                else:
+                    b.figure_callout(f.get("label") or "image", f.get("caption") or "")
+            continue
+        if t == "custom_text":
+            _render_custom_text(b, it.get("content") or "")
+            continue
+        # Unknown item type → ignore silently
     return b.to_bytes()

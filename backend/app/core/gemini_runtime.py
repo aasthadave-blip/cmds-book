@@ -242,3 +242,71 @@ def call_gemini_text_only(
 
     assert last_exc is not None
     raise last_exc
+
+
+def call_gemini_text_with_images(
+    *,
+    system_prompt: str,
+    user_prompt: str,
+    image_bytes_list: list[tuple[bytes, str]],
+    model: str = "gemini-2.5-pro",
+    timeout_s: int = DEFAULT_TIMEOUT_S,
+    max_output_tokens: int = 32768,
+    temperature: float = 0.4,
+    response_mime_type: str = "application/json",
+) -> str:
+    """Call Gemini with text + one or more inline images (no PDF upload).
+
+    Used by Phase 4 multimodal question regeneration: send the source
+    question text alongside its attached figure image(s) so the LLM can
+    decide whether the image needs regeneration after producing the new
+    question text.
+
+    ``image_bytes_list``: list of (raw_bytes, mime_type) pairs. mime_type
+    is usually "image/png" or "image/jpeg".
+
+    Same retry + concurrency semantics as the other call_gemini_* helpers.
+    """
+    from google.genai import types as gtypes
+
+    last_exc: BaseException | None = None
+    for attempt in range(RETRY_ATTEMPTS + 1):
+        with _inflight_sem:
+            client = _build_client(timeout_s)
+            try:
+                parts: list[Any] = []
+                # Each image is sent inline (no upload). For typical figure
+                # binaries (<2MB each) this fits within Gemini's input limit.
+                for img_bytes, mime in image_bytes_list:
+                    parts.append(
+                        gtypes.Part.from_bytes(
+                            data=img_bytes,
+                            mime_type=mime,
+                        )
+                    )
+                parts.append(system_prompt + "\n\n" + user_prompt)
+                response = client.models.generate_content(
+                    model=model,
+                    contents=parts,
+                    config=gtypes.GenerateContentConfig(
+                        response_mime_type=response_mime_type,
+                        temperature=temperature,
+                        max_output_tokens=max_output_tokens,
+                    ),
+                )
+                return response.text or ""
+            except Exception as e:
+                last_exc = e
+                if attempt < RETRY_ATTEMPTS and _is_transient(e):
+                    backoff = _BACKOFF_BASE_S * (2 ** attempt)
+                    backoff += random.uniform(0, backoff * 0.25)
+                    logger.warning(
+                        "Gemini (text+images) transient error (attempt %s/%s): %s — retrying in %.1fs",
+                        attempt + 1, RETRY_ATTEMPTS + 1, e, backoff,
+                    )
+                    time.sleep(backoff)
+                    continue
+                raise
+
+    assert last_exc is not None
+    raise last_exc

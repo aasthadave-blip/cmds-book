@@ -268,6 +268,16 @@ async def patch_schema(
         _logging.getLogger(__name__).warning(
             "post-patch chip relink failed (book=%s): %s", book.id, e,
         )
+    # Re-run figure embedder too — schema edits can move a figure's
+    # parent section, so placement metadata needs to be recomputed.
+    try:
+        from app.services.figure_embedder import embed_figures_for_book
+        await embed_figures_for_book(session, book.id)
+    except Exception as e:
+        import logging as _logging
+        _logging.getLogger(__name__).warning(
+            "post-patch figure embedder failed (book=%s): %s", book.id, e,
+        )
     # Ensure all attributes are loaded inside the async context — otherwise
     # Pydantic's from_attributes=True serialization in `from_orm_book` /
     # response_model can trigger lazy IO during the response phase →

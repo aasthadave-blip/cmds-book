@@ -102,6 +102,15 @@ class Settings(BaseSettings):
     # theory extractor; one Gemini call per schema section). Default v3.
     QUESTION_WORKER_VERSION: Literal["v2", "v3"] = "v3"
 
+    # Phase 4 — multimodal question regen for questions with embedded images.
+    # When ON: the regen call passes image bytes + DECISION RULE prompt; the
+    # LLM also returns image_needs_regen verdict. When verdict=true, a figure
+    # regeneration job is auto-enqueued using the new question as guidance.
+    # Set FALSE to revert to text-only regen for ALL questions (rollback).
+    # Only affects regen of image-bearing questions; text-only question
+    # regen is identical regardless of this flag.
+    MULTIMODAL_REGEN_ENABLED: bool = True
+
     # Multi-OCR (Sprint 4; empty by default)
     MATHPIX_APP_ID: str = ""
     MATHPIX_APP_KEY: str = ""

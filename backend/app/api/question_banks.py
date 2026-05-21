@@ -122,6 +122,16 @@ def _bank_dict(bank: QuestionBank, question_count: int = 0) -> dict:
 
 
 def _question_dict(q: Question) -> dict:
+    # Phase 4 — surface the multimodal regen verdict if present so the
+    # frontend can show a "⚠ figure needs regen" hint per regen variant.
+    image_regen_hint = None
+    if isinstance(q.qc_local, dict):
+        ir = q.qc_local.get("image_regen")
+        if isinstance(ir, dict) and ir.get("needed"):
+            image_regen_hint = {
+                "needed": True,
+                "reason": ir.get("reason") or "",
+            }
     return {
         "id": str(q.id),
         "section_ref": q.section_ref,
@@ -146,6 +156,8 @@ def _question_dict(q: Question) -> dict:
         "has_solution": q.has_solution,
         "kind": q.kind or "exercise",
         "is_hidden": bool(q.is_hidden),
+        # Phase 4 — present only when regen LLM flagged image_needs_regen=true
+        "image_regen_hint": image_regen_hint,
     }
 
 
@@ -528,6 +540,61 @@ async def link_examples(
     return await link_examples_to_theory(session, bank.book_id)
 
 
+async def _load_question_embedded_figures(
+    session: AsyncSession,
+    book_id: UUID,
+) -> dict[str, list[dict]]:
+    """Build {question_id_str: [figure_dict, ...]} for question-context
+    figure_references on this book. Variant choice: regen-if-approved
+    else original.
+    """
+    from app.models.figure import Figure
+    from app.models.figure_reference import FigureReference
+
+    refs = (
+        await session.execute(
+            select(FigureReference)
+            .where(FigureReference.book_id == book_id)
+            .where(FigureReference.context == "question")
+            .where(FigureReference.is_hidden.is_(False))
+            .where(FigureReference.placement_kind != "unattached")
+        )
+    ).scalars().all()
+    if not refs:
+        return {}
+    fig_ids = {r.figure_id for r in refs}
+    figs = (
+        await session.execute(
+            select(Figure).where(Figure.id.in_(fig_ids))
+        )
+    ).scalars().all()
+    fig_by_id = {f.id: f for f in figs}
+
+    out: dict[str, list[dict]] = {}
+    for r in refs:
+        if r.question_id is None:
+            continue
+        f = fig_by_id.get(r.figure_id)
+        if f is None:
+            continue
+        variant = "regen" if (f.regen_image_bytes and f.approved_at) else "original"
+        out.setdefault(str(r.question_id), []).append({
+            "ref_id": str(r.id),
+            "figure_id": str(f.id),
+            "label": f.figure_number or r.placeholder_text or "",
+            "caption": f.caption or "",
+            "variant": variant,
+            "image_url": f"/api/figures/{f.id}/image?variant=auto",
+            "placement_kind": r.placement_kind or "appended",
+            "placement_char_offset": r.placement_char_offset,
+        })
+    for k, lst in out.items():
+        lst.sort(key=lambda d: (
+            d.get("placement_char_offset") if d.get("placement_char_offset") is not None else 10**9
+        ))
+    return out
+
+
 @banks_router.get("/{bank_id}/questions")
 async def list_questions(
     bank_id: UUID,
@@ -551,6 +618,9 @@ async def list_questions(
     )
     questions = result.scalars().all()
 
+    # Phase 1: pre-load embedded figures per question
+    embedded_q_figures = await _load_question_embedded_figures(session, bank.book_id)
+
     # group by section_ref, preserving schema order if available
     book = await session.get(Book, bank.book_id)
     order: list[str] = []
@@ -568,7 +638,10 @@ async def list_questions(
 
     grouped: dict[str, list[dict]] = {sid: [] for sid in order}
     for q in questions:
-        grouped.setdefault(q.section_ref, []).append(_question_dict(q))
+        qd = _question_dict(q)
+        # Phase 1 figure embedder — attach figures for this question
+        qd["embedded_figures"] = embedded_q_figures.get(str(q.id), [])
+        grouped.setdefault(q.section_ref, []).append(qd)
 
     # Pending rejected items per section (status='pending' only — restored/discarded hidden)
     rej_result = await session.execute(

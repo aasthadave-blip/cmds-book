@@ -8,6 +8,9 @@ import { RegenPage } from "./pages/RegenPage";
 import { SettingsPage } from "./pages/SettingsPage";
 import { QuestionsPage } from "./pages/QuestionsPage";
 import { FiguresPage } from "./pages/FiguresPage";
+import { FinalComposerPage } from "./pages/FinalComposerPage";
+import { FinalMergePage } from "./pages/FinalMergePage";
+import { FinalPreviewPage } from "./pages/FinalPreviewPage";
 import { useUI } from "./stores/ui";
 
 export default function App() {
@@ -25,6 +28,9 @@ export default function App() {
         {view === "settings" && <SettingsPage />}
         {view === "questions" && <QuestionsPage />}
         {view === "images" && <FiguresPage />}
+        {view === "final" && <FinalMergePage />}
+        {view === "compose" && <FinalComposerPage />}
+        {view === "preview" && <FinalPreviewPage />}
       </main>
     </div>
   );

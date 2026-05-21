@@ -32,8 +32,13 @@ from sqlalchemy import create_engine, delete, select
 from sqlalchemy.orm import Session, sessionmaker
 
 from app.core.config import settings
-from app.core.gemini_runtime import call_gemini_text_only
+from app.core.gemini_runtime import (
+    call_gemini_text_only,
+    call_gemini_text_with_images,
+)
 from app.core.heartbeat import Heartbeat
+from app.models.figure import Figure
+from app.models.figure_reference import FigureReference
 from app.models.book import Book
 from app.models.job import Job
 from app.models.question import Question
@@ -242,6 +247,53 @@ def _build_user_prompt(
     return "\n".join(parts)
 
 
+def _load_source_image_bytes(
+    session: Session,
+    book_id: UUID,
+    question_id: UUID,
+) -> list[tuple[bytes, str]]:
+    """Phase 4 — fetch image bytes for any figures attached to this
+    question via figure_references. Returns [(bytes, mime), ...]. Empty
+    when no images attached or none have stored bytes.
+
+    Variant choice mirrors the embedder's rule: regen variant if approved,
+    else original. Only includes references with placement_kind != hidden
+    and placement_kind != unattached.
+    """
+    refs = (
+        session.execute(
+            select(FigureReference)
+            .where(FigureReference.book_id == book_id)
+            .where(FigureReference.question_id == question_id)
+            .where(FigureReference.context == "question")
+            .where(FigureReference.is_hidden.is_(False))
+            .where(FigureReference.placement_kind != "unattached")
+        )
+        .scalars()
+        .all()
+    )
+    if not refs:
+        return []
+    fig_ids = {r.figure_id for r in refs}
+    figs = (
+        session.execute(select(Figure).where(Figure.id.in_(fig_ids)))
+        .scalars()
+        .all()
+    )
+    out: list[tuple[bytes, str]] = []
+    for f in figs:
+        data = (
+            f.regen_image_bytes
+            if (f.regen_image_bytes and f.approved_at is not None)
+            else f.image_bytes
+        )
+        if not data:
+            continue
+        mime = f.mime_type or "image/png"
+        out.append((data, mime))
+    return out
+
+
 async def _regen_one_source(
     source: Question,
     *,
@@ -255,8 +307,19 @@ async def _regen_one_source(
     chapter: str | None,
     grade: str | None,
     board: str | None,
+    image_bytes_list: list[tuple[bytes, str]] | None = None,
+    image_addendum_prompt: str | None = None,
 ) -> dict[str, Any]:
     """Single Gemini call to regenerate `count` variants from `source`.
+
+    PHASE 4 — multimodal branch:
+      When ``image_bytes_list`` is non-empty AND ``settings.MULTIMODAL_REGEN_ENABLED``
+      is True, the call goes through ``call_gemini_text_with_images`` on Pro
+      with the image_addendum appended to the system prompt. Each returned
+      regen item then carries ``image_needs_regen`` + ``image_regen_reason``
+      fields used downstream to optionally chain a figure regeneration.
+
+      Otherwise the existing text-only Flash path runs (unchanged behaviour).
 
     Returns:
         {"ok": bool, "items": [<regen dict>...], "notes": str, "error": str}
@@ -274,16 +337,39 @@ async def _regen_one_source(
         board=board,
     )
 
+    # Decide path
+    use_multimodal = bool(
+        image_bytes_list
+        and settings.MULTIMODAL_REGEN_ENABLED
+    )
+
     try:
-        raw = await asyncio.to_thread(
-            call_gemini_text_only,
-            system_prompt=system_prompt,
-            user_prompt=user_prompt,
-            model=GEMINI_MODEL,
-            timeout_s=GEMINI_TIMEOUT_S,
-            max_output_tokens=MAX_OUTPUT_TOKENS,
-            temperature=0.4,
-        )
+        if use_multimodal:
+            # Append the image-addendum rules to the standard system prompt
+            full_system = system_prompt
+            if image_addendum_prompt:
+                full_system = system_prompt + "\n\n" + image_addendum_prompt
+            raw = await asyncio.to_thread(
+                call_gemini_text_with_images,
+                system_prompt=full_system,
+                user_prompt=user_prompt,
+                image_bytes_list=image_bytes_list,
+                # Pro for multimodal — better visual reasoning than Flash
+                model="gemini-2.5-pro",
+                timeout_s=GEMINI_TIMEOUT_S,
+                max_output_tokens=MAX_OUTPUT_TOKENS,
+                temperature=0.4,
+            )
+        else:
+            raw = await asyncio.to_thread(
+                call_gemini_text_only,
+                system_prompt=system_prompt,
+                user_prompt=user_prompt,
+                model=GEMINI_MODEL,
+                timeout_s=GEMINI_TIMEOUT_S,
+                max_output_tokens=MAX_OUTPUT_TOKENS,
+                temperature=0.4,
+            )
         data = parse_json(raw)
         if not isinstance(data, dict):
             return {"ok": False, "items": [], "notes": "",
@@ -293,11 +379,17 @@ async def _regen_one_source(
         # Keep only items that have a non-empty question string.
         items = [it for it in items if isinstance(it, dict)
                  and (it.get("question") or "").strip()]
+        # Normalise the multimodal-only fields so they always exist downstream
+        for it in items:
+            if "image_needs_regen" not in it:
+                it["image_needs_regen"] = False
+            if "image_regen_reason" not in it:
+                it["image_regen_reason"] = ""
         return {"ok": True, "items": items, "notes": notes, "error": ""}
     except Exception as e:
         logger.warning(
-            "regen-v3 single-source call failed (q=%s): %s",
-            source.id, e,
+            "regen-v3 single-source call failed (q=%s, multimodal=%s): %s",
+            source.id, use_multimodal, e,
         )
         return {"ok": False, "items": [], "notes": "", "error": str(e)}
 
@@ -316,47 +408,64 @@ def _persist_regen_items(
       the worker's known state (source row + regen row). NEVER from the
       Gemini item dict. Item-level fields (question, answer, etc.) are
       model-supplied. The section anchor is owned by the worker.
+
+    PHASE 4 — multimodal regen:
+      Each regen question INHERITS figure_references from the source
+      (same images attached at same offsets). When item carries
+      ``image_needs_regen=true``, the verdict + reason is also stored
+      under qc_local["image_regen"] so the frontend can surface a
+      "⚠ Figure needs regen" hint on that variant.
     """
+    # Pre-load source figure_references once — we'll copy them per regen row
+    source_refs = (
+        session.execute(
+            select(FigureReference)
+            .where(FigureReference.question_id == source.id)
+            .where(FigureReference.context == "question")
+        )
+        .scalars()
+        .all()
+    )
+
     inserted = 0
     for it in items:
         text = (it.get("question") or "").strip()
         if not text:
             continue
         answer = (it.get("answer") or "").strip() or None
-        # Structure-mirroring (prompt Rule 8): the model returns `solution`
-        # only when the source had a printed solution, `answer` only when
-        # the source had an inline answer key. Prefer `solution` for
-        # solution_text; fall back to `answer` so older prompt outputs
-        # without the new field still produce sensible behaviour. If the
-        # SOURCE had neither, the model returns both empty → regen also
-        # has empty solution_text / has_solution=False.
+        # Structure-mirroring (prompt Rule 8) — see comments above
         solution = (it.get("solution") or "").strip() or None
         solution_text = solution or answer
-        # Decide has_solution by mirroring the source — the prompt is
-        # instructed to leave fields empty when the source lacks them,
-        # so an empty solution_text here means "source didn't have one".
         has_solution = bool(solution_text) and bool(source.has_solution)
-        # Same idea for options: if source isn't an MCQ, regen variants
-        # shouldn't claim has_options either.
         model_says_options = bool(it.get("options"))
         has_options = model_says_options and bool(source.has_options)
         q_type = (it.get("question_type") or source.question_type or "").strip() or None
         kind = _map_question_type_to_kind(q_type)
 
+        # Phase 4 — capture multimodal verdict in qc_local
+        qc_local: dict[str, Any] = {
+            "pass": True, "score": 1.0, "failures": [],
+        }
+        if it.get("image_needs_regen") is True:
+            qc_local["image_regen"] = {
+                "needed": True,
+                "reason": (it.get("image_regen_reason") or "").strip(),
+            }
+
         row = Question(
-            bank_id=regen.bank_id,           # worker-known
-            book_id=regen.book_id,           # worker-known
-            regen_id=regen.id,               # GENERATED flag
-            source_question_id=source.id,    # 0014 — point back to source
-            section_ref=source.section_ref,  # Q4 rule — from source, never model
+            bank_id=regen.bank_id,
+            book_id=regen.book_id,
+            regen_id=regen.id,
+            source_question_id=source.id,
+            section_ref=source.section_ref,
             section_title=source.section_title,
             page_start=source.page_start,
             page_end=source.page_end,
             raw_text=text,
-            qc_local={"pass": True, "score": 1.0, "failures": []},
+            qc_local=qc_local,
             attempts=1,
             status="passed",
-            question_number=None,            # regen items have no printed q_no
+            question_number=None,
             exercise_ref=source.exercise_ref,
             chapter_ref=source.chapter_ref,
             kind=kind,
@@ -368,6 +477,29 @@ def _persist_regen_items(
             qc_status="pending",
         )
         session.add(row)
+        session.flush()  # need row.id for figure_references copy
+
+        # Inherit figure_references from source (same images, new
+        # question_id). The Composer / Final view will see them attached
+        # via the regen question's id. If image_needs_regen=true, the
+        # frontend uses qc_local.image_regen to show a hint; the user can
+        # manually trigger figure regen via the existing 🔁 Regenerate
+        # touchpoint on the Figures page.
+        for sref in source_refs:
+            new_ref = FigureReference(
+                book_id=sref.book_id,
+                figure_id=sref.figure_id,
+                section_ref=sref.section_ref,
+                context="question",
+                question_id=row.id,
+                placeholder_text=sref.placeholder_text,
+                link_method="auto",
+                placement_kind=sref.placement_kind,
+                placement_block_idx=sref.placement_block_idx,
+                placement_char_offset=sref.placement_char_offset,
+            )
+            session.add(new_ref)
+
         inserted += 1
     session.commit()
     return inserted
@@ -415,6 +547,7 @@ async def _run_regen_v3(regen_id: UUID, job_id: UUID) -> dict[str, Any]:
         grade = getattr(book, "grade_level", None) or None
         board = getattr(book, "board", None) or None
         bank_id = bank.id
+        book_id_snapshot = regen.book_id
         regen.status = "extracting"
         regen.last_error = None
         session.commit()
@@ -480,6 +613,15 @@ async def _run_regen_v3(regen_id: UUID, job_id: UUID) -> dict[str, Any]:
         session.commit()
 
         system_prompt = load_raw("question_regenerator_v3")
+        # Phase 4 — optional multimodal addendum prompt. Loaded once here
+        # and conditionally appended per source by _regen_one_source when
+        # the source has attached images AND MULTIMODAL_REGEN_ENABLED.
+        try:
+            image_addendum_prompt: str | None = load_raw(
+                "question_regenerator_v3_image_addendum"
+            )
+        except Exception:
+            image_addendum_prompt = None
 
         _update_job(
             session, job_id,
@@ -511,6 +653,15 @@ async def _run_regen_v3(regen_id: UUID, job_id: UUID) -> dict[str, Any]:
                 "exercise_ref": source.exercise_ref,
                 "chapter_ref": source.chapter_ref,
             }
+            src_book_id = source.book_id
+            # Phase 4 — load image bytes if multimodal feature is on. Cheap
+            # if the question has no attached figures (empty list).
+            if settings.MULTIMODAL_REGEN_ENABLED:
+                image_bytes_list = _load_source_image_bytes(
+                    own, src_book_id, qid,
+                )
+            else:
+                image_bytes_list = []
         # Build a transient Question-like object for prompt building. Easiest:
         # use a tiny attribute holder rather than instantiating ORM detached.
         class _SrcView:
@@ -532,6 +683,8 @@ async def _run_regen_v3(regen_id: UUID, job_id: UUID) -> dict[str, Any]:
             chapter=cached.get("section_title") or None,
             grade=grade,
             board=board,
+            image_bytes_list=image_bytes_list or None,
+            image_addendum_prompt=image_addendum_prompt,
         )
         # Persist within a fresh session.
         if result.get("ok") and result.get("items"):
@@ -583,6 +736,19 @@ async def _run_regen_v3(regen_id: UUID, job_id: UUID) -> dict[str, Any]:
                             message=f"Regen {done}/{total_sources} sources — "
                                     f"{total_generated} generated, "
                                     f"{total_failed} failed")
+
+    # Post-regen embedder pass: regenerated variants get fresh
+    # FigureReference rows materialized against their own raw_text +
+    # solution_text. Without this, variants that reference a figure only
+    # in their solution would never have it attached, so the
+    # image_regen_hint badge wouldn't surface on the Final/Preview cards.
+    try:
+        from app.services.figure_embedder import embed_figures_for_book_sync
+        with SyncSession() as own:
+            embed_counters = embed_figures_for_book_sync(own, book_id_snapshot)
+            logger.info("post-regen embed: %s", embed_counters)
+    except Exception as e:
+        logger.warning("post-regen embed failed: %s", e)
 
     # Final stats + status.
     sections_report: list[dict[str, Any]] = []
@@ -687,6 +853,7 @@ async def _run_regen_one_section_v3(
         grade = getattr(book, "grade_level", None) or None
         board = getattr(book, "board", None) or None
         bank_id = bank.id
+        book_id_snapshot = regen.book_id
 
         # Wipe ONLY this section's regen rows. Other sections preserved.
         session.execute(
@@ -716,6 +883,12 @@ async def _run_regen_one_section_v3(
 
         total_sources = len(source_qs)
         system_prompt = load_raw("question_regenerator_v3")
+        try:
+            image_addendum_prompt: str | None = load_raw(
+                "question_regenerator_v3_image_addendum"
+            )
+        except Exception:
+            image_addendum_prompt = None
         source_ids = [q.id for q in source_qs]
 
         _update_job(
@@ -745,6 +918,13 @@ async def _run_regen_one_section_v3(
                 "exercise_ref": source.exercise_ref,
                 "chapter_ref": source.chapter_ref,
             }
+            src_book_id = source.book_id
+            if settings.MULTIMODAL_REGEN_ENABLED:
+                image_bytes_list = _load_source_image_bytes(
+                    own, src_book_id, qid,
+                )
+            else:
+                image_bytes_list = []
 
         class _SrcView:
             pass
@@ -765,6 +945,8 @@ async def _run_regen_one_section_v3(
             chapter=cached.get("section_title") or None,
             grade=grade,
             board=board,
+            image_bytes_list=image_bytes_list or None,
+            image_addendum_prompt=image_addendum_prompt,
         )
         if result.get("ok") and result.get("items"):
             with SyncSession() as own:
@@ -799,6 +981,16 @@ async def _run_regen_one_section_v3(
                 _update_job(own, job_id, progress=progress,
                             message=f"Section retry {done}/{total_sources} — "
                                     f"{total_generated} generated")
+
+    # Post-regen embedder pass — mirror the full-regen path so section
+    # retries also get figures attached to newly created variants.
+    try:
+        from app.services.figure_embedder import embed_figures_for_book_sync
+        with SyncSession() as own:
+            embed_counters = embed_figures_for_book_sync(own, book_id_snapshot)
+            logger.info("post-section-regen embed: %s", embed_counters)
+    except Exception as e:
+        logger.warning("post-section-regen embed failed: %s", e)
 
     # Merge this section's report into the regen's extraction_stats without
     # touching other sections. If extraction_stats is missing, build minimal.

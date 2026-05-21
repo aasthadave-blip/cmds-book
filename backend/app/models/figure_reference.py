@@ -54,3 +54,24 @@ class FigureReference(Base):
     created_at: Mapped[datetime] = mapped_column(
         DateTime(timezone=True), server_default=func.now(), nullable=False,
     )
+    # Phase 1 figure-embedder placement (migration 0017). Populated by
+    # the deterministic figure_embedder service. See migration docstring.
+    placement_kind: Mapped[str | None] = mapped_column(
+        sa.String(32), nullable=True,
+    )
+    placement_block_idx: Mapped[int | None] = mapped_column(
+        sa.Integer, nullable=True,
+    )
+    placement_char_offset: Mapped[int | None] = mapped_column(
+        sa.Integer, nullable=True,
+    )
+    # User can click ✕ on a rendered figure to suppress it at this spot.
+    # Migration 0018. Hidden refs are excluded from theory / question
+    # render responses and from final-merge exports. The figure itself
+    # stays in the figures table — only THIS placement is suppressed.
+    is_hidden: Mapped[bool] = mapped_column(
+        sa.Boolean(),
+        nullable=False,
+        default=False,
+        server_default=sa.text("0"),
+    )

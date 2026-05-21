@@ -1105,6 +1105,20 @@ def extract_questions_v2_task(self, book_id: str, job_id: str) -> dict:
             bank.status = "ready"
             session.commit()
 
+            # Auto-embed figures now that questions exist (v2 path).
+            try:
+                from app.services.figure_embedder import embed_figures_for_book_sync
+                embed_counters = embed_figures_for_book_sync(session, bank.book_id)
+                logger.info(
+                    "[embed] post-questions-v2 book=%s %s",
+                    bank.book_id, embed_counters,
+                )
+            except Exception as e:
+                logger.warning(
+                    "figure_embedder failed post-questions-v2 (book=%s): %s",
+                    bank.book_id, e,
+                )
+
             totals = bank.extraction_stats or {}
             partial_n = int(totals.get("partial_blocks", 0))
             failed_n = int(totals.get("failed_blocks", 0))

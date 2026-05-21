@@ -424,6 +424,14 @@ async def approve_section_figures(
         else:
             skipped += 1
     await session.commit()
+    # Re-run figure embedder — approval flips which variant is surfaced
+    # by the renderer. Non-fatal.
+    try:
+        from app.services.figure_embedder import embed_figures_for_book
+        await embed_figures_for_book(session, book_id)
+        await session.commit()
+    except Exception as e:
+        logger.warning("figure_embedder after approve failed: %s", e)
     return {
         "section_ref": section_ref,
         "approved": approved,
@@ -456,6 +464,12 @@ async def unapprove_section_figures(
             f.approved_at = None
             cleared += 1
     await session.commit()
+    try:
+        from app.services.figure_embedder import embed_figures_for_book
+        await embed_figures_for_book(session, book_id)
+        await session.commit()
+    except Exception as e:
+        logger.warning("figure_embedder after unapprove failed: %s", e)
     return {"section_ref": section_ref, "unapproved": cleared}
 
 
@@ -478,6 +492,12 @@ async def approve_one_figure(
         )
     f.approved_at = datetime.utcnow()
     await session.commit()
+    try:
+        from app.services.figure_embedder import embed_figures_for_book
+        await embed_figures_for_book(session, f.book_id)
+        await session.commit()
+    except Exception as e:
+        logger.warning("figure_embedder after one-approve failed: %s", e)
     return {
         "figure_id": str(figure_id),
         "approved_at": f.approved_at.isoformat(),
@@ -495,7 +515,128 @@ async def unapprove_one_figure(
         raise HTTPException(404, detail="Figure not found")
     f.approved_at = None
     await session.commit()
+    try:
+        from app.services.figure_embedder import embed_figures_for_book
+        await embed_figures_for_book(session, f.book_id)
+        await session.commit()
+    except Exception as e:
+        logger.warning("figure_embedder after one-unapprove failed: %s", e)
     return {"figure_id": str(figure_id), "status": "unapproved"}
+
+
+# ---------------------------------------------------------------------------
+# Per-ref hide / unhide — Phase 1, point 3.
+# When the user clicks ✕ on an embedded figure in Theory or Questions, we
+# flip is_hidden on that figure_reference row. Hidden refs are excluded
+# from all render responses and from final-merge exports. The Figure
+# itself is untouched — only this placement is suppressed.
+# ---------------------------------------------------------------------------
+
+@books_router.post("/figure-references/{ref_id}/hide", status_code=status.HTTP_200_OK)
+async def hide_figure_reference(
+    ref_id: UUID,
+    session: AsyncSession = Depends(get_session),
+) -> dict:
+    ref = await session.get(FigureReference, ref_id)
+    if ref is None:
+        raise HTTPException(404, detail="FigureReference not found")
+    ref.is_hidden = True
+    await session.commit()
+    return {"ref_id": str(ref_id), "is_hidden": True}
+
+
+@books_router.post("/figure-references/{ref_id}/unhide", status_code=status.HTTP_200_OK)
+async def unhide_figure_reference(
+    ref_id: UUID,
+    session: AsyncSession = Depends(get_session),
+) -> dict:
+    ref = await session.get(FigureReference, ref_id)
+    if ref is None:
+        raise HTTPException(404, detail="FigureReference not found")
+    ref.is_hidden = False
+    await session.commit()
+    return {"ref_id": str(ref_id), "is_hidden": False}
+
+
+# Hard-delete a figure reference. Used by the unattached panel's Delete CTA
+# when the user has decided this figure doesn't belong anywhere. The Figure
+# row itself is untouched — only the placement is removed. A subsequent
+# embedder run can recreate the reference if the figure still matches.
+@books_router.delete(
+    "/figure-references/{ref_id}", status_code=status.HTTP_200_OK
+)
+async def delete_figure_reference(
+    ref_id: UUID,
+    session: AsyncSession = Depends(get_session),
+) -> dict:
+    ref = await session.get(FigureReference, ref_id)
+    if ref is None:
+        raise HTTPException(404, detail="FigureReference not found")
+    await session.delete(ref)
+    await session.commit()
+    return {"ref_id": str(ref_id), "deleted": True}
+
+
+# Re-run the figure embedder on demand. Used after manual schema edits or
+# when the user wants to retry placement (e.g. after adding labels). The
+# embedder is idempotent and deterministic — safe to call any time.
+@books_router.post("/{book_id}/reembed-figures", status_code=status.HTTP_200_OK)
+async def reembed_figures(
+    book_id: UUID,
+    session: AsyncSession = Depends(get_session),
+) -> dict:
+    from app.services.figure_embedder import embed_figures_for_book
+    counters = await embed_figures_for_book(session, book_id)
+    return {"book_id": str(book_id), "counters": counters}
+
+
+# ---------------------------------------------------------------------------
+# GET /api/books/{book_id}/unattached-figures
+# Figures the embedder couldn't place (no theory match + no question
+# target). User reviews these in a dedicated tray; nothing is auto-dumped
+# into a random section. Phase 1, point 2.
+# ---------------------------------------------------------------------------
+
+@books_router.get("/{book_id}/unattached-figures")
+async def list_unattached_figures(
+    book_id: UUID,
+    session: AsyncSession = Depends(get_session),
+) -> dict:
+    refs = (
+        await session.execute(
+            select(FigureReference)
+            .where(FigureReference.book_id == book_id)
+            .where(FigureReference.placement_kind == "unattached")
+            .where(FigureReference.is_hidden.is_(False))
+        )
+    ).scalars().all()
+    if not refs:
+        return {"book_id": str(book_id), "figures": []}
+    fig_ids = {r.figure_id for r in refs}
+    figs = (
+        await session.execute(
+            select(Figure).where(Figure.id.in_(fig_ids))
+        )
+    ).scalars().all()
+    fig_by_id = {f.id: f for f in figs}
+    out = []
+    for r in refs:
+        f = fig_by_id.get(r.figure_id)
+        if f is None:
+            continue
+        variant = "regen" if (f.regen_image_bytes and f.approved_at) else "original"
+        out.append({
+            "ref_id": str(r.id),
+            "figure_id": str(f.id),
+            "label": f.figure_number or r.placeholder_text or "",
+            "caption": f.caption or "",
+            "variant": variant,
+            "image_url": f"/api/figures/{f.id}/image?variant=auto",
+            "context": r.context,
+            "section_ref": r.section_ref,
+            "page_number": f.page_number,
+        })
+    return {"book_id": str(book_id), "figures": out}
 
 
 # ---------------------------------------------------------------------------

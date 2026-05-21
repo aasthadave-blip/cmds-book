@@ -24,7 +24,7 @@ from app.utils.json_parse import parse_json
 logger = logging.getLogger(__name__)
 
 MAX_ATTEMPTS = 3
-GEMINI_MODEL = "gemini-2.5-pro"
+GEMINI_MODEL = "gemini-2.5-pro"  # Production. Flash was tested locally but missed sections — reverted to Pro for completeness.
 
 # Sub-retry policy for transient infra errors only (network blips, Gemini 5xx,
 # read timeouts). These DO NOT count against MAX_ATTEMPTS and do not change

@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+from typing import Any
 from uuid import UUID
 
 from fastapi import APIRouter, Depends, HTTPException
@@ -9,12 +10,71 @@ from sqlalchemy import select
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from app.core.db import get_session
+from app.models.figure import Figure
+from app.models.figure_reference import FigureReference
 from app.models.job import Job
 from app.models.section import Section
 from app.schemas.book import BookUploadResponse
 from app.schemas.section import SectionOut
 
 router = APIRouter(tags=["sections"])
+
+
+async def _load_embedded_figures(
+    session: AsyncSession,
+    book_id: UUID,
+) -> dict[str, list[dict[str, Any]]]:
+    """Build a {section_ref: [figure_dict, ...]} map for theory-context
+    figure_references on this book. Each figure_dict carries the data
+    the frontend needs to render the figure inline.
+
+    Variant is chosen per Q1 rule: regen if approved_at IS NOT NULL,
+    else original.
+    """
+    # Join figure_references → figures, theory context only,
+    # excluding hidden + unattached (those live in a separate tray).
+    refs = (
+        await session.execute(
+            select(FigureReference)
+            .where(FigureReference.book_id == book_id)
+            .where(FigureReference.context == "theory")
+            .where(FigureReference.is_hidden.is_(False))
+            .where(FigureReference.placement_kind != "unattached")
+        )
+    ).scalars().all()
+    if not refs:
+        return {}
+
+    fig_ids = {r.figure_id for r in refs}
+    figs = (
+        await session.execute(
+            select(Figure).where(Figure.id.in_(fig_ids))
+        )
+    ).scalars().all()
+    fig_by_id = {f.id: f for f in figs}
+
+    out: dict[str, list[dict[str, Any]]] = {}
+    for r in refs:
+        f = fig_by_id.get(r.figure_id)
+        if f is None:
+            continue
+        variant = "regen" if (f.regen_image_bytes and f.approved_at) else "original"
+        out.setdefault(r.section_ref, []).append({
+            "ref_id": str(r.id),               # needed for hide/unhide
+            "figure_id": str(f.id),
+            "label": f.figure_number or r.placeholder_text or "",
+            "caption": f.caption or "",
+            "variant": variant,
+            "image_url": f"/api/figures/{f.id}/image?variant=auto",
+            "placement_kind": r.placement_kind or "appended",
+            "placement_block_idx": r.placement_block_idx,
+        })
+    # Order each section's figures by placement_block_idx (None → end)
+    for k, lst in out.items():
+        lst.sort(key=lambda d: (
+            d.get("placement_block_idx") if d.get("placement_block_idx") is not None else 10**9
+        ))
+    return out
 
 
 @router.get("/api/books/{book_id}/sections", response_model=list[SectionOut])
@@ -25,7 +85,14 @@ async def list_sections(
     result = await session.execute(
         select(Section).where(Section.book_id == book_id).order_by(Section.section_id)
     )
-    return [SectionOut.model_validate(s) for s in result.scalars().all()]
+    secs = result.scalars().all()
+    embedded_by_section = await _load_embedded_figures(session, book_id)
+    out: list[SectionOut] = []
+    for s in secs:
+        d = SectionOut.model_validate(s)
+        d.embedded_figures = embedded_by_section.get(s.section_id, [])
+        out.append(d)
+    return out
 
 
 @router.get("/api/sections/{section_id}", response_model=SectionOut)
@@ -36,7 +103,11 @@ async def get_section(
     sec = await session.get(Section, section_id)
     if sec is None:
         raise HTTPException(404, detail="Section not found")
-    return SectionOut.model_validate(sec)
+    out = SectionOut.model_validate(sec)
+    # Phase 1 figure embedder — populate inline figures for this section
+    embedded_by_section = await _load_embedded_figures(session, sec.book_id)
+    out.embedded_figures = embedded_by_section.get(sec.section_id, [])
+    return out
 
 
 @router.post("/api/sections/{section_id}/re-extract", response_model=BookUploadResponse)

@@ -9,6 +9,7 @@ import {
   useQuestionBanks,
   useQuestions,
   useBookFigures,
+  useBookUnattachedFigures,
 } from "../api/hooks";
 import type {
   Section,
@@ -116,7 +117,9 @@ function shortStatus(s: string): string {
 function BookFolders({ bookId }: { bookId: string }) {
   const { data: regens } = useBookRegenerations(bookId);
   const { data: banks } = useQuestionBanks(bookId);
+  const { data: unattached } = useBookUnattachedFigures(bookId);
   const { bookLens, setBookLens, view, setView } = useUI();
+  const unattachedCount = unattached?.figures?.length ?? 0;
 
   const latestRegen = regens?.[0] ?? null;
   // Prefer the latest READY bank so the user sees results even if a retry
@@ -161,6 +164,36 @@ function BookFolders({ bookId }: { bookId: string }) {
       >
         <span>🗂</span>
         <span>Schema / Progress</span>
+      </button>
+      {/* Phase 3 — Compose Final Draft (top-level book action, separate from
+          the read-only lenses below). Drag-drop reorder, edit, remove,
+          add custom text. Auto-seeds from Final on first open. */}
+      <button
+        className={`sb-nav-btn ${view === "compose" ? "active" : ""}`}
+        onClick={() => setView("compose")}
+        style={{
+          width: "100%",
+          padding: "4px 8px",
+          marginBottom: 4,
+          fontSize: "0.7rem",
+          fontWeight: 600,
+          textAlign: "left",
+          border: "1px solid var(--b1)",
+          borderRadius: 5,
+          background:
+            view === "compose"
+              ? "var(--accent, #5b6cff)"
+              : "rgba(91,108,255,0.08)",
+          color: view === "compose" ? "#fff" : "var(--text1)",
+          cursor: "pointer",
+          display: "flex",
+          alignItems: "center",
+          gap: 6,
+        }}
+        title="Compose & export the final chapter — drag-drop reorder, edit, remove, add"
+      >
+        <span>🛠</span>
+        <span>Compose Final Draft</span>
       </button>
       {/* Lens toggle — Theory vs Questions */}
       <div
@@ -219,9 +252,42 @@ function BookFolders({ bookId }: { bookId: string }) {
             setView("images");
           }}
           style={lensBtnStyle(bookLens === "images")}
-          title="Images — extracted figures + regenerated variants"
+          title={
+            unattachedCount > 0
+              ? `Images — ${unattachedCount} unattached figure${unattachedCount === 1 ? "" : "s"} need review`
+              : "Images — extracted figures + regenerated variants"
+          }
         >
           🖼 Images
+          {unattachedCount > 0 && (
+            <span
+              style={{
+                marginLeft: 6,
+                display: "inline-block",
+                padding: "0 5px",
+                fontSize: "0.62rem",
+                fontWeight: 700,
+                borderRadius: 8,
+                background: "var(--red, #d33)",
+                color: "white",
+                lineHeight: "14px",
+                verticalAlign: "middle",
+              }}
+            >
+              ⚠ {unattachedCount}
+            </span>
+          )}
+        </button>
+        {/* Phase 2 — Final merged view (read-only). Clicking jumps to the
+            FinalMergePage which renders theory + figures + questions in
+            schema order with export buttons. */}
+        <button
+          className={`sb-lens ${view === "final" ? "active" : ""}`}
+          onClick={() => setView("final")}
+          style={lensBtnStyle(view === "final")}
+          title="Final merged view — theory + questions + figures, export-ready"
+        >
+          📄 Final
         </button>
       </div>
       {inFlightRetry && bookLens === "questions" && (

@@ -225,6 +225,17 @@ def _extract_figures_v2(book_id: str, job_id: str) -> dict[str, Any]:
                 inserted_refs += 1
         session.commit()
 
+        # 5b. Deterministic figure embedder — writes placement metadata
+        # so theory / questions know WHERE to render each figure inline.
+        # Non-fatal: extraction is already saved if this fails.
+        try:
+            from app.services.figure_embedder import embed_figures_for_book_sync
+            embed_counters = embed_figures_for_book_sync(session, book_uuid)
+            session.commit()
+            logger.info("figure_embedder after extract: %s", embed_counters)
+        except Exception as e:
+            logger.warning("figure_embedder after extract failed: %s", e)
+
         # 6. Finish job
         result = {
             "status": "succeeded",
@@ -479,6 +490,16 @@ def _regenerate_figures_v2_section(
         status = "succeeded" if failed == 0 else (
             "partial" if regenerated + cached_hits > 0 else "failed"
         )
+        # Re-run figure embedder — regen may have produced new variants;
+        # placement metadata stays the same but the embedder also picks
+        # up any variant changes for the renderer. Non-fatal.
+        try:
+            from app.services.figure_embedder import embed_figures_for_book_sync
+            embed_counters = embed_figures_for_book_sync(session, book_uuid)
+            session.commit()
+            logger.info("figure_embedder after regen: %s", embed_counters)
+        except Exception as e:
+            logger.warning("figure_embedder after regen failed: %s", e)
         _update_job(
             session, job_uuid,
             status=status,

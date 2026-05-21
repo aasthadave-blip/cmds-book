@@ -1579,6 +1579,22 @@ async def _run_v3(book_id: UUID, bank_id: UUID, job_id: UUID) -> dict[str, Any]:
     except Exception as e:
         logger.warning("example_linker failed (book=%s): %s", book_id, e)
 
+    # Auto-embed figures now that questions exist. If figures were extracted
+    # before questions, this is when question-tagged figure_references finally
+    # land on the right questions. No-op if no figures yet — embedder is
+    # idempotent.
+    try:
+        from app.services.figure_embedder import embed_figures_for_book_sync
+        with SyncSession() as session:
+            embed_counters = embed_figures_for_book_sync(session, book_id)
+            logger.info(
+                "[embed] post-questions book=%s %s", book_id, embed_counters
+            )
+    except Exception as e:
+        logger.warning(
+            "figure_embedder failed post-questions (book=%s): %s", book_id, e
+        )
+
     # Final job status
     with SyncSession() as session:
         bank_status = "ready" if counts["failed"] == 0 else "partial"

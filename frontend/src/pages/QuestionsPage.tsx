@@ -16,6 +16,7 @@ import {
   useRegenQuestions,
   useRestoreRejected,
   useDiscardRejected,
+  useHideFigureReference,
   useHideQuestion,
   useUnhideQuestion,
   useRetrySection,
@@ -25,7 +26,9 @@ import {
 } from "../api/hooks";
 import {
   api,
+  API_BASE,
   type BookSchema,
+  type EmbeddedFigure,
   type ExtractionSectionStats,
   type Question,
   type QuestionBank,
@@ -561,6 +564,52 @@ const FIG_RE = /\{\{\s*fig\s*:\s*([^}]+?)\s*\}\}/gi;
 
 /** Split a raw_text on {{fig: ...}} tokens so we can render each figure as a
  *  visible chip inside the question body. */
+// Render text with embedded-figure images spliced in at the touchpoint
+// (the position where "Figure X.Y" appears in the text). Figures whose
+// labels don't appear in this text are returned unconsumed so the caller
+// can render them at the end of the question card.
+function renderWithEmbeddedFigures(
+  text: string,
+  figures: EmbeddedFigure[],
+): { nodes: (string | JSX.Element)[]; consumedIds: Set<string> } {
+  const consumedIds = new Set<string>();
+  if (!text || figures.length === 0) {
+    return { nodes: renderWithFigures(text), consumedIds };
+  }
+  type Hit = { end: number; fig: EmbeddedFigure };
+  const hits: Hit[] = [];
+  for (const fig of figures) {
+    if (!fig.label) continue;
+    const num = fig.label.match(/(\d+(?:\.\d+)*)/)?.[1];
+    if (!num) continue;
+    const escaped = num.replace(/\./g, "\\.");
+    // Accept: "Figure 4.2", "Fig 4.2", "Fig. 4.2", "Fig_4.2", "Fig:4.2",
+    // "Figure4.2" (no separator), all case-insensitive. Anything between
+    // the keyword and number is whitespace / dot / underscore / colon /
+    // dash (zero or more) so we tolerate OCR variants.
+    const re = new RegExp(`(?:Figures?|Figs?\\.?)[\\s._:\\-]*[(\\[]?\\s*${escaped}\\s*[)\\]]?\\b`, "i");
+    const m = re.exec(text);
+    if (m && m.index !== undefined) {
+      hits.push({ end: m.index + m[0].length, fig });
+    }
+  }
+  hits.sort((a, b) => a.end - b.end);
+
+  const nodes: (string | JSX.Element)[] = [];
+  let cursor = 0;
+  for (const hit of hits) {
+    if (consumedIds.has(hit.fig.figure_id)) continue;
+    nodes.push(...renderWithFigures(text.slice(cursor, hit.end)));
+    nodes.push(
+      <QuestionFigure key={`emb-${hit.fig.figure_id}`} figure={hit.fig} />,
+    );
+    consumedIds.add(hit.fig.figure_id);
+    cursor = hit.end;
+  }
+  nodes.push(...renderWithFigures(text.slice(cursor)));
+  return { nodes, consumedIds };
+}
+
 function renderWithFigures(text: string): (string | JSX.Element)[] {
   if (!text) return [text];
   const parts: (string | JSX.Element)[] = [];
@@ -1452,42 +1501,73 @@ function SectionBlock({
               </button>
             )}
           </div>
-          <div
-            style={{
-              whiteSpace: "pre-wrap",
-              fontSize: "0.82rem",
-              lineHeight: 1.55,
-              color: "var(--text1)",
-            }}
-          >
-            {renderWithFigures(q.raw_text)}
-          </div>
-          {q.has_solution && q.solution_text && (
-            <details style={{ marginTop: 8 }}>
-              <summary
-                style={{
-                  fontSize: "0.68rem",
-                  color: "var(--text3)",
-                  cursor: "pointer",
-                }}
-              >
-                Solution
-              </summary>
-              <div
-                style={{
-                  whiteSpace: "pre-wrap",
-                  fontSize: "0.78rem",
-                  lineHeight: 1.5,
-                  color: "var(--text2)",
-                  marginTop: 4,
-                  paddingLeft: 8,
-                  borderLeft: "2px solid var(--border)",
-                }}
-              >
-                {renderWithFigures(q.solution_text)}
-              </div>
-            </details>
-          )}
+          {(() => {
+            // Phase 1 figure embedder: splice images at the touchpoint
+            // (where "Figure X.Y" appears) — try body first, then solution,
+            // then anything left renders as a trailing block.
+            const figs = q.embedded_figures ?? [];
+            const bodyRender = renderWithEmbeddedFigures(q.raw_text, figs);
+            const remainAfterBody = figs.filter(
+              (f) => !bodyRender.consumedIds.has(f.figure_id),
+            );
+            const solRender =
+              q.has_solution && q.solution_text
+                ? renderWithEmbeddedFigures(q.solution_text, remainAfterBody)
+                : {
+                    nodes: [] as (string | JSX.Element)[],
+                    consumedIds: new Set<string>(),
+                  };
+            const trailing = remainAfterBody.filter(
+              (f) => !solRender.consumedIds.has(f.figure_id),
+            );
+            return (
+              <>
+                <div
+                  style={{
+                    whiteSpace: "pre-wrap",
+                    fontSize: "0.82rem",
+                    lineHeight: 1.55,
+                    color: "var(--text1)",
+                  }}
+                >
+                  {bodyRender.nodes}
+                </div>
+                {trailing.length > 0 && (
+                  <div style={{ marginTop: 8 }}>
+                    {trailing.map((f) => (
+                      <QuestionFigure key={f.figure_id} figure={f} />
+                    ))}
+                  </div>
+                )}
+                {q.has_solution && q.solution_text && (
+                  <details style={{ marginTop: 8 }}>
+                    <summary
+                      style={{
+                        fontSize: "0.68rem",
+                        color: "var(--text3)",
+                        cursor: "pointer",
+                      }}
+                    >
+                      Solution
+                    </summary>
+                    <div
+                      style={{
+                        whiteSpace: "pre-wrap",
+                        fontSize: "0.78rem",
+                        lineHeight: 1.5,
+                        color: "var(--text2)",
+                        marginTop: 4,
+                        paddingLeft: 8,
+                        borderLeft: "2px solid var(--border)",
+                      }}
+                    >
+                      {solRender.nodes}
+                    </div>
+                  </details>
+                )}
+              </>
+            );
+          })()}
         </div>
       ))}
     </div>
@@ -2732,35 +2812,205 @@ function QuestionCard({
           </button>
         )}
       </div>
+      {(() => {
+        // Splice embedded figures at the touchpoint in body / solution,
+        // trailing for anything still unmatched. Same logic as SectionBlock.
+        const figs = q.embedded_figures ?? [];
+        const bodyRender = renderWithEmbeddedFigures(q.raw_text, figs);
+        const remainAfterBody = figs.filter(
+          (f) => !bodyRender.consumedIds.has(f.figure_id),
+        );
+        const solRender =
+          q.has_solution && q.solution_text
+            ? renderWithEmbeddedFigures(q.solution_text, remainAfterBody)
+            : {
+                nodes: [] as (string | JSX.Element)[],
+                consumedIds: new Set<string>(),
+              };
+        const trailing = remainAfterBody.filter(
+          (f) => !solRender.consumedIds.has(f.figure_id),
+        );
+        return (
+          <>
+            <div
+              style={{
+                whiteSpace: "pre-wrap",
+                fontSize: "0.78rem",
+                lineHeight: 1.5,
+                color: "var(--text1)",
+              }}
+            >
+              {bodyRender.nodes}
+            </div>
+            {trailing.length > 0 && (
+              <div style={{ marginTop: 8 }}>
+                {trailing.map((f) => (
+                  <QuestionFigure key={f.figure_id} figure={f} />
+                ))}
+              </div>
+            )}
+            {q.has_solution && q.solution_text && (
+              <details style={{ marginTop: 6 }}>
+                <summary
+                  style={{
+                    fontSize: "0.66rem",
+                    color: "var(--text3)",
+                    cursor: "pointer",
+                  }}
+                >
+                  Solution
+                </summary>
+                <div
+                  style={{
+                    whiteSpace: "pre-wrap",
+                    fontSize: "0.74rem",
+                    lineHeight: 1.45,
+                    color: "var(--text2)",
+                    marginTop: 4,
+                    paddingLeft: 8,
+                    borderLeft: "2px solid var(--border)",
+                  }}
+                >
+                  {solRender.nodes}
+                </div>
+              </details>
+            )}
+          </>
+        );
+      })()}
+    </div>
+  );
+}
+
+// ---------------------------------------------------------------------------
+// QuestionFigure — renders one embedded figure beneath a question card
+// (Phase 1 figure_embedder). Variant + needs_review styling mirrors the
+// figure renderer in BlockRenderer.
+// ---------------------------------------------------------------------------
+function QuestionFigure({ figure }: { figure: EmbeddedFigure }) {
+  const src = figure.image_url.startsWith("http")
+    ? figure.image_url
+    : `${API_BASE}${figure.image_url}`;
+  const isRegen = figure.variant === "regen";
+  const isAppended = figure.placement_kind !== "inline";
+  const isReview = figure.placement_kind === "needs_review";
+  const { selectedBookId } = useUI();
+  const hide = useHideFigureReference();
+  const onRemove = () => {
+    if (!figure.ref_id || !selectedBookId) return;
+    if (
+      !window.confirm(
+        `Remove ${figure.label || "this figure"} from this question? It won't appear here or in exports.`,
+      )
+    )
+      return;
+    hide.mutate({ refId: figure.ref_id, bookId: selectedBookId });
+  };
+  return (
+    <div
+      style={{
+        marginTop: 6,
+        marginBottom: 6,
+        padding: 6,
+        border: isAppended ? "1px dashed var(--border)" : "1px solid var(--border)",
+        borderRadius: 6,
+        background: "var(--bg2, #fafbfd)",
+        maxWidth: 380,
+      }}
+    >
       <div
         style={{
-          whiteSpace: "pre-wrap",
-          fontSize: "0.78rem",
-          lineHeight: 1.5,
-          color: "var(--text1)",
+          display: "flex",
+          alignItems: "center",
+          gap: 6,
+          fontSize: "0.66rem",
+          color: "var(--text3)",
+          marginBottom: 4,
         }}
       >
-        {renderWithFigures(q.raw_text)}
-      </div>
-      {q.has_solution && q.solution_text && (
-        <details style={{ marginTop: 6 }}>
-          <summary style={{ fontSize: "0.66rem", color: "var(--text3)", cursor: "pointer" }}>
-            Solution
-          </summary>
-          <div
+        {figure.label && (
+          <span style={{ fontWeight: 600, color: "var(--text2)" }}>
+            {figure.label}
+          </span>
+        )}
+        {isRegen && (
+          <span
             style={{
-              whiteSpace: "pre-wrap",
-              fontSize: "0.74rem",
-              lineHeight: 1.45,
-              color: "var(--text2)",
-              marginTop: 4,
-              paddingLeft: 8,
-              borderLeft: "2px solid var(--border)",
+              fontSize: "0.58rem",
+              fontWeight: 600,
+              padding: "1px 5px",
+              borderRadius: 6,
+              background: "rgba(91,108,255,0.15)",
+              color: "var(--accent, #5b6cff)",
             }}
+            title="Regenerated variant (approved)"
           >
-            {renderWithFigures(q.solution_text)}
-          </div>
-        </details>
+            ✨ Regenerated
+          </span>
+        )}
+        {isAppended && (
+          <span
+            style={{
+              fontSize: "0.58rem",
+              fontWeight: 600,
+              padding: "1px 5px",
+              borderRadius: 6,
+              background: isReview
+                ? "rgba(220,53,69,0.12)"
+                : "rgba(255,165,0,0.15)",
+              color: isReview ? "var(--red, #d33)" : "var(--warn, #c80)",
+            }}
+            title={
+              isReview
+                ? "No body to attach to — please verify"
+                : "No label match — auto-appended for review"
+            }
+          >
+            ⚠ {isReview ? "Needs review" : "Auto-appended"}
+          </span>
+        )}
+        <button
+          type="button"
+          onClick={onRemove}
+          disabled={hide.isPending || !figure.ref_id}
+          title="Remove this figure from this question (excluded from export)"
+          style={{
+            marginLeft: "auto",
+            background: "transparent",
+            border: "1px solid var(--border)",
+            borderRadius: 4,
+            color: "var(--text3)",
+            cursor: hide.isPending ? "default" : "pointer",
+            fontSize: "0.66rem",
+            padding: "1px 6px",
+            lineHeight: 1,
+          }}
+        >
+          ✕
+        </button>
+      </div>
+      <img
+        src={src}
+        alt={figure.label || figure.caption || "figure"}
+        loading="lazy"
+        style={{
+          maxWidth: "100%",
+          height: "auto",
+          display: "block",
+          borderRadius: 4,
+        }}
+      />
+      {figure.caption && (
+        <div
+          style={{
+            fontSize: "0.66rem",
+            color: "var(--text3)",
+            fontStyle: "italic",
+            marginTop: 4,
+          }}
+        >
+          {figure.caption}
+        </div>
       )}
     </div>
   );

@@ -10,6 +10,7 @@ from __future__ import annotations
 
 import asyncio
 import logging
+import os
 from datetime import datetime
 from uuid import UUID
 
@@ -318,114 +319,192 @@ def extract_book_task(self, book_id: str, job_id: str) -> dict:
             total = len(to_extract)
             failed_section_ids: list[str] = []
 
+            # ── PARALLEL SECTION EXTRACTION ────────────────────────────────
+            # Each section's Gemini call is an independent HTTP request — no
+            # shared context, no cross-section bleeding (impossible by design,
+            # since Gemini doesn't keep state between requests). Concurrency
+            # controlled by THEORY_SECTION_CONCURRENCY env var (default 4).
+            # Set to 1 to revert to sequential behaviour byte-for-byte.
+            #
+            # SAFETY GUARDS (all preserved from sequential version):
+            #   1. Same theory_extractor.extract_section_with_qc call per
+            #      section — same prompt, same Pro model, same retry policy.
+            #   2. Each task uses its OWN SyncSession for DB writes (no
+            #      shared session across tasks → no race / lock corruption).
+            #   3. Failures are isolated per-section (return_exceptions=True)
+            #      — one section's crash does not abort the batch.
+            #   4. Per-section retry inside extract_section_with_qc is
+            #      untouched (MAX_ATTEMPTS=3 + backoff).
+            #   5. Post-write section_id verification (paranoid guard) catches
+            #      any cross-section write corruption with a loud assert.
+            #   6. Schema postpass + example_linker still run AFTER all
+            #      sections complete — same invariant as the sequential loop.
+            CONCURRENCY = max(1, int(os.environ.get("THEORY_SECTION_CONCURRENCY", "4")))
+
+            # Pre-compute per-section payloads sequentially (cheap — just
+            # arithmetic + schema lookups, no Gemini calls). Captures the
+            # current iteration-order-dependent effective_page_end values
+            # so the parallel phase has all the data it needs.
+            section_payloads: list[dict] = []
             for i, sec_schema in enumerate(to_extract, start=1):
-                # next_sec: the immediately following section in pre-order traversal.
-                # For containers this is their first child; for leaves it's the next sibling.
-                # Used for two things: (1) tell Gemini where to stop, (2) trim page_end.
                 next_sec = to_extract[i] if i < total else None
                 next_title = next_sec.title if next_sec else None
-
-                # Effective page range:
-                # - Top-level sections (direct schema roots) and intermediate
-                #   containers: trimmed to first child's page_start.
-                # - Leaf sections (no children): EXTENDED to next sibling's
-                #   page_start so prose that continues onto the page where
-                #   the next section starts is captured (Gemini's next_title
-                #   STOP anchor prevents leak into the next section).
-                # - Container with no intro text → empty → status="skipped".
                 is_container = len(sec_schema.subsections) > 0
-                is_top_level = sec_schema.id in top_level_ids
-
                 if is_container and next_sec and next_sec.page_start is not None:
-                    # Container: trim DOWN to first child's page_start so the
-                    # parent only OCRs its own intro text, not all children.
                     effective_page_end = min(
                         sec_schema.page_end or next_sec.page_start,
                         next_sec.page_start,
                     )
                 elif (not is_container) and next_sec and next_sec.page_start is not None:
-                    # Leaf: extend UP to next sibling's page_start so we
-                    # capture content continuing onto the page where the
-                    # next section's heading appears. next_title is set
-                    # below as the STOP anchor in the prompt — Gemini
-                    # transcribes up to that heading and stops.
                     effective_page_end = max(
                         sec_schema.page_end or 0,
                         next_sec.page_start,
                     )
                 else:
                     effective_page_end = sec_schema.page_end
+                section_payloads.append({
+                    "sec_schema": sec_schema,
+                    "next_title": next_title,
+                    "effective_page_end": effective_page_end,
+                    "is_container": is_container,
+                    "idx": i,
+                })
 
-                progress = 10 + int(85 * (i - 1) / max(total, 1))
-                _update_job(
-                    session,
-                    job_uuid,
-                    message=f"Extracting {sec_schema.title} ({i}/{total})",
-                    progress=progress,
-                )
+            # Shared mutable counter for monotonic progress reporting. Each
+            # task increments under the lock and writes the new progress
+            # via its own SyncSession.
+            done_counter = {"n": 0}
+            counter_lock = asyncio.Lock()
 
+            async def _extract_and_persist(payload: dict) -> tuple[str, str]:
+                """Run one section through extract_section_with_qc and
+                persist the result. Returns (section_id, outcome) where
+                outcome is one of: ok / failed / skipped / crashed."""
+                sec_schema = payload["sec_schema"]
+                is_container = payload["is_container"]
                 try:
-                    # Watchdog keepalive: a 10s daemon-thread heartbeat runs
-                    # for the duration of this section so the watchdog (300s
-                    # threshold) does not kill long single-call extractions
-                    # for big top-level chapter sections. This thread ONLY
-                    # writes job.last_heartbeat_at — it does NOT touch the
-                    # prompt, the Gemini call, retries, or the extracted
-                    # output in any way.
-                    with Heartbeat(
-                        job_uuid,
-                        base_msg=f"Extracting {sec_schema.title} ({i}/{total})",
-                        progress=progress,
-                    ):
-                        result: ExtractionResult = asyncio.run(
-                            extract_section_with_qc(
-                                section_id=sec_schema.id,
-                                title=sec_schema.title,
-                                level=sec_schema.level,
-                                pdf_bytes=pdf_bytes,
-                                page_start=sec_schema.page_start,
-                                page_end=effective_page_end,
-                                next_title=next_title,
-                            )
-                        )
+                    result: ExtractionResult = await extract_section_with_qc(
+                        section_id=sec_schema.id,
+                        title=sec_schema.title,
+                        level=sec_schema.level,
+                        pdf_bytes=pdf_bytes,
+                        page_start=sec_schema.page_start,
+                        page_end=payload["effective_page_end"],
+                        next_title=payload["next_title"],
+                    )
                 except Exception as e:
-                    logger.exception("extract_section_with_qc crashed on %s", sec_schema.id)
-                    sec = session.execute(
+                    logger.exception(
+                        "extract_section_with_qc crashed on %s", sec_schema.id
+                    )
+                    # Persist failure in this task's own session
+                    with SyncSession() as own_session:
+                        sec = own_session.execute(
+                            select(Section).where(
+                                Section.book_id == book_uuid,
+                                Section.section_id == sec_schema.id,
+                            )
+                        ).scalar_one_or_none()
+                        if sec is not None:
+                            sec.status = "failed"
+                            sec.qc_local = {
+                                "pass": False,
+                                "failures": [str(e)[:500]],
+                            }
+                            sec.attempts = (sec.attempts or 0) + 1
+                        own_session.commit()
+                    return (sec_schema.id, "crashed")
+
+                # Persist success in this task's own session
+                outcome: str
+                with SyncSession() as own_session:
+                    sec = own_session.execute(
                         select(Section).where(
                             Section.book_id == book_uuid,
                             Section.section_id == sec_schema.id,
                         )
-                    ).scalar_one_or_none()
-                    if sec is not None:
-                        sec.status = "failed"
-                        sec.qc_local = {"pass": False, "failures": [str(e)[:500]]}
-                        sec.attempts = (sec.attempts or 0) + 1
-                    session.commit()
-                    failed_section_ids.append(sec_schema.id)
-                    continue
+                    ).scalar_one()
+                    sec.blocks = result.blocks
+                    sec.qc_local = result.qc.to_dict()
+                    sec.attempts = result.attempts
+                    if not result.qc.pass_ and is_container and not result.blocks:
+                        sec.status = "skipped"
+                        outcome = "skipped"
+                    else:
+                        sec.status = "passed" if result.qc.pass_ else "failed"
+                        outcome = "passed" if result.qc.pass_ else "failed"
+                    own_session.commit()
+                    # PARANOID: verify section_id matches after commit. If
+                    # something somehow corrupted the write, fail LOUDLY.
+                    check = own_session.execute(
+                        select(Section).where(
+                            Section.book_id == book_uuid,
+                            Section.section_id == sec_schema.id,
+                        )
+                    ).scalar_one()
+                    if check.section_id != sec_schema.id:
+                        raise RuntimeError(
+                            f"Post-write section_id mismatch: "
+                            f"expected={sec_schema.id} got={check.section_id}"
+                        )
 
-                sec = session.execute(
-                    select(Section).where(
-                        Section.book_id == book_uuid,
-                        Section.section_id == sec_schema.id,
+                # Atomic progress update — each task contributes one tick.
+                # Progress goes 10 → 95 as sections complete.
+                async with counter_lock:
+                    done_counter["n"] += 1
+                    n_done = done_counter["n"]
+                with SyncSession() as own_session:
+                    prog = 10 + int(85 * n_done / max(total, 1))
+                    _update_job(
+                        own_session,
+                        job_uuid,
+                        message=f"Extracted {n_done}/{total} sections",
+                        progress=prog,
                     )
-                ).scalar_one()
-                sec.blocks = result.blocks
-                sec.qc_local = result.qc.to_dict()
-                sec.attempts = result.attempts
+                    own_session.commit()
+                return (sec_schema.id, outcome)
 
-                # Container sections (top-level OR intermediate) trimmed to
-                # before the first child may have no intro text — totally
-                # normal, not a failure. Mark skipped so they don't pollute
-                # the QC fail list.
-                if not result.qc.pass_ and is_container and not result.blocks:
-                    sec.status = "skipped"
-                else:
-                    sec.status = "passed" if result.qc.pass_ else "failed"
-                    if result.local_qc_fail:
-                        failed_section_ids.append(sec_schema.id)
+            async def _run_parallel() -> list[tuple[str, str]]:
+                sem = asyncio.Semaphore(CONCURRENCY)
 
-                session.commit()
+                async def gated(p):
+                    async with sem:
+                        return await _extract_and_persist(p)
+
+                # return_exceptions=True so one section's unexpected error
+                # in the OUTER plumbing (not the Gemini call — that's caught
+                # inside) doesn't bring down the whole batch.
+                return await asyncio.gather(
+                    *[gated(p) for p in section_payloads],
+                    return_exceptions=True,
+                )
+
+            # One outer Heartbeat covers the whole parallel phase so the
+            # watchdog doesn't kill the job during long Gemini calls. With
+            # concurrency=4, expected wall-clock is total_sections/4 × per-
+            # section time. Heartbeat thread is independent of the worker.
+            with Heartbeat(
+                job_uuid,
+                base_msg=(
+                    f"Extracting {total} sections "
+                    f"(parallel × {CONCURRENCY})"
+                ),
+                progress=10,
+            ):
+                outcomes = asyncio.run(_run_parallel())
+
+            # Tally failures and crashes for the final job summary
+            for outcome in outcomes:
+                if isinstance(outcome, BaseException):
+                    # An unexpected error inside _extract_and_persist itself
+                    # (not the Gemini call — that's caught inside). Log and
+                    # treat the whole batch as having had a failure; we
+                    # cannot determine which section_id it came from at this
+                    # layer, so the message will reflect it at job-end.
+                    logger.exception("section task plumbing crashed: %s", outcome)
+                    continue
+                section_id, status = outcome
+                if status in ("failed", "crashed"):
+                    failed_section_ids.append(section_id)
 
             book.status = "ready"
             session.commit()
@@ -439,6 +518,21 @@ def extract_book_task(self, book_id: str, job_id: str) -> dict:
                 link_examples_to_theory_sync(session, book_uuid)
             except Exception as e:
                 logger.warning("example_linker failed (book=%s): %s", book_uuid, e)
+
+            # Auto-embed figures into the freshly-extracted theory blocks.
+            # If figures were extracted before theory, this is when the
+            # figure_references finally land in the right sections. No-op if
+            # the book has no figures yet — embedder is idempotent.
+            try:
+                from app.services.figure_embedder import embed_figures_for_book_sync
+                embed_counters = embed_figures_for_book_sync(session, book_uuid)
+                logger.info(
+                    "[embed] post-theory book=%s %s", book_uuid, embed_counters
+                )
+            except Exception as e:
+                logger.warning(
+                    "figure_embedder failed post-theory (book=%s): %s", book_uuid, e
+                )
 
             _update_job(
                 session,

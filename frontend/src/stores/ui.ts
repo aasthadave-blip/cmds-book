@@ -1,7 +1,7 @@
 import { create } from "zustand";
 import type { UUID } from "../api/client";
 
-export type View = "library" | "upload" | "schema" | "reader" | "regen" | "settings" | "questions" | "images";
+export type View = "library" | "upload" | "schema" | "reader" | "regen" | "settings" | "questions" | "images" | "final" | "compose" | "preview";
 export type BookLens = "theory" | "questions" | "images";
 
 interface UIState {

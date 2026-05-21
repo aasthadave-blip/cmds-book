@@ -208,7 +208,10 @@ export function ReaderPage() {
                   </p>
                 </div>
               ) : (
-                <BlockRenderer blocks={displayBlocks} />
+                <BlockRenderer
+                  blocks={displayBlocks}
+                  embeddedFigures={isRegenView ? undefined : section?.embedded_figures}
+                />
               )}
 
               {!isRegenView && qcLocal?.failures && qcLocal.failures.length > 0 && (

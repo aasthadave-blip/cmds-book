@@ -19,3 +19,7 @@ class SectionOut(BaseModel):
     qc_llm: dict[str, Any] | None = None
     status: str
     attempts: int
+    # Phase 1 figure embedder — figures to render inline in this section's
+    # theory body. Populated by GET /api/books/{id}/sections (joins
+    # figure_references + figures). Empty when not populated.
+    embedded_figures: list[dict[str, Any]] = []

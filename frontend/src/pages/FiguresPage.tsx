@@ -18,9 +18,13 @@ import {
   useBook,
   useBookFigures,
   useBookFigureRegenerations,
+  useBookUnattachedFigures,
+  useDeleteFigureReference,
   useExtractFiguresV2,
   useDiscardFigureRegen,
+  useHideFigureReference,
   useJob,
+  useReembedFigures,
   useRegenerateFiguresSection,
   useApproveSectionFigures,
   useUnapproveSectionFigures,
@@ -29,10 +33,12 @@ import {
 } from "../api/hooks";
 import {
   api,
+  API_BASE,
   type Figure,
   type FigureRegenParams,
   type FigureRegenerationRun,
   type FigureSectionGroup,
+  type UnattachedFigure,
   type UUID,
 } from "../api/client";
 
@@ -50,11 +56,13 @@ export function FiguresPage() {
     pollMs: isJobRunning ? 2000 : undefined,
   });
   const extractFigures = useExtractFiguresV2();
+  const reembed = useReembedFigures();
   // Regen run history — driven by the new FigureRegenerations endpoint.
   // Polled while a regen job is running so the history updates live.
   const { data: regenRunsData } = useBookFigureRegenerations(selectedBookId, {
     pollMs: isJobRunning ? 2000 : undefined,
   });
+  const { data: unattached } = useBookUnattachedFigures(selectedBookId);
   const [mode, setMode] = useState<Mode>("original");
   const [regenOpenForSection, setRegenOpenForSection] = useState<string | null>(null);
 
@@ -122,6 +130,18 @@ export function FiguresPage() {
           </span>
           <div style={{ marginLeft: "auto", display: "flex", gap: 8 }}>
             <button
+              className="btn"
+              style={{ fontSize: "0.72rem", padding: "4px 12px" }}
+              disabled={reembed.isPending || total === 0}
+              onClick={() => {
+                if (!selectedBookId) return;
+                reembed.mutate(selectedBookId);
+              }}
+              title="Re-run the figure embedder. Deterministic, no Gemini call — just re-matches existing figures to theory/questions."
+            >
+              {reembed.isPending ? "Re-embedding…" : "↻ Re-embed"}
+            </button>
+            <button
               className="btn primary"
               style={{ fontSize: "0.72rem", padding: "4px 12px" }}
               disabled={extractFigures.isPending || isJobRunning}
@@ -140,6 +160,11 @@ export function FiguresPage() {
             </button>
           </div>
         </div>
+
+        {/* Unattached figures — figures the embedder couldn't place anywhere */}
+        {(unattached?.figures?.length ?? 0) > 0 && (
+          <UnattachedFiguresPanel bookId={selectedBookId} figures={unattached!.figures} />
+        )}
 
         {/* Mode toggle */}
         <div style={{ display: "flex", gap: 4, marginBottom: 14 }}>
@@ -1141,6 +1166,194 @@ function RegenRunRow({ run }: { run: FigureRegenerationRun }) {
             Historical run images are not stored — only the latest regen per figure
             is viewable on the figure card. This list tracks the run metadata.
           </div>
+        </div>
+      )}
+    </div>
+  );
+}
+
+// ---------------------------------------------------------------------------
+// UnattachedFiguresPanel — shows figures the embedder couldn't place anywhere.
+// User can click "Restore" to re-include the figure (clears is_hidden and lets
+// the embedder retry on next run), or just acknowledge they're aware.
+// ---------------------------------------------------------------------------
+function UnattachedFiguresPanel({
+  bookId,
+  figures,
+}: {
+  bookId: UUID;
+  figures: UnattachedFigure[];
+}) {
+  const hide = useHideFigureReference();
+  const del = useDeleteFigureReference();
+  const [collapsed, setCollapsed] = useState(false);
+  return (
+    <div
+      style={{
+        marginBottom: 14,
+        padding: "10px 12px",
+        background: "rgba(220,53,69,0.06)",
+        border: "1px solid rgba(220,53,69,0.25)",
+        borderRadius: 6,
+      }}
+    >
+      <div
+        style={{
+          display: "flex",
+          alignItems: "center",
+          gap: 8,
+          marginBottom: collapsed ? 0 : 10,
+          cursor: "pointer",
+        }}
+        onClick={() => setCollapsed((c) => !c)}
+      >
+        <span style={{ fontWeight: 600, fontSize: "0.8rem", color: "var(--red, #d33)" }}>
+          ⚠ {figures.length} unattached figure{figures.length === 1 ? "" : "s"}
+        </span>
+        <span style={{ fontSize: "0.7rem", color: "var(--text3)" }}>
+          These figures could not be placed in any section or question. Review and
+          decide manually.
+        </span>
+        <span style={{ marginLeft: "auto", fontSize: "0.7rem", color: "var(--text3)" }}>
+          {collapsed ? "▶ show" : "▼ hide"}
+        </span>
+      </div>
+      {!collapsed && (
+        <div
+          style={{
+            display: "grid",
+            gridTemplateColumns: "repeat(auto-fill, minmax(180px, 1fr))",
+            gap: 10,
+          }}
+        >
+          {figures.map((f) => {
+            const src = f.image_url.startsWith("http")
+              ? f.image_url
+              : `${API_BASE}${f.image_url}`;
+            return (
+              <div
+                key={f.ref_id || f.figure_id}
+                style={{
+                  background: "var(--surface, #fff)",
+                  border: "1px solid var(--border)",
+                  borderRadius: 6,
+                  padding: 6,
+                  fontSize: "0.7rem",
+                }}
+              >
+                <div
+                  style={{
+                    display: "flex",
+                    alignItems: "center",
+                    gap: 4,
+                    marginBottom: 4,
+                  }}
+                >
+                  {f.label && (
+                    <span style={{ fontWeight: 600, color: "var(--text2)" }}>
+                      {f.label}
+                    </span>
+                  )}
+                  <span
+                    style={{
+                      fontSize: "0.6rem",
+                      padding: "1px 4px",
+                      borderRadius: 4,
+                      background:
+                        f.context === "question"
+                          ? "rgba(91,108,255,0.12)"
+                          : "rgba(255,165,0,0.12)",
+                      color:
+                        f.context === "question"
+                          ? "var(--accent, #5b6cff)"
+                          : "var(--warn, #c80)",
+                    }}
+                  >
+                    {f.context}
+                  </span>
+                  {f.ref_id && (
+                    <div style={{ marginLeft: "auto", display: "flex", gap: 4 }}>
+                      <button
+                        type="button"
+                        onClick={() =>
+                          hide.mutate({ refId: f.ref_id, bookId })
+                        }
+                        disabled={hide.isPending || del.isPending}
+                        title="Mark as resolved — dismiss from this panel. Re-embed will reintroduce if it still matches."
+                        style={{
+                          background: "transparent",
+                          border: "1px solid var(--border)",
+                          borderRadius: 4,
+                          color: "var(--text3)",
+                          fontSize: "0.62rem",
+                          padding: "1px 6px",
+                          cursor: hide.isPending ? "default" : "pointer",
+                        }}
+                      >
+                        ✓ Resolved
+                      </button>
+                      <button
+                        type="button"
+                        onClick={() => {
+                          if (
+                            !window.confirm(
+                              `Delete this figure placement permanently? The image itself stays, but this reference will be removed. Re-embed will recreate it only if the figure still matches.`,
+                            )
+                          )
+                            return;
+                          del.mutate({ refId: f.ref_id, bookId });
+                        }}
+                        disabled={hide.isPending || del.isPending}
+                        title="Hard-delete this figure_reference row"
+                        style={{
+                          background: "transparent",
+                          border: "1px solid rgba(220,53,69,0.4)",
+                          borderRadius: 4,
+                          color: "var(--red, #d33)",
+                          fontSize: "0.62rem",
+                          padding: "1px 6px",
+                          cursor: del.isPending ? "default" : "pointer",
+                        }}
+                      >
+                        🗑 Delete
+                      </button>
+                    </div>
+                  )}
+                </div>
+                <img
+                  src={src}
+                  alt={f.label || f.caption || "figure"}
+                  loading="lazy"
+                  style={{
+                    maxWidth: "100%",
+                    height: "auto",
+                    display: "block",
+                    borderRadius: 4,
+                    border: "1px solid var(--border)",
+                  }}
+                />
+                <div style={{ marginTop: 4, color: "var(--text3)" }}>
+                  {f.section_ref && <span>§ {f.section_ref}</span>}
+                  {f.page_number != null && (
+                    <span style={{ marginLeft: 6 }}>p.{f.page_number}</span>
+                  )}
+                </div>
+                {f.caption && (
+                  <div
+                    style={{
+                      marginTop: 4,
+                      fontStyle: "italic",
+                      color: "var(--text3)",
+                      maxHeight: 40,
+                      overflow: "hidden",
+                    }}
+                  >
+                    {f.caption}
+                  </div>
+                )}
+              </div>
+            );
+          })}
         </div>
       )}
     </div>

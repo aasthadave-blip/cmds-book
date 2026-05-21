@@ -10,6 +10,7 @@ import {
   useQuestionStructure,
   useBookFigures,
   useExtractFiguresV2,
+  useFinalMerge,
   useReExtractSection,
   useSections,
 } from "../api/hooks";
@@ -256,6 +257,7 @@ export function SchemaPage() {
       <WizardRail active={rail} />
       <div className="cnt">
         <div className="ci">
+          <FinalPreviewCard />
           {imageBased && wordCount < 50 && (
             <div
               className="card"
@@ -1411,6 +1413,69 @@ function CompletionPanel({ bookId }: { bookId: string }) {
           onClick={() => setView("library")}
         >
           View in Library
+        </button>
+      </div>
+    </div>
+  );
+}
+
+// ---------------------------------------------------------------------------
+// FinalPreviewCard — touchpoint from Schema → Final Merge view.
+// Shows when there's anything to preview (status counts come from final-merge
+// endpoint). Click jumps straight to the Final tab.
+// ---------------------------------------------------------------------------
+function FinalPreviewCard() {
+  const { selectedBookId, setView } = useUI();
+  const { data } = useFinalMerge(selectedBookId, true);
+  if (!selectedBookId || !data) return null;
+  const totalQ = data.sections.reduce((n, s) => n + s.questions.length, 0);
+  const totalF =
+    data.sections.reduce(
+      (n, s) =>
+        n +
+        s.embedded_figures.length +
+        s.questions.reduce((m, q) => m + q.embedded_figures.length, 0),
+      0,
+    );
+  const regenN = data.sections.filter((s) => s.block_source === "regen").length;
+  return (
+    <div
+      className="card"
+      style={{
+        background:
+          "linear-gradient(135deg, rgba(91,108,255,0.08), rgba(91,108,255,0.02))",
+        borderColor: "rgba(91,108,255,0.3)",
+        cursor: "pointer",
+      }}
+      onClick={() => setView("final")}
+      title="Open Final merged view"
+    >
+      <div
+        style={{ display: "flex", alignItems: "center", gap: 12, flexWrap: "wrap" }}
+      >
+        <div style={{ fontSize: "1.4rem" }}>📄</div>
+        <div style={{ flex: 1, minWidth: 220 }}>
+          <div className="clbl" style={{ marginBottom: 2 }}>
+            Final merged preview
+          </div>
+          <div style={{ fontSize: "0.72rem", color: "var(--text3)" }}>
+            {data.sections.length} sections · {totalQ} questions · {totalF}{" "}
+            figures
+            {regenN > 0 && ` · ✨ ${regenN} regenerated`}
+            {data.unattached_figures.length > 0 &&
+              ` · ⚠ ${data.unattached_figures.length} unattached`}
+          </div>
+        </div>
+        <button
+          type="button"
+          className="btn primary"
+          style={{ fontSize: "0.72rem", padding: "4px 14px" }}
+          onClick={(e) => {
+            e.stopPropagation();
+            setView("final");
+          }}
+        >
+          Open Final →
         </button>
       </div>
     </div>

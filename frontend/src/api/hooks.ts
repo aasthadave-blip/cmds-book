@@ -35,6 +35,8 @@ export const qk = {
     ["books", bookId, "figure-references", sectionRef ?? "all", ctx ?? "all"] as const,
   bookFigureRegens: (bookId: UUID, sectionRef?: string) =>
     ["books", bookId, "figure-regenerations", sectionRef ?? "all"] as const,
+  bookUnattached: (bookId: UUID) =>
+    ["books", bookId, "unattached-figures"] as const,
 };
 
 export function useBooks() {
@@ -487,6 +489,124 @@ export function useBookFigureRefs(
     queryKey: qk.bookFigureRefs(bookId ?? "", opts?.sectionRef, opts?.context),
     queryFn: () => api.listFigureReferences(bookId!, opts),
     enabled: !!bookId,
+  });
+}
+
+export function useBookUnattachedFigures(bookId: UUID | null) {
+  return useQuery({
+    queryKey: qk.bookUnattached(bookId ?? ""),
+    queryFn: () => api.listUnattachedFigures(bookId!),
+    enabled: !!bookId,
+  });
+}
+
+export function useHideFigureReference() {
+  const qc = useQueryClient();
+  return useMutation({
+    mutationFn: ({ refId }: { refId: UUID; bookId: UUID }) =>
+      api.hideFigureReference(refId),
+    onSuccess: (_data, vars) => {
+      // Invalidate all section + question views so the figure disappears
+      void qc.invalidateQueries({ queryKey: qk.sections(vars.bookId) });
+      void qc.invalidateQueries({ queryKey: ["question-banks"] });
+      void qc.invalidateQueries({ queryKey: qk.bookUnattached(vars.bookId) });
+    },
+  });
+}
+
+export function useUnhideFigureReference() {
+  const qc = useQueryClient();
+  return useMutation({
+    mutationFn: ({ refId }: { refId: UUID; bookId: UUID }) =>
+      api.unhideFigureReference(refId),
+    onSuccess: (_data, vars) => {
+      void qc.invalidateQueries({ queryKey: qk.sections(vars.bookId) });
+      void qc.invalidateQueries({ queryKey: ["question-banks"] });
+      void qc.invalidateQueries({ queryKey: qk.bookUnattached(vars.bookId) });
+    },
+  });
+}
+
+export function useDeleteFigureReference() {
+  const qc = useQueryClient();
+  return useMutation({
+    mutationFn: ({ refId }: { refId: UUID; bookId: UUID }) =>
+      api.deleteFigureReference(refId),
+    onSuccess: (_data, vars) => {
+      void qc.invalidateQueries({ queryKey: qk.sections(vars.bookId) });
+      void qc.invalidateQueries({ queryKey: ["question-banks"] });
+      void qc.invalidateQueries({ queryKey: qk.bookUnattached(vars.bookId) });
+    },
+  });
+}
+
+/* ─── Final Draft (composer) ─────────────────────────────────────────── */
+
+export function useFinalDraft(
+  bookId: UUID | null,
+  preferRegen: boolean = true,
+) {
+  return useQuery({
+    queryKey: ["books", bookId, "final-draft"] as const,
+    queryFn: () => api.getFinalDraft(bookId!, preferRegen),
+    enabled: !!bookId,
+    // Always pull fresh on page mount so Preview reflects the latest
+    // edits saved in Composer (no stale-cache lag between tabs).
+    refetchOnMount: "always",
+    refetchOnWindowFocus: true,
+    staleTime: 0,
+  });
+}
+
+export function usePatchFinalDraft(bookId: UUID | null) {
+  const qc = useQueryClient();
+  return useMutation({
+    mutationFn: (operations: Parameters<typeof api.patchFinalDraft>[1]) =>
+      api.patchFinalDraft(bookId!, operations),
+    onSuccess: (data) => {
+      // Two-step cache update: write the new data (instant for any
+      // consumer on the same page) AND invalidate so any other mounted
+      // consumer (Preview tab, sidebar counts) refetches.
+      qc.setQueryData(["books", bookId, "final-draft"], data);
+      void qc.invalidateQueries({
+        queryKey: ["books", bookId, "final-draft"],
+      });
+    },
+  });
+}
+
+export function useReseedFinalDraft(bookId: UUID | null) {
+  const qc = useQueryClient();
+  return useMutation({
+    mutationFn: (preferRegen: boolean = true) =>
+      api.reseedFinalDraft(bookId!, preferRegen),
+    onSuccess: (data) => {
+      qc.setQueryData(["books", bookId, "final-draft"], data);
+    },
+  });
+}
+
+export function useFinalMerge(
+  bookId: UUID | null,
+  preferRegen: boolean = true,
+) {
+  return useQuery({
+    queryKey: ["books", bookId, "final-merge", preferRegen] as const,
+    queryFn: () => api.getFinalMerge(bookId!, preferRegen),
+    enabled: !!bookId,
+  });
+}
+
+export function useReembedFigures() {
+  const qc = useQueryClient();
+  return useMutation({
+    mutationFn: (bookId: UUID) => api.reembedFigures(bookId),
+    onSuccess: (_data, bookId) => {
+      void qc.invalidateQueries({ queryKey: qk.sections(bookId) });
+      void qc.invalidateQueries({ queryKey: ["question-banks"] });
+      void qc.invalidateQueries({ queryKey: qk.bookUnattached(bookId) });
+      void qc.invalidateQueries({ queryKey: qk.bookFigures(bookId) });
+    },
   });
 }
 

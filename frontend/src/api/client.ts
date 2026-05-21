@@ -66,6 +66,132 @@ export type Block =
   | { t: "exercise_ref"; label: string; number?: string; section_id?: string; question_id?: string }
   | { t: "question_ref"; label: string; number?: string; section_id?: string; question_id?: string };
 
+/** A figure that should be rendered inline within a section's theory body
+ *  or beside a specific question, as computed by the deterministic
+ *  figure_embedder service (Phase 1).
+ */
+export interface EmbeddedFigure {
+  /** figure_references row id — used to hide/unhide this placement. */
+  ref_id: UUID;
+  figure_id: UUID;
+  label: string;            // e.g. "Figure 4.7"
+  caption: string;
+  variant: "original" | "regen";
+  image_url: string;        // GET endpoint returning PNG bytes
+  placement_kind: "inline" | "appended" | "unattached" | "needs_review";
+  /** For theory placement: render figure AFTER the block at this index.
+   *  Null when the placement is "appended" / "unattached". */
+  placement_block_idx?: number | null;
+  /** For question placement: character offset inside raw_text where the
+   *  inline marker would render. Null when "appended". */
+  placement_char_offset?: number | null;
+}
+
+/** Returned by `/api/books/{id}/unattached-figures`. Same shape as
+ *  EmbeddedFigure with extra context fields so the user can decide
+ *  where to put them (or leave unattached). */
+export interface UnattachedFigure extends EmbeddedFigure {
+  context: "theory" | "question";
+  section_ref: string;
+  page_number: number | null;
+}
+
+/* ─── Phase 3 — Final Draft (composer) ─────────────────────────────────── */
+
+export type FinalDraftItem =
+  | {
+      id: string;
+      type: "section_heading";
+      parent_section_id: string | null;
+      section_id: string;
+      title: string;
+      level: number;
+      regen: boolean;
+    }
+  | {
+      id: string;
+      type: "block";
+      parent_section_id: string | null;
+      block: Block;
+    }
+  | {
+      id: string;
+      type: "figure";
+      parent_section_id: string | null;
+      figure: EmbeddedFigure;
+    }
+  | {
+      id: string;
+      type: "question";
+      parent_section_id: string | null;
+      question: FinalMergeQuestion;
+    }
+  | {
+      id: string;
+      type: "custom_text";
+      parent_section_id: string | null;
+      content: string;
+    };
+
+export interface FinalDraft {
+  id: UUID;
+  book_id: UUID;
+  status: "draft" | "exporting" | "exported" | "failed";
+  prefer_regen: boolean;
+  items: FinalDraftItem[];
+  item_count: number;
+  last_seeded_at: string | null;
+  updated_at: string | null;
+}
+
+export type FinalDraftOperation =
+  | { op: "reorder"; id: string; after_id: string | "start" }
+  | { op: "remove"; id: string }
+  | { op: "edit_item"; id: string; patch: Record<string, unknown> }
+  | { op: "insert_custom_text"; after_id: string | "start"; content: string }
+  | {
+      op: "insert_existing";
+      after_id: string | "start";
+      item: Omit<FinalDraftItem, "id">;
+    };
+
+/** Phase 2 — Final Merge document. Stitched theory + questions + figures
+ *  in schema order, ready for read-only rendering and export. */
+export interface FinalMergeSection {
+  section_id: string;
+  section_title: string;
+  level: number;
+  blocks: Block[];
+  block_source: "original" | "regen";
+  regen_meta: { regen_id: UUID; regen_created_at: string } | null;
+  embedded_figures: EmbeddedFigure[];
+  questions: FinalMergeQuestion[];
+  /** Phase 3 — questions inlined at chip positions within `blocks`.
+   *  Key is the block index after which to render (`"-1"` = before any block).
+   *  These questions are excluded from the standalone `questions` list. */
+  inlined_questions_by_block_idx?: Record<string, FinalMergeQuestion[]>;
+}
+export interface FinalMergeQuestion {
+  id: UUID;
+  question_number: string | null;
+  exercise_ref: string | null;
+  page_start: number | null;
+  question_type: string | null;
+  raw_text: string;
+  has_solution: boolean;
+  solution_text: string;
+  kind: string;
+  embedded_figures: EmbeddedFigure[];
+  /** Phase 4 — multimodal regen verdict. Present only on regen questions
+   *  whose attached image was flagged for regeneration. */
+  image_regen_hint?: { needed: boolean; reason: string } | null;
+}
+export interface FinalMergeDoc {
+  book: { id: UUID; title: string; subject: string };
+  sections: FinalMergeSection[];
+  unattached_figures: UnattachedFigure[];
+}
+
 export interface Section {
   id: UUID;
   book_id: UUID;
@@ -77,6 +203,10 @@ export interface Section {
   qc_llm: Record<string, unknown> | null;
   status: string;
   attempts: number;
+  /** Figures to render inline within this section's theory body. Empty
+   *  when no figures are linked to this section (or theory not yet
+   *  extracted). Populated by Phase 1 figure_embedder. */
+  embedded_figures?: EmbeddedFigure[];
 }
 
 export interface Job {
@@ -220,6 +350,9 @@ export interface Question {
   has_solution: boolean;
   kind: string;
   is_hidden: boolean;
+  /** Figures associated with this question (Phase 1 figure_embedder).
+   *  Empty when no figures linked. */
+  embedded_figures?: EmbeddedFigure[];
 }
 
 export interface RejectedQuestion {
@@ -656,6 +789,65 @@ export const api = {
     req<{ figure_id: UUID; status: string }>(
       `/api/figures/${figureId}/unapprove`,
       { method: "POST" },
+    ),
+  // Phase 1: per-placement hide / unhide. Suppresses an inline or
+  // appended figure at THIS spot without deleting the underlying image.
+  hideFigureReference: (refId: UUID) =>
+    req<{ ref_id: UUID; is_hidden: boolean }>(
+      `/api/books/figure-references/${refId}/hide`,
+      { method: "POST" },
+    ),
+  unhideFigureReference: (refId: UUID) =>
+    req<{ ref_id: UUID; is_hidden: boolean }>(
+      `/api/books/figure-references/${refId}/unhide`,
+      { method: "POST" },
+    ),
+  deleteFigureReference: (refId: UUID) =>
+    req<{ ref_id: UUID; deleted: boolean }>(
+      `/api/books/figure-references/${refId}`,
+      { method: "DELETE" },
+    ),
+  reembedFigures: (bookId: UUID) =>
+    req<{ book_id: UUID; counters: Record<string, number> }>(
+      `/api/books/${bookId}/reembed-figures`,
+      { method: "POST" },
+    ),
+  getFinalDraft: (bookId: UUID, preferRegen: boolean = true) =>
+    req<FinalDraft>(
+      `/api/books/${bookId}/final-draft?prefer_regen=${preferRegen}`,
+    ),
+  reseedFinalDraft: (bookId: UUID, preferRegen: boolean = true) =>
+    req<FinalDraft>(
+      `/api/books/${bookId}/final-draft/reseed?prefer_regen=${preferRegen}`,
+      { method: "POST" },
+    ),
+  patchFinalDraft: (bookId: UUID, operations: FinalDraftOperation[]) =>
+    req<FinalDraft>(`/api/books/${bookId}/final-draft`, {
+      method: "PATCH",
+      body: JSON.stringify({ operations }),
+    }),
+  deleteFinalDraft: (bookId: UUID) =>
+    req<{ deleted: boolean }>(`/api/books/${bookId}/final-draft`, {
+      method: "DELETE",
+    }),
+  finalDraftExportUrl: (
+    bookId: UUID,
+    fmt: "json" | "markdown" | "docx",
+  ) => `${API_BASE}/api/books/${bookId}/final-draft/export/${fmt}`,
+
+  getFinalMerge: (bookId: UUID, preferRegen: boolean = true) =>
+    req<FinalMergeDoc>(
+      `/api/books/${bookId}/final-merge?prefer_regen=${preferRegen}`,
+    ),
+  finalMergeExportUrl: (
+    bookId: UUID,
+    fmt: "json" | "markdown" | "docx",
+    preferRegen: boolean = true,
+  ) =>
+    `${API_BASE}/api/books/${bookId}/final-merge/export/${fmt}?prefer_regen=${preferRegen}`,
+  listUnattachedFigures: (bookId: UUID) =>
+    req<{ book_id: UUID; figures: UnattachedFigure[] }>(
+      `/api/books/${bookId}/unattached-figures`,
     ),
   listFigureReferences: (
     bookId: UUID,
