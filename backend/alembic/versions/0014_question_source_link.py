@@ -29,7 +29,7 @@ def upgrade() -> None:
         batch.add_column(
             sa.Column(
                 "source_question_id",
-                sa.CHAR(32),
+                sa.Uuid(as_uuid=True),
                 nullable=True,
             )
         )

@@ -43,16 +43,16 @@ def upgrade() -> None:
     # explicitly discards. Restoring promotes them into ``questions``.
     op.create_table(
         "rejected_questions",
-        sa.Column("id", sa.CHAR(32), primary_key=True),
+        sa.Column("id", sa.Uuid(as_uuid=True), primary_key=True),
         sa.Column(
             "bank_id",
-            sa.CHAR(32),
+            sa.Uuid(as_uuid=True),
             sa.ForeignKey("question_banks.id", ondelete="CASCADE"),
             nullable=False,
         ),
         sa.Column(
             "book_id",
-            sa.CHAR(32),
+            sa.Uuid(as_uuid=True),
             sa.ForeignKey("books.id", ondelete="CASCADE"),
             nullable=False,
         ),

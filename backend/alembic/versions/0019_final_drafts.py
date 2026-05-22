@@ -30,10 +30,10 @@ depends_on: Union[str, Sequence[str], None] = None
 def upgrade() -> None:
     op.create_table(
         "final_drafts",
-        sa.Column("id", sa.CHAR(32), primary_key=True),
+        sa.Column("id", sa.Uuid(as_uuid=True), primary_key=True),
         sa.Column(
             "book_id",
-            sa.CHAR(32),
+            sa.Uuid(as_uuid=True),
             sa.ForeignKey("books.id", ondelete="CASCADE"),
             nullable=False,
             unique=True,
