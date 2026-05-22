@@ -45,6 +45,23 @@ def run_migrations_online() -> None:
         poolclass=pool.NullPool,
     )
     with connectable.connect() as connection:
+        # Self-heal: if alembic_version exists with the old default
+        # VARCHAR(32) column, widen it before the migration tries to write
+        # a 37-char revision name. This makes a fresh deploy onto a Postgres
+        # that was previously left in a half-migrated state recoverable
+        # without manual DROP SCHEMA.
+        if connection.dialect.name == "postgresql":
+            try:
+                connection.execute(sa.text(
+                    "ALTER TABLE alembic_version "
+                    "ALTER COLUMN version_num TYPE VARCHAR(128)"
+                ))
+                connection.commit()
+            except Exception:
+                # Table doesn't exist yet (fresh DB) — fine, the
+                # version_table_pk_type below will create it correctly.
+                connection.rollback()
+
         context.configure(
             connection=connection,
             target_metadata=target_metadata,
