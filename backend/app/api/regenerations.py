@@ -63,11 +63,27 @@ async def regenerate_book(
     if section_ids is not None:
         params_payload["_section_ids"] = list(section_ids)
 
+    # CARRY-FORWARD — seed the new regen row with the prior regen's
+    # blocks_by_section / qc_drift, so sections the user previously
+    # regenerated stay visible in the Final / Composer view even when
+    # this run's scope only covers a subset of sections. The worker
+    # then MERGES this run's regenerated sections into the seed.
+    prior = (
+        await session.execute(
+            select(Regeneration)
+            .where(Regeneration.book_id == book.id)
+            .order_by(desc(Regeneration.created_at))
+            .limit(1)
+        )
+    ).scalar_one_or_none()
+    seed_blocks = dict(prior.blocks_by_section or {}) if prior else {}
+    seed_qc = dict(prior.qc_drift or {}) if prior and prior.qc_drift else {}
+
     regen = Regeneration(
         book_id=book.id,
         params=params_payload,
-        blocks_by_section={},
-        qc_drift=None,
+        blocks_by_section=seed_blocks,
+        qc_drift=seed_qc or None,
     )
     session.add(regen)
     await session.flush()

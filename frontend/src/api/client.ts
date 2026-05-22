@@ -78,7 +78,12 @@ export interface EmbeddedFigure {
   caption: string;
   variant: "original" | "regen";
   image_url: string;        // GET endpoint returning PNG bytes
-  placement_kind: "inline" | "appended" | "unattached" | "needs_review";
+  placement_kind:
+    | "inline"
+    | "appended"
+    | "unattached"
+    | "needs_review"
+    | "page_fallback"; // auto-placed at end of page-detected section
   /** For theory placement: render figure AFTER the block at this index.
    *  Null when the placement is "appended" / "unattached". */
   placement_block_idx?: number | null;

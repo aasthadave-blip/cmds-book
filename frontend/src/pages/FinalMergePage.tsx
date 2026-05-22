@@ -1,11 +1,12 @@
 import { useState } from "react";
 import { useUI } from "../stores/ui";
-import { useFinalMerge } from "../api/hooks";
+import { useFinalMerge, useFinalDraft } from "../api/hooks";
 import { api, API_BASE } from "../api/client";
 import type { Block, EmbeddedFigure, FinalMergeQuestion } from "../api/client";
 import { BlockRenderer } from "../components/BlockRenderer";
 import { QuestionCard } from "../components/QuestionCard";
 import { RichText, RenderStyleContext } from "../components/RichText";
+import { renderFinalDraftItem } from "./FinalPreviewPage";
 
 /**
  * Phase 2 — Final Merge view.
@@ -23,6 +24,13 @@ export function FinalMergePage() {
   const { selectedBookId } = useUI();
   const [preferRegen, setPreferRegen] = useState(true);
   const { data, isLoading, error } = useFinalMerge(selectedBookId, preferRegen);
+  // Sync with Composer/Preview — if the user has authored a FinalDraft with
+  // edits, show that here too (Composer-Preview-Final all reflect the same
+  // state). When no draft exists or it's empty, fall back to the
+  // auto-generated merge below.
+  const { data: draftData } = useFinalDraft(selectedBookId, true);
+  const draftItems = draftData?.items ?? [];
+  const useDraft = draftItems.length > 0;
 
   if (!selectedBookId) {
     return (
@@ -151,7 +159,17 @@ export function FinalMergePage() {
         </div>
 
         {/* Body */}
-        {data.sections.length === 0 ? (
+        {useDraft ? (
+          // Draft path — Composer/Preview/Final all read from FinalDraft.items
+          // so any edit you make in Composer reflects here byte-for-byte.
+          <div style={{ marginBottom: 8, fontSize: "0.72rem", color: "var(--text3)" }}>
+            ✨ Showing your composed draft. (Edit in Composer · Auto-merge is
+            available when the draft is empty.)
+          </div>
+        ) : null}
+        {useDraft ? (
+          <div className="preview-doc">{draftItems.map(renderFinalDraftItem)}</div>
+        ) : data.sections.length === 0 ? (
           <div className="empty" style={{ padding: 40 }}>
             <div className="empty-i">📄</div>
             <h3>Nothing to show yet</h3>

@@ -438,11 +438,26 @@ async def embed_figures_for_book(
                 counters["theory_inline"] += 1
                 continue
 
-            # STRICT MODE: no page-based section fallback. The figure
-            # extractor's page-assigned section is unreliable for figures
-            # on section boundaries — trust the label match instead. If
-            # the label doesn't appear anywhere in any theory body, the
-            # figure goes to the Unattached panel for manual review.
+            # SECTION FALLBACK: when no label match anywhere AND the figure
+            # has a section_id from the figure extractor (page-based), append
+            # the figure to that section at end-of-blocks. Flagged with
+            # placement_kind="page_fallback" so the UI can prompt the user to
+            # verify (page detection is less reliable than label matching at
+            # section boundaries). Only fires when section_id resolves to a
+            # known Section row — never blindly shoves figures under random
+            # sections.
+            if section_id and section_id in sections_by_id:
+                new_refs.append(FigureReference(
+                    figure_id=fig.id, book_id=book_id, section_ref=section_id,
+                    context="theory", question_id=None,
+                    placeholder_text=fig.figure_number, link_method="auto",
+                    placement_kind="page_fallback", placement_block_idx=None,
+                    placement_char_offset=None,
+                ))
+                counters["theory_appended"] += 1
+                continue
+
+            # No label match + no usable section → Unattached panel.
             new_refs.append(FigureReference(
                 figure_id=fig.id, book_id=book_id, section_ref=section_id,
                 context="theory", question_id=None,
@@ -488,10 +503,23 @@ async def embed_figures_for_book(
                     counters["question_inline"] += 1
                     continue
 
-            # STRICT MODE: no page-based fallback. If the figure's label
-            # doesn't appear in any question's body or solution, it goes
-            # to the Unattached panel rather than being shoved under the
-            # first question on the same page.
+            # SECTION FALLBACK (question context): when no question's text
+            # mentions the label but the figure has a page-detected section,
+            # append at the section level as a "page_fallback" theory-context
+            # reference. The user can re-link to a specific question in the
+            # UI if needed. Conservative — only fires when section_id is
+            # known.
+            if section_id and section_id in sections_by_id:
+                new_refs.append(FigureReference(
+                    figure_id=fig.id, book_id=book_id, section_ref=section_id,
+                    context="theory", question_id=None,
+                    placeholder_text=fig.figure_number, link_method="auto",
+                    placement_kind="page_fallback", placement_block_idx=None,
+                    placement_char_offset=None,
+                ))
+                counters["theory_appended"] += 1
+                continue
+
             new_refs.append(FigureReference(
                 figure_id=fig.id, book_id=book_id, section_ref=section_id,
                 context="question", question_id=None,
@@ -599,7 +627,20 @@ def embed_figures_for_book_sync(session, book_id: UUID) -> dict[str, int]:
                 counters["theory_inline"] += 1
                 continue
 
-            # STRICT MODE: no page-based section fallback. See async variant.
+            # SECTION FALLBACK — same logic as async variant: use the figure
+            # extractor's page-detected section as a soft placement, flagged
+            # so the UI can prompt user verification.
+            if section_id and section_id in sections_by_id:
+                session.add(FigureReference(
+                    figure_id=fig.id, book_id=book_id, section_ref=section_id,
+                    context="theory", question_id=None,
+                    placeholder_text=fig.figure_number, link_method="auto",
+                    placement_kind="page_fallback", placement_block_idx=None,
+                    placement_char_offset=None,
+                ))
+                counters["theory_appended"] += 1
+                continue
+
             session.add(FigureReference(
                 figure_id=fig.id, book_id=book_id, section_ref=section_id,
                 context="theory", question_id=None,
@@ -637,7 +678,18 @@ def embed_figures_for_book_sync(session, book_id: UUID) -> dict[str, int]:
                     counters["question_inline"] += 1
                     continue
 
-            # STRICT MODE: no page-based question fallback. See async variant.
+            # SECTION FALLBACK (question context) — same logic as async.
+            if section_id and section_id in sections_by_id:
+                session.add(FigureReference(
+                    figure_id=fig.id, book_id=book_id, section_ref=section_id,
+                    context="theory", question_id=None,
+                    placeholder_text=fig.figure_number, link_method="auto",
+                    placement_kind="page_fallback", placement_block_idx=None,
+                    placement_char_offset=None,
+                ))
+                counters["theory_appended"] += 1
+                continue
+
             session.add(FigureReference(
                 figure_id=fig.id, book_id=book_id, section_ref=section_id,
                 context="question", question_id=None,

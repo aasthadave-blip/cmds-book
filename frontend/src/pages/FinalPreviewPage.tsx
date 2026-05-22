@@ -116,6 +116,10 @@ export function FinalPreviewPage() {
 // Per-item render
 // ---------------------------------------------------------------------------
 
+export function renderFinalDraftItem(item: FinalDraftItem) {
+  return renderItem(item);
+}
+
 function renderItem(item: FinalDraftItem) {
   if (item.type === "section_heading") {
     const lvl = Math.max(0, Math.min(5, item.level));

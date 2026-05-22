@@ -49,8 +49,30 @@ export function QuestionCard({
           background: "var(--surface, #fff)",
         };
 
+  // Render a prominent heading above the question card. Preference:
+  //   1. exercise_ref — the chip's label like "EXAMPLE 4.3" / "Exercise 8.2"
+  //      (set by the backend chip-merge from the chip's `label` field)
+  //   2. question_number — bare number like "4.5" if no label exists,
+  //      prefixed with "Question " so it reads naturally
+  //   3. nothing — practice questions without any identifier stay clean
+  const exRef = (q.exercise_ref || "").trim();
+  const qNum = (q.question_number || "").trim();
+  const heading = exRef ? exRef : qNum ? `Question ${qNum}` : "";
   return (
     <div style={wrapper}>
+      {heading && (
+        <div
+          style={{
+            fontSize: "1rem",
+            fontWeight: 700,
+            color: "var(--text1)",
+            marginBottom: 6,
+            letterSpacing: 0.2,
+          }}
+        >
+          {heading}
+        </div>
+      )}
       <div
         style={{
           fontSize: "0.66rem",
@@ -63,7 +85,6 @@ export function QuestionCard({
         {q.question_number ? `${q.question_number}` : ""}
         {q.page_start ? ` · p.${q.page_start}` : ""}
         {q.question_type ? ` · ${q.question_type}` : ""}
-        {q.exercise_ref ? ` · ${q.exercise_ref}` : ""}
       </div>
       {q.image_regen_hint?.needed && (
         <div

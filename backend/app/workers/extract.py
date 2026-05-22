@@ -757,8 +757,36 @@ def regenerate_book_task(
             select(Section).where(Section.book_id == book_uuid).order_by(Section.section_id)
         ).scalars().all()
 
-        # Always drop container sections from the regen set
-        sections = [s for s in all_sections if s.section_id not in container_ids]
+        # Container + example sections are dropped from "regen all" so we
+        # don't waste a Gemini call on parent sections whose content is fully
+        # covered by their children, or on worked-example sections that
+        # belong to the questions pipeline. When the user EXPLICITLY picks
+        # section_ids, honor their choice regardless — they know what they
+        # want and silently dropping the selection is hostile.
+        _EX_PREFIXES = (
+            "example ", "worked example", "exercise ", "problem ",
+            "question ", "illustration ", "solved example",
+        )
+        def _is_example_section(s) -> bool:
+            t = (getattr(s, "title", None) or "").strip().lower()
+            return any(t.startswith(p) for p in _EX_PREFIXES)
+
+        if section_ids is None:
+            # "Regen all" — drop containers + example sections
+            sections = [s for s in all_sections if s.section_id not in container_ids]
+            before_n = len(sections)
+            sections = [s for s in sections if not _is_example_section(s)]
+            skipped_n = before_n - len(sections)
+            if skipped_n:
+                logger.info(
+                    "regenerate_book_task: skipping %d example/exercise sections "
+                    "from theory regen 'all' scope",
+                    skipped_n,
+                )
+        else:
+            # Explicit selection — honor whatever the user picked, even
+            # containers / examples. They asked for it.
+            sections = list(all_sections)
 
         # If the caller specified section_ids, further filter to those
         if section_ids is not None:
@@ -836,8 +864,23 @@ def regenerate_book_task(
                 }
 
             if regen_row is not None:
-                regen_row.blocks_by_section = blocks_by_section
-                regen_row.qc_drift = qc_drift
+                # MERGE (don't replace) — the regen row was seeded by the
+                # API with the prior regen's blocks_by_section, so sections
+                # the user previously regenerated keep their saved output.
+                # Only the sections in THIS run's scope get overwritten.
+                # Without flag_modified, SQLAlchemy doesn't notice the JSON
+                # dict mutated in place and skips the UPDATE.
+                from sqlalchemy.orm.attributes import flag_modified
+                existing_blocks = dict(regen_row.blocks_by_section or {})
+                existing_blocks.update(blocks_by_section)
+                regen_row.blocks_by_section = existing_blocks
+                flag_modified(regen_row, "blocks_by_section")
+
+                existing_qc = dict(regen_row.qc_drift or {})
+                existing_qc.update(qc_drift)
+                regen_row.qc_drift = existing_qc
+                flag_modified(regen_row, "qc_drift")
+
                 session.commit()
 
             fail_count = sum(1 for r in qc_drift.values() if not r.get("pass"))

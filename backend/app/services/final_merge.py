@@ -447,9 +447,15 @@ def _merge_chips_with_questions(section: dict[str, Any]) -> dict[str, Any]:
         if old_idx in dropped_chip_idx:
             old_to_new.append(None)
             anchor = new_idx  # last survivor's new index
-            inlined.setdefault(anchor, []).append(
-                questions[dropped_chip_idx[old_idx]]
-            )
+            # Copy the chip's label onto the inlined question so the
+            # rendered card has a prominent "EXAMPLE 4.3" / "Exercise 8.2"
+            # heading. Question extraction sometimes leaves exercise_ref
+            # empty even when the chip clearly identifies it.
+            inlined_q = dict(questions[dropped_chip_idx[old_idx]])
+            chip_label = (b.get("label") or "").strip()
+            if chip_label and not (inlined_q.get("exercise_ref") or "").strip():
+                inlined_q["exercise_ref"] = chip_label
+            inlined.setdefault(anchor, []).append(inlined_q)
         else:
             new_idx += 1
             new_blocks.append(b)
@@ -704,6 +710,54 @@ async def build_final_merge(
                 questions_by_section.setdefault(q.section_ref, []).append(q)
 
     # 5. Assemble ordered sections
+    # CROSS-SECTION CHIP MATCHING — schemas often split worked examples into
+    # their own subsection (e.g. "3-percentage-example-3-1"). A chip in the
+    # parent section ("3-percentage") then has its target question filed
+    # under the subsection, so the per-section chip-merge below would not
+    # find a match and the chip stays orphaned while the subsection renders
+    # a duplicate full card. To fix: augment each section's question pool
+    # with questions from its descendants tagged with `_origin_section_id`.
+    # If a chip consumes a descendant's question, we later skip that
+    # subsection so it doesn't render twice.
+    desc_by_section: dict[str, set[str]] = {}
+
+    def _collect_descendants(node):
+        out_ids: set[str] = set()
+        for sub in (getattr(node, "subsections", None) or []):
+            if getattr(sub, "type", "") == "excluded":
+                continue
+            out_ids.add(sub.id)
+            out_ids |= _collect_descendants(sub)
+        return out_ids
+
+    def _walk_desc(nodes):
+        for n in nodes:
+            if getattr(n, "type", "") == "excluded":
+                continue
+            desc_by_section[n.id] = _collect_descendants(n)
+            _walk_desc(getattr(n, "subsections", None) or [])
+
+    _walk_desc(getattr(schema_obj, "sections", []) or [])
+
+    def _question_to_dict(q, *, origin_section_id: str | None = None) -> dict[str, Any]:
+        qd: dict[str, Any] = {
+            "id": str(q.id),
+            "question_number": q.question_number,
+            "exercise_ref": q.exercise_ref,
+            "section_ref": q.section_ref,
+            "page_start": q.page_start,
+            "question_type": q.question_type,
+            "raw_text": q.raw_text or "",
+            "has_solution": bool(q.has_solution),
+            "solution_text": q.solution_text or "",
+            "kind": q.kind,
+            "embedded_figures": question_figures_by_qid.get(str(q.id), []),
+            "image_regen_hint": _extract_image_regen_hint(q),
+        }
+        if origin_section_id is not None:
+            qd["_origin_section_id"] = origin_section_id
+        return qd
+
     out_sections: list[dict[str, Any]] = []
     for ss in ordered_schema_sections:
         sec_row = section_by_id.get(ss.id)
@@ -716,28 +770,27 @@ async def build_final_merge(
             blocks = (sec_row.blocks if sec_row and sec_row.blocks else []) or []
             block_source = "original"
         section_figures = theory_by_section.get(ss.id, [])
-        # Skip purely empty sections (no theory body, no questions, no figs)
         section_questions = questions_by_section.get(ss.id, [])
-        if not blocks and not section_figures and not section_questions:
-            continue
 
-        question_dicts: list[dict[str, Any]] = []
-        for q in section_questions:
-            qd = {
-                "id": str(q.id),
-                "question_number": q.question_number,
-                "exercise_ref": q.exercise_ref,
-                "section_ref": q.section_ref,
-                "page_start": q.page_start,
-                "question_type": q.question_type,
-                "raw_text": q.raw_text or "",
-                "has_solution": bool(q.has_solution),
-                "solution_text": q.solution_text or "",
-                "kind": q.kind,
-                "embedded_figures": question_figures_by_qid.get(str(q.id), []),
-                "image_regen_hint": _extract_image_regen_hint(q),
-            }
-            question_dicts.append(qd)
+        # Build the question pool: section's own questions PLUS descendant
+        # questions (tagged with their origin) so chips can match across
+        # subsections. Descendant questions stay in their own section's
+        # question list too — the consumed-tracking step below decides
+        # whether to skip the subsection entirely.
+        question_dicts: list[dict[str, Any]] = [
+            _question_to_dict(q, origin_section_id=ss.id)
+            for q in section_questions
+        ]
+        for desc_sid in desc_by_section.get(ss.id, set()):
+            for q in questions_by_section.get(desc_sid, []):
+                question_dicts.append(
+                    _question_to_dict(q, origin_section_id=desc_sid)
+                )
+
+        # Skip purely empty sections (no theory, no figures, no own questions
+        # AND no descendant questions whose chip might land here).
+        if not blocks and not section_figures and not question_dicts:
+            continue
 
         out_sections.append({
             "section_id": ss.id,
@@ -798,6 +851,84 @@ async def build_final_merge(
     # (dropping the chip + the duplicate standalone question). Idempotent
     # for sections that have no chips or no questions.
     merged_sections = [_merge_chips_with_questions(s) for s in out_sections]
+
+    # Track which questions were consumed by chip-match (across sections —
+    # cross-section matching is enabled above by tagging descendant
+    # questions with `_origin_section_id`). When a subsection's question
+    # is fully consumed via its parent's chip, we drop that subsection
+    # from the output to prevent a duplicate full-card render.
+    consumed_qids_by_origin: dict[str, set[str]] = {}
+    for s in merged_sections:
+        for qs in (s.get("inlined_questions_by_block_idx") or {}).values():
+            for q in qs:
+                origin = q.get("_origin_section_id")
+                qid = q.get("id")
+                if origin and qid:
+                    consumed_qids_by_origin.setdefault(origin, set()).add(qid)
+
+    # Drop sections whose every question got consumed elsewhere AND that
+    # have no theory blocks / figures of their own to justify a render.
+    # Preserves parent + sibling sections; only collapses worked-example
+    # subsections whose content has been hoisted to the parent via chip.
+    pruned_sections: list[dict[str, Any]] = []
+    for s in merged_sections:
+        sid = s.get("section_id")
+        consumed_here = consumed_qids_by_origin.get(sid or "", set())
+        own_questions = s.get("questions") or []
+        # Strip origin tag from outgoing questions + filter out any that
+        # were consumed via a parent chip.
+        kept_questions: list[dict[str, Any]] = []
+        for q in own_questions:
+            qid = q.get("id")
+            origin = q.get("_origin_section_id")
+            # Only keep questions whose origin == this section (don't ship
+            # the duplicates that were borrowed from descendants — those
+            # are/were owned by the descendant section's own row).
+            if origin and origin != sid:
+                continue
+            if qid in consumed_here:
+                continue
+            q2 = {k: v for k, v in q.items() if k != "_origin_section_id"}
+            kept_questions.append(q2)
+        s["questions"] = kept_questions
+
+        # Also strip _origin_section_id from inlined questions (frontend
+        # doesn't need internal tracking metadata).
+        if s.get("inlined_questions_by_block_idx"):
+            cleaned: dict[str, list[dict[str, Any]]] = {}
+            for k, qs in s["inlined_questions_by_block_idx"].items():
+                cleaned[k] = [
+                    {kk: vv for kk, vv in q.items() if kk != "_origin_section_id"}
+                    for q in qs
+                ]
+            s["inlined_questions_by_block_idx"] = cleaned
+
+        # Drop this section if it's a worked-example subsection whose
+        # question was hoisted via a parent's chip-match. Without this,
+        # the example renders twice: once as the inlined question card in
+        # the parent, once as a standalone section with redundant solution
+        # blocks here. The subsection's blocks are typically just
+        # solution_text already attached to the question — dropping them
+        # is the intended dedup.
+        #
+        # We DO keep figures around — if the subsection had its own
+        # figure that didn't make it onto the question's
+        # embedded_figures, the user would lose visual content. So we
+        # demote the section to a figures-only "trailer" appended to the
+        # parent? No — that's overengineering. Cleanest: drop entirely.
+        # The figure embedder already attaches question-context figures
+        # to the question's embedded_figures, so they ride along on the
+        # inlined card. Section-level figures here would be a rare edge
+        # case we accept losing in exchange for not duplicating examples.
+        if (
+            sid
+            and sid in consumed_qids_by_origin
+            and not kept_questions
+        ):
+            continue
+        pruned_sections.append(s)
+    merged_sections = pruned_sections
+
     # Second pass: for worked-example sections where the merge ran and
     # the inlined question carries solution_text, drop the now-redundant
     # OCR'd solution blocks. Deterministic, structural signal only.
