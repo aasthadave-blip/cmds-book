@@ -31,7 +31,10 @@ def upgrade() -> None:
             sa.Column(
                 "is_hidden",
                 sa.Boolean(),
-                server_default=sa.text("0"),
+                # Use sa.false() so the literal renders correctly per dialect:
+                # SQLite → 0, Postgres → false. sa.text("0") fails on Postgres
+                # (DatatypeMismatch).
+                server_default=sa.false(),
                 nullable=False,
             )
         )

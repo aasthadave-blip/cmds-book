@@ -36,7 +36,8 @@ def upgrade() -> None:
             "is_hidden",
             sa.Boolean(),
             nullable=False,
-            server_default=sa.text("0"),
+            # sa.false() renders correctly per dialect (SQLite 0, Postgres false).
+            server_default=sa.false(),
         ),
     )
 

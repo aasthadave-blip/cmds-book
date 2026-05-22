@@ -50,7 +50,8 @@ def upgrade() -> None:
             "prefer_regen",
             sa.Boolean(),
             nullable=False,
-            server_default=sa.text("1"),
+            # sa.true() renders correctly per dialect (SQLite 1, Postgres true).
+            server_default=sa.true(),
         ),
         sa.Column("last_seeded_at", sa.DateTime(), nullable=True),
         sa.Column(
