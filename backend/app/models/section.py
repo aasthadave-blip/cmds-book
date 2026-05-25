@@ -20,7 +20,11 @@ class Section(Base):
         nullable=False,
         index=True,
     )
-    section_id: Mapped[str] = mapped_column(String(64), nullable=False)
+    # NOTE: widened to 256 in migration 0020. SQLite ignores width;
+    # Postgres enforces it, and slug-style IDs for deeply-nested worked
+    # examples (e.g. "...-finding-the-distance-...-example-8-38") can
+    # exceed 64 chars.
+    section_id: Mapped[str] = mapped_column(String(256), nullable=False)
     title: Mapped[str] = mapped_column(Text, nullable=False)
     level: Mapped[int | None] = mapped_column(Integer)
     bloom: Mapped[int | None] = mapped_column(Integer)

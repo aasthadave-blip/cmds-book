@@ -32,7 +32,7 @@ class RejectedQuestion(Base):
         ForeignKey("books.id", ondelete="CASCADE"),
         nullable=False,
     )
-    section_ref: Mapped[str | None] = mapped_column(sa.String(64), nullable=True, index=True)
+    section_ref: Mapped[str | None] = mapped_column(sa.String(256), nullable=True, index=True)
     section_title: Mapped[str | None] = mapped_column(sa.Text)
     page_start: Mapped[int | None] = mapped_column(sa.Integer)
     page_end: Mapped[int | None] = mapped_column(sa.Integer)

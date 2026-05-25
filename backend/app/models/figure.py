@@ -20,7 +20,7 @@ class Figure(Base):
         nullable=False,
         index=True,
     )
-    section_id: Mapped[str] = mapped_column(sa.String(64), nullable=False, index=True)
+    section_id: Mapped[str] = mapped_column(sa.String(256), nullable=False, index=True)
     figure_number: Mapped[str | None] = mapped_column(sa.Text)
     caption: Mapped[str | None] = mapped_column(sa.Text)
     description: Mapped[str | None] = mapped_column(sa.Text)

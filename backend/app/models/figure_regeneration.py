@@ -26,7 +26,7 @@ class FigureRegeneration(Base):
         nullable=False,
         index=True,
     )
-    section_id: Mapped[str] = mapped_column(sa.String(64), nullable=False)
+    section_id: Mapped[str] = mapped_column(sa.String(256), nullable=False)
     image_url: Mapped[str | None] = mapped_column(sa.Text)
     style_params: Mapped[dict | None] = mapped_column(sa.JSON)
     model_used: Mapped[str | None] = mapped_column(sa.String(128))

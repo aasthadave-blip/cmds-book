@@ -26,7 +26,7 @@ class Question(Base):
         nullable=False,
         index=True,
     )
-    section_ref: Mapped[str | None] = mapped_column(sa.String(64), nullable=True, index=True)
+    section_ref: Mapped[str | None] = mapped_column(sa.String(256), nullable=True, index=True)
     section_title: Mapped[str | None] = mapped_column(sa.Text)
     page_start: Mapped[int | None] = mapped_column(sa.Integer)
     page_end: Mapped[int | None] = mapped_column(sa.Integer)
@@ -53,7 +53,7 @@ class Question(Base):
     # Stage 2 OCR metadata — verbatim tags captured during extraction
     question_number: Mapped[str | None] = mapped_column(sa.String(32))
     exercise_ref: Mapped[str | None] = mapped_column(sa.String(128))
-    chapter_ref: Mapped[str | None] = mapped_column(sa.String(64))
+    chapter_ref: Mapped[str | None] = mapped_column(sa.String(256))
     sub_part: Mapped[str | None] = mapped_column(sa.String(8))
     question_type: Mapped[str | None] = mapped_column(sa.String(32))
     has_options: Mapped[bool] = mapped_column(
