@@ -18,35 +18,35 @@ This is the single source of truth. Earlier drafts (`COST_MODEL_2026.md`, `COST_
 | Scenario | Description | Cost |
 |---|---|---|
 | **Best case** | Extract once. No regen at all. | **$1.20** |
-| **Typical** ⭐ | Extract + 1 theory regen + 1 Q regen (all 70 source questions × 3 variants) + 30% of 15 figures regenerated | **$11.40** |
-| **Heavy** | Extract + 2 theory regens + 3 Q regen passes + 80% of figures regenerated | **$30.78** |
+| **Typical** ⭐ | Extract + 1 theory regen + 1 Q regen (all 100 source questions × 2 variants) + 30% of 15 figures regenerated | **$10.99** |
+| **Heavy** | Extract + 2 theory regens + 3 Q regen passes + 80% of figures regenerated | **$29.54** |
 
 ### Annual forecast (500 books × 12 chapters = 6,000 chapters)
 
 | Scenario | AI spend | Infra | **Yearly total** |
 |---|---|---|---|
 | Best | $6,576 | $600 | **$7,176** |
-| Typical ⭐ | $67,817 | $600 | **$68,417** |
-| Heavy | $184,068 | $600 | **$184,668** |
+| Typical ⭐ | $65,344 | $600 | **$65,944** |
+| Heavy | $177,047 | $600 | **$177,647** |
 
-> **Recommended yearly budget: $68K / yr** for 500 books at typical usage.
-> Reserve up to $185K / yr if heavy iteration is expected.
+> **Recommended yearly budget: $66K / yr** for 500 books at typical usage.
+> Reserve up to $178K / yr if heavy iteration is expected.
 
 ### Per book (12 chapters)
 
 | Scenario | Cost |
 |---|---|
 | Best | **$14.36** |
-| Typical | **$136.83** |
-| Heavy | **$369.34** |
+| Typical | **$131.89** |
+| Heavy | **$354.49** |
 
 ### Per chapter — at 50 books / year volume (alternative scale)
 
 | Scenario | AI yr | + Infra | Year |
 |---|---|---|---|
 | Best | $658 | $60 | **$718** |
-| Typical | $6,782 | $60 | **$6,842** |
-| Heavy | $18,407 | $60 | **$18,467** |
+| Typical | $6,534 | $60 | **$6,594** |
+| Heavy | $17,705 | $60 | **$17,765** |
 
 ---
 
@@ -100,8 +100,8 @@ Single provider: **Google Gemini API**.
 | **T4** | Theory regen | `services/regenerator.py:92` | `gemini-2.5-pro` | 10 × Rt = 10 |
 | **T5** | QC verifier (OFF default) | `services/qa/verifier.py:65` | `gemini-2.5-flash` | 0 (off) |
 | **Q1** | Question extract | `workers/questions_v3.py:730` | `gemini-2.5-flash` | 10 calls |
-| **Q2** | Question regen (text) | `workers/question_regen_v3.py:365` | `gemini-2.5-flash` | (S × (1−P)) × V = 147 calls |
-| **Q3** | Question regen (multimodal) | `workers/question_regen_v3.py:353` | `gemini-2.5-pro` | (S × P) × V = 63 calls |
+| **Q2** | Question regen (text) | `workers/question_regen_v3.py:365` | `gemini-2.5-flash` | (S × (1−P)) × V = 140 calls |
+| **Q3** | Question regen (multimodal) | `workers/question_regen_v3.py:353` | `gemini-2.5-pro` | (S × P) × V = 60 calls |
 | **I1** | Figure extract | `services/figures/extractor.py:134` | `gemini-3.1-pro-preview` | 1 call |
 | **I2** | Figure regen | `services/figures/regenerator.py:141` | `gemini-3.1-flash-image-preview` | 4.5 calls (30% of 15) |
 | **I-OL** | Label overlay | `services/figures/overlay.py:159` | `gemini-3.1-pro-preview` | 4.5 calls (1 per figure regen, 2 OCR each) |
@@ -161,8 +161,8 @@ Single provider: **Google Gemini API**.
 | Books per year | **500** | Production target |
 | Chapters per book | **12** | Standard textbook |
 | Sections per chapter (N) | **10** | CBSE/ICSE/JEE typical |
-| Source questions (S) | **70** | Real chapters have 50–100 questions (exercises + examples + practice) |
-| Variants per regen (V) | **3** | UI default |
+| Source questions (S) | **100** | Realistic large chapter (CBSE/JEE/Advanced: 50–150 typical) |
+| Variants per regen (V) | **2** | UI configurable; 2 gives variety with lower cost vs 3 |
 | % questions with images (P) | **30%** | Math/physics typical |
 | Figures per chapter (F) | **15** | Math/physics: 10–25; bio: 15–30 |
 | % figures regenerated (Fr%) | **30%** | "Fix the broken ones" workflow → Fr = 4.5 |
@@ -236,7 +236,7 @@ Gemini tokenizes attached PDFs at ~258 tokens/page (OCR mode):
 
 ### 7.1 Substituted values
 
-N=10, S=70, V=3, F=15, Fr%=30% → Fr=4.5, P=30%, Rt=1, Rq=1, R=30%, Infra=$0.10
+N=10, S=100, V=2, F=15, Fr%=30% → Fr=4.5, P=30%, Rt=1, Rq=1, R=30%, Infra=$0.10
 
 ### 7.2 Theory pipeline
 
@@ -253,11 +253,11 @@ N=10, S=70, V=3, F=15, Fr%=30% → Fr=4.5, P=30%, Rt=1, Rq=1, R=30%, Infra=$0.10
 | Component | Calc | Cost |
 |---|---|---|
 | Q1 extract | 10 × $0.014 | $0.140 |
-| Q2 text regen | 49 sources × 3 × $0.014 | $2.058 |
-| Q3 multimodal regen | 21 sources × 3 × $0.073 | $4.599 |
-| **Subtotal** | | **$6.797** |
+| Q2 text regen | 70 sources × 2 × $0.014 | $1.960 |
+| Q3 multimodal regen | 30 sources × 2 × $0.073 | $4.380 |
+| **Subtotal** | | **$6.480** |
 
-> S=70 questions split 70/30 by image presence: 49 text + 21 multimodal. Each gets V=3 variants. Total Q regen calls = 70 × 3 = 210.
+> S=100 questions split 70/30 by image presence: 70 text + 30 multimodal. Each gets V=2 variants. Total Q regen calls = 100 × 2 = 200.
 
 ### 7.4 Images pipeline
 
@@ -273,12 +273,12 @@ N=10, S=70, V=3, F=15, Fr%=30% → Fr=4.5, P=30%, Rt=1, Rq=1, R=30%, Infra=$0.10
 | Component | Cost |
 |---|---|
 | Theory | $1.358 |
-| Questions | $6.797 |
+| Questions | $6.480 |
 | Images | $0.540 |
-| **AI subtotal** | **$8.695** |
-| + Retry buffer 30% | $2.609 |
+| **AI subtotal** | **$8.378** |
+| + Retry buffer 30% | $2.513 |
 | + Infra | $0.100 |
-| **GRAND $/CHAPTER** | **$11.40** |
+| **GRAND $/CHAPTER** | **$10.99** |
 
 ### 7.6 Best case (extract only, no regen)
 
@@ -297,28 +297,28 @@ N=10, S=70, V=3, F=15, Fr%=30% → Fr=4.5, P=30%, Rt=1, Rq=1, R=30%, Infra=$0.10
 | Component | Cost |
 |---|---|
 | Theory (Rt=2) | $2.078 |
-| Questions (Rq=3) | $20.111 |
+| Questions (Rq=3) | $19.160 |
 | Images (Fr=12 = 80% of F=15) | $1.342 |
-| AI subtotal | $23.531 |
-| + Retry 30% | $7.059 |
+| AI subtotal | $22.580 |
+| + Retry 30% | $6.774 |
 | + Infra | $0.200 |
-| **GRAND $/CH (Heavy)** | **$30.79** |
+| **GRAND $/CH (Heavy)** | **$29.54** |
 
 ### 7.8 Per book (12 chapters)
 
 | Scenario | Per book |
 |---|---|
 | Best | **$14.36** |
-| Typical ⭐ | **$136.83** |
-| Heavy | **$369.34** |
+| Typical ⭐ | **$131.89** |
+| Heavy | **$354.49** |
 
 ### 7.9 Per year (500 books = 6,000 chapters)
 
 | Scenario | AI cost | + Infra | **Year** |
 |---|---|---|---|
 | Best | $6,576 | $600 | **$7,176** |
-| Typical ⭐ | $67,817 | $600 | **$68,417** |
-| Heavy | $184,068 | $600 | **$184,668** |
+| Typical ⭐ | $65,344 | $600 | **$65,944** |
+| Heavy | $177,047 | $600 | **$177,647** |
 
 ---
 
@@ -336,13 +336,13 @@ Worst case per section in theory: 3 × 4 = 12 calls. Average: ~1.3× (the 30% bu
 
 ---
 
-## 9. Cost driver ranking — % of Typical $/chapter
+## 9. Cost driver ranking — % of Typical $/chapter ($10.99)
 
 | Rank | Driver | $/ch | % share |
 |---|---|---|---|
-| 1 | **Q3 multimodal regen** | $4.599 | **40%** |
-| 2 | Retry buffer (30%) | $2.609 | 23% |
-| 3 | Q2 text regen | $2.058 | 18% |
+| 1 | **Q3 multimodal regen** | $4.380 | **40%** |
+| 2 | Retry buffer (30%) | $2.513 | 23% |
+| 3 | Q2 text regen | $1.960 | 18% |
 | 4 | T4 theory regen | $0.710 | 6% |
 | 5 | T3 theory extract | $0.590 | 5% |
 | 6 | I-OL label overlay | $0.257 | 2% |
@@ -360,15 +360,15 @@ Worst case per section in theory: 3 × 4 = 12 calls. Average: ~1.3× (the 30% bu
 
 | # | Lever | Effort | Savings/ch | $/yr at 500 books |
 |---|---|---|---|---|
-| 1 | Disable `MULTIMODAL_REGEN_ENABLED` (loses image-needs-regen badge) | env | **$4.60** (–40%) | **–$27,600** |
-| 2 | Cap V from 3 → 2 (less variety, same coverage) | UI | $1.55 (–14%) | –$9,300 |
-| 3 | Reduce Rq from 1 → 0.5 (skip regen on half the chapters) | workflow | $3.40 (–30%) | –$20,400 |
+| 1 | Disable `MULTIMODAL_REGEN_ENABLED` (loses image-needs-regen badge) | env | **$4.38** (–40%) | **–$26,280** |
+| 2 | Drop V from 2 → 1 (one variant per source, less variety) | UI | $3.17 (–29%) | –$19,020 |
+| 3 | Reduce Rq from 1 → 0.5 (skip regen on half the chapters) | workflow | $3.24 (–29%) | –$19,440 |
 | 4 | Enable Gemini prompt caching (T2 + Q1 prompts) | 1 dev day | $0.30 (–3%) | –$1,800 |
 | 5 | Disable overlay step | per-call | $0.26 (–2%) | –$1,500 |
 | 6 | Move T3 to Flash | env | $0.42 (–4%) | –$2,500 |
-| 7 | Reduce P (filter image-questions out of regen) | filter | varies | up to $4,500 |
+| 7 | Reduce P (filter image-questions out of regen) | filter | varies | up to $4,300 |
 
-Combined "lean prod" (#1 + #4): typical drops from $11.40 → $6.50/ch → $39K/yr (43% off).
+Combined "lean prod" (#1 + #4): typical drops from $10.99 → $6.30/ch → $37.8K/yr (43% off).
 
 ---
 
@@ -377,8 +377,8 @@ Combined "lean prod" (#1 + #4): typical drops from $11.40 → $6.50/ch → $39K/
 | Mode | T3 | Q regen | Figure | $/ch | Yearly @ 500 |
 |---|---|---|---|---|---|
 | **Cheapest viable** | Flash | Flash, no multimodal | Pro Preview extract only | $1.50 | $9K |
-| **Balanced (Typical)** ⭐ | Pro | Flash + Pro multimodal | Pro Preview + Flash Image + overlay | **$11.40** | **$68K** |
-| **Premium** | Pro | All Pro | Pro Preview + GA Imagen | $14.00 | $84K |
+| **Balanced (Typical)** ⭐ | Pro | Flash + Pro multimodal | Pro Preview + Flash Image + overlay | **$10.99** | **$66K** |
+| **Premium** | Pro | All Pro | Pro Preview + GA Imagen | $13.40 | $80K |
 
 ---
 
@@ -476,8 +476,8 @@ Knobs:
 
 ## 15. How to use this doc
 
-1. **Customer quoting:** Typical $11.40/ch all-in (S=70 realistic).
-2. **Annual budget:** $68K for 500 books at typical. Reserve $185K for heavy iteration.
+1. **Customer quoting:** Typical $10.99/ch all-in (S=100, V=2 realistic).
+2. **Annual budget:** $66K for 500 books at typical. Reserve $178K for heavy iteration.
 3. **Vendor comparison:** at $11.40/ch you're paying for Pro-tier quality. Lower-priced SaaS uses smaller models — compare quality not price.
 4. **Optimization order:** Disable multimodal regen first (#1, –40% off) — biggest lever. Then prompt caching (#4).
 5. **Sensitivity analysis:** use §13 formula. Q3 multimodal dominates — every variant of every image-bearing question is +$0.073.
