@@ -478,7 +478,7 @@ Knobs:
 
 1. **Customer quoting:** Typical $10.99/ch all-in (S=100, V=2 realistic).
 2. **Annual budget:** $66K for 500 books at typical. Reserve $178K for heavy iteration.
-3. **Vendor comparison:** at $11.40/ch you're paying for Pro-tier quality. Lower-priced SaaS uses smaller models — compare quality not price.
+3. **Vendor comparison:** at $10.99/ch you're paying for Pro-tier quality. Lower-priced SaaS uses smaller models — compare quality not price.
 4. **Optimization order:** Disable multimodal regen first (#1, –40% off) — biggest lever. Then prompt caching (#4).
 5. **Sensitivity analysis:** use §13 formula. Q3 multimodal dominates — every variant of every image-bearing question is +$0.073.
 6. **Re-audit:** quarterly or when §14 call sites change.
