@@ -82,15 +82,50 @@ def _extract_number(s: str | None) -> str | None:
     return m.group(1) if m else None
 
 
+# Sub-question parenthesised parts: "1(i)" → "1.1", "1(ii)" → "1.2", etc.
+# Maps roman numeral suffixes to dotted-decimal sub-question index so a chip
+# numbered "1(iii)" matches a question whose exercise_ref is "Exercise 1.3".
+_ROMAN_MAP = {
+    "i": 1, "ii": 2, "iii": 3, "iv": 4, "v": 5,
+    "vi": 6, "vii": 7, "viii": 8, "ix": 9, "x": 10,
+    "xi": 11, "xii": 12, "xiii": 13, "xiv": 14, "xv": 15,
+}
+_ROMAN_SUFFIX_RE = _re.compile(r"(\d+)\s*[\(\[]\s*([ivx]+)\s*[\)\]]", _re.IGNORECASE)
+
+
+def _normalise_subquestion(s: str | None) -> str | None:
+    """If the string contains a `N(roman)` sub-question pattern, convert to
+    `N.M` dotted form. Returns the normalised number string or None if no
+    match. Used so chips like "Exercise 1(i)" align with questions like
+    "Exercise 1.1".
+    """
+    if not s:
+        return None
+    m = _ROMAN_SUFFIX_RE.search(str(s))
+    if not m:
+        return None
+    parent = m.group(1)
+    roman_idx = _ROMAN_MAP.get(m.group(2).lower())
+    if roman_idx is None:
+        return None
+    return f"{parent}.{roman_idx}"
+
+
 def _chip_number(block: dict[str, Any]) -> str | None:
     t = block.get("t")
     if t not in ("example_ref", "exercise_ref", "question_ref"):
         return None
-    # Prefer the chip's explicit number, fall back to extracting from label
+    # 1) Sub-question pattern (Exercise 1(iii) → 1.3) takes priority over
+    #    bare-integer extraction so chips align with dotted question refs.
+    for src in (block.get("label"), block.get("number")):
+        sub = _normalise_subquestion(src)
+        if sub:
+            return sub
+    # 2) Prefer the chip's explicit number, fall back to extracting from label.
     n = _extract_number(block.get("number")) or _extract_number(block.get("label"))
     if n:
         return n
-    # Last resort: extract from section_id suffix (e.g. "-example-4.18")
+    # 3) Last resort: extract from section_id suffix (e.g. "-example-4.18")
     return _extract_number(block.get("section_id"))
 
 
@@ -413,20 +448,43 @@ def _merge_chips_with_questions(section: dict[str, Any]) -> dict[str, Any]:
         section["inlined_questions_by_block_idx"] = {}
         return section
 
-    # Match chip indices to question indices by number
+    # Match chip → question. Two-tier:
+    #   Tier 1 (primary): normalised number equality. Catches "Exercise 4.3"
+    #          chip ↔ "Exercise 4.3" question, and (via sub-question
+    #          normalisation in _chip_number) "Exercise 1(iii)" → 1.3 chip ↔
+    #          "Exercise 1.3" question.
+    #   Tier 2 (fallback): section_id match. When numbering schemes drift
+    #          (e.g. chip "Exercise 7(ii)" with no roman map AND question
+    #          stored under section_ref ending in -exercise-7-ii), the chip's
+    #          section_id and the question's section_ref still align.
     used_q: set[int] = set()
     matches: list[tuple[int, int]] = []  # (chip_block_idx, question_idx)
     for bi, b in enumerate(blocks):
         cn = _chip_number(b)
-        if not cn:
-            continue
-        for qi, q in enumerate(questions):
-            if qi in used_q:
-                continue
-            if _question_number(q) == cn:
-                matches.append((bi, qi))
-                used_q.add(qi)
-                break
+        chip_sid = b.get("section_id")
+        matched = False
+        # Tier 1: number
+        if cn:
+            for qi, q in enumerate(questions):
+                if qi in used_q:
+                    continue
+                if _question_number(q) == cn:
+                    matches.append((bi, qi))
+                    used_q.add(qi)
+                    matched = True
+                    break
+        # Tier 2: section_id
+        if not matched and chip_sid:
+            for qi, q in enumerate(questions):
+                if qi in used_q:
+                    continue
+                q_sid = q.get("section_ref") or ""
+                if q_sid == chip_sid or (
+                    q_sid and chip_sid and q_sid.startswith(chip_sid + "-")
+                ):
+                    matches.append((bi, qi))
+                    used_q.add(qi)
+                    break
 
     if not matches:
         section["inlined_questions_by_block_idx"] = {}

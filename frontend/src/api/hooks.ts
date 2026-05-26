@@ -564,12 +564,20 @@ export function usePatchFinalDraft(bookId: UUID | null) {
     mutationFn: (operations: Parameters<typeof api.patchFinalDraft>[1]) =>
       api.patchFinalDraft(bookId!, operations),
     onSuccess: (data) => {
-      // Two-step cache update: write the new data (instant for any
-      // consumer on the same page) AND invalidate so any other mounted
-      // consumer (Preview tab, sidebar counts) refetches.
+      // Three-step cache propagation:
+      //   1. setQueryData on the final-draft key → instant for any consumer
+      //      (Composer, Preview, and Final tab's draft branch).
+      //   2. invalidateQueries on the same key → forces refetch on any
+      //      stale mounted consumer.
+      //   3. invalidateQueries on the merge key → Final tab also reads
+      //      final-merge as a fallback when the draft is empty; bust that
+      //      cache too so it never serves stale data after a draft edit.
       qc.setQueryData(["books", bookId, "final-draft"], data);
       void qc.invalidateQueries({
         queryKey: ["books", bookId, "final-draft"],
+      });
+      void qc.invalidateQueries({
+        queryKey: ["books", bookId, "final-merge"],
       });
     },
   });
