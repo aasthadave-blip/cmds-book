@@ -27,6 +27,7 @@ from sqlalchemy.orm import Session, sessionmaker
 
 from app.core.config import settings
 from app.models import Book, Figure, FigureReference, FigureRegeneration, Job, Question
+from app.workers.celery_app import celery_app
 from app.workers.runner import register as register_task
 
 logger = logging.getLogger(__name__)
@@ -254,6 +255,12 @@ def _extract_figures_v2(book_id: str, job_id: str) -> dict[str, Any]:
             finished_at=datetime.utcnow(),
         )
         return result
+
+
+# Celery-mode wrapper. Inline path uses _extract_figures_v2 directly.
+@celery_app.task(name="extract_figures_v2", bind=True)
+def extract_figures_v2_task(self, book_id: str, job_id: str) -> dict[str, Any]:
+    return _extract_figures_v2(book_id, job_id)
 
 
 register_task("extract_figures_v2", _extract_figures_v2)
@@ -518,6 +525,18 @@ def _regenerate_figures_v2_section(
         "failed": failed,
         "failures": failures,
     }
+
+
+# Celery-mode wrapper. Inline path uses _regenerate_figures_v2_section directly.
+@celery_app.task(name="regenerate_figures_v2_section", bind=True)
+def regenerate_figures_v2_section_task(
+    self,
+    book_id: str,
+    section_ref: str,
+    params_json: str,
+    job_id: str,
+) -> dict[str, Any]:
+    return _regenerate_figures_v2_section(book_id, section_ref, params_json, job_id)
 
 
 register_task("regenerate_figures_v2_section", _regenerate_figures_v2_section)

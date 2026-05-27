@@ -45,6 +45,7 @@ from app.models.question_bank import QuestionBank
 from app.services.qa.fidelity import evaluate_question
 from app.services.qa.pdf_text import extract_pages
 from app.services.qa.verifier import get_page_ground_truth, match_page
+from app.workers.celery_app import celery_app
 from app.workers.runner import register as register_task
 
 logger = logging.getLogger(__name__)
@@ -427,6 +428,12 @@ def run_qa_fidelity_task(bank_id: str, job_id: str) -> dict:
 
 def _run_qa_fidelity(bank_id: str, job_id: str) -> dict:
     return run_qa_fidelity_task(bank_id, job_id)
+
+
+# Celery-mode wrapper. Inline path uses _run_qa_fidelity directly.
+@celery_app.task(name="run_qa_fidelity", bind=True)
+def run_qa_fidelity_celery_task(self, bank_id: str, job_id: str) -> dict:
+    return _run_qa_fidelity(bank_id, job_id)
 
 
 register_task("run_qa_fidelity", _run_qa_fidelity)

@@ -46,6 +46,7 @@ from app.models.question_bank import QuestionBank
 from app.models.question_regeneration import QuestionRegeneration
 from app.services.prompt_loader import load_raw
 from app.utils.json_parse import parse_json
+from app.workers.celery_app import celery_app
 from app.workers.runner import register as register_task
 
 logger = logging.getLogger(__name__)
@@ -1097,6 +1098,18 @@ def _retry_regen_section_v3(
                         error=str(e)[:2000],
                         finished_at=datetime.utcnow())
         return {"ok": False, "error": str(e)}
+
+
+# Celery-mode task wrappers. Inline path uses the underscore functions via
+# register_task; Celery path uses these wrappers. Behavior identical.
+@celery_app.task(name="extract_questions_regen_v3", bind=True)
+def extract_questions_regen_v3_task(self, regen_id: str, job_id: str) -> dict[str, Any]:
+    return _extract_questions_regen_v3(regen_id, job_id)
+
+
+@celery_app.task(name="retry_regen_section_v3", bind=True)
+def retry_regen_section_v3_task(self, regen_id: str, section_ref: str, job_id: str) -> dict[str, Any]:
+    return _retry_regen_section_v3(regen_id, section_ref, job_id)
 
 
 register_task("extract_questions_regen_v3", _extract_questions_regen_v3)

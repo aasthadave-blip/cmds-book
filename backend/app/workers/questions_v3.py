@@ -51,6 +51,7 @@ from app.services.prompt_loader import load_raw
 from app.services.questions.dedup import dedup_bank
 from app.services.questions.structural_filter import filter_items
 from app.utils.json_parse import parse_json
+from app.workers.celery_app import celery_app
 from app.workers.runner import register as register_task
 
 logger = logging.getLogger(__name__)
@@ -1645,6 +1646,15 @@ def _extract_questions_v3(book_id: str, bank_id: str, job_id: str) -> dict[str, 
         return {"ok": False, "error": str(e)}
 
 
+# Celery-mode task wrapper. Mirrors the pattern used in extract.py: the
+# inline path uses _extract_questions_v3 directly via register_task; the
+# Celery path uses this wrapper (Celery binds `self` as first arg). Both
+# delegate to the same underlying function so behavior is identical.
+@celery_app.task(name="extract_questions_v3", bind=True)
+def extract_questions_v3_task(self, book_id: str, bank_id: str, job_id: str) -> dict[str, Any]:
+    return _extract_questions_v3(book_id, bank_id, job_id)
+
+
 register_task("extract_questions_v3", _extract_questions_v3)
 
 
@@ -1797,6 +1807,11 @@ def _re_extract_section_v3(bank_id: str, section_ref: str, job_id: str) -> dict[
                 finished_at=datetime.utcnow(),
             )
         return {"ok": False, "error": str(e)}
+
+
+@celery_app.task(name="re_extract_section_v3", bind=True)
+def re_extract_section_v3_task(self, bank_id: str, section_ref: str, job_id: str) -> dict[str, Any]:
+    return _re_extract_section_v3(bank_id, section_ref, job_id)
 
 
 register_task("re_extract_section_v3", _re_extract_section_v3)

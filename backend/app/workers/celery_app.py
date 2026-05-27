@@ -33,7 +33,19 @@ if settings.TASK_EXECUTOR == "celery":
         "cmds",
         broker=settings.CELERY_BROKER_URL,
         backend=settings.CELERY_RESULT_BACKEND,
-        include=["app.workers.extract"],
+        # Every worker module that defines @celery_app.task functions must be
+        # listed here so Celery imports them at startup and registers the
+        # tasks in its registry. Missing a module = silent "task not found"
+        # on dispatch.
+        include=[
+            "app.workers.extract",
+            "app.workers.questions",
+            "app.workers.questions_v2",
+            "app.workers.questions_v3",
+            "app.workers.question_regen_v3",
+            "app.workers.figures_tasks",
+            "app.workers.qa",
+        ],
     )
     celery_app.conf.update(
         task_serializer="json",
