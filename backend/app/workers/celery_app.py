@@ -29,10 +29,15 @@ class _NoopCeleryApp:
 if settings.TASK_EXECUTOR == "celery":
     from celery import Celery  # type: ignore[import-not-found]
 
+    # NOTE: no result backend configured. Our app tracks task state via Job
+    # rows in Postgres (status/progress/error fields) — we never call
+    # `.delay().get()` or use AsyncResult. Configuring a Redis result backend
+    # caused "Retry limit exceeded while trying to reconnect to the Celery
+    # result store backend" errors in the API process because send_task tried
+    # to set up a result consumer over a flaky Redis pub/sub connection.
     celery_app: "Celery | _NoopCeleryApp" = Celery(
         "cmds",
         broker=settings.CELERY_BROKER_URL,
-        backend=settings.CELERY_RESULT_BACKEND,
         # Every worker module that defines @celery_app.task functions must be
         # listed here so Celery imports them at startup and registers the
         # tasks in its registry. Missing a module = silent "task not found"
@@ -49,9 +54,9 @@ if settings.TASK_EXECUTOR == "celery":
     )
     celery_app.conf.update(
         task_serializer="json",
-        result_serializer="json",
         accept_content=["json"],
-        task_track_started=True,
+        # No result backend → no task_track_started (would require result store).
+        task_ignore_result=True,
         task_time_limit=60 * 30,
         task_soft_time_limit=60 * 25,
         worker_max_tasks_per_child=50,
