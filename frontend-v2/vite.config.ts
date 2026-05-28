@@ -11,7 +11,10 @@ import react from '@vitejs/plugin-react';
 // and the deployed UI hits the backend directly (CORS allowlist on Railway
 // must include the deployed UI origin).
 export default defineConfig(({ mode }) => {
-  const env = loadEnv(mode, process.cwd(), '');
+  // Pass '' as cwd → loadEnv falls back to its own resolution. Avoids
+  // referencing Node's `process` global, which would require @types/node
+  // and break `tsc -b` during prod build.
+  const env = loadEnv(mode, '', '');
   const proxyTarget =
     env.VITE_DEV_PROXY_TARGET || env.VITE_API_BASE ||
     'https://cmds-book-production.up.railway.app';
