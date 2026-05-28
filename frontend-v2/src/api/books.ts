@@ -4,7 +4,7 @@
 // cards want a flatter shape with derived counts + a cover color. The
 // adapter computes those once at fetch time so the page code stays clean.
 
-import { useCallback, useEffect, useState } from 'react';
+import { useQuery } from '@tanstack/react-query';
 
 import { API_BASE, req, ApiError } from './client';
 import { COVER_GRADIENTS, type Book, type BookStatus } from '../mocks/books';
@@ -177,24 +177,21 @@ type State =
   | { kind: 'error'; error: string };
 
 export function useBooks() {
-  const [state, setState] = useState<State>({ kind: 'loading' });
-
-  const load = useCallback(async () => {
-    setState({ kind: 'loading' });
-    try {
+  const q = useQuery({
+    queryKey: ['books'],
+    queryFn: async () => {
       const raw = await req<BackendBook[]>('/api/books');
-      const books = raw.map(adaptBook);
-      setState({ kind: 'ready', books });
-    } catch (err) {
-      setState({ kind: 'error', error: explainError(err) });
-    }
-  }, []);
+      return raw.map(adaptBook);
+    },
+  });
 
-  useEffect(() => {
-    void load();
-  }, [load]);
+  const state: State = q.isPending
+    ? { kind: 'loading' }
+    : q.error
+      ? { kind: 'error', error: explainError(q.error) }
+      : { kind: 'ready', books: q.data! };
 
-  return { ...state, refetch: load };
+  return { ...state, refetch: () => q.refetch() };
 }
 
 // ---------- Single-book detail ----------
@@ -223,29 +220,26 @@ type BookState =
   | { kind: 'error'; error: string };
 
 export function useBook(id: string | undefined) {
-  const [state, setState] = useState<BookState>({ kind: 'loading' });
-
-  const load = useCallback(async () => {
-    if (!id) {
-      setState({ kind: 'error', error: 'No book id in URL' });
-      return;
-    }
-    setState({ kind: 'loading' });
-    try {
+  const q = useQuery({
+    queryKey: ['book', id],
+    queryFn: async () => {
       const raw = await req<BackendBook>(`/api/books/${id}`);
       const book = adaptBook(raw);
       const chapters = extractChapters(raw, book.status);
-      setState({ kind: 'ready', data: { book, chapters, raw } });
-    } catch (err) {
-      setState({ kind: 'error', error: explainError(err) });
-    }
-  }, [id]);
+      return { book, chapters, raw } as BookDetail;
+    },
+    enabled: Boolean(id),
+  });
 
-  useEffect(() => {
-    void load();
-  }, [load]);
+  const state: BookState = !id
+    ? { kind: 'error', error: 'No book id in URL' }
+    : q.isPending
+      ? { kind: 'loading' }
+      : q.error
+        ? { kind: 'error', error: explainError(q.error) }
+        : { kind: 'ready', data: q.data! };
 
-  return { ...state, refetch: load };
+  return { ...state, refetch: () => q.refetch() };
 }
 
 function extractChapters(raw: BackendBook, bookStatus: BookStatus): BackendChapter[] {
