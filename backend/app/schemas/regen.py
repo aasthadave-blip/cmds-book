@@ -130,6 +130,19 @@ class PostRegenQCResult(BaseModel):
     drifted_values: list[str] = Field(default_factory=list)
     original_number_count: int = 0
 
+    # New defensive structural checks (R1.4 — quality safety net without
+    # an extra LLM call). Block-count drift signals the LLM under- or
+    # over-produced free blocks; word-ratio drift signals truncation or
+    # runaway expansion beyond the prompt's ±15% length integrity rule.
+    block_count_original: int = 0
+    block_count_regenerated: int = 0
+    word_count_original: int = 0
+    word_count_regenerated: int = 0
+    word_ratio: float = 1.0  # regen / original
+
+    # Free-form warning strings the UI can surface to reviewers.
+    warnings: list[str] = Field(default_factory=list)
+
     model_config = ConfigDict(populate_by_name=True)
 
     def to_dict(self) -> dict[str, Any]:
