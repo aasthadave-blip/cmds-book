@@ -4,7 +4,7 @@ from datetime import datetime
 from uuid import UUID, uuid4
 
 import sqlalchemy as sa
-from sqlalchemy import DateTime, String, Text, func
+from sqlalchemy import DateTime, ForeignKey, String, Text, func
 from sqlalchemy.orm import Mapped, mapped_column, relationship
 
 from app.core.db import Base
@@ -16,6 +16,15 @@ class Book(Base):
     id: Mapped[UUID] = mapped_column(sa.Uuid(as_uuid=True), primary_key=True, default=uuid4)
     title: Mapped[str] = mapped_column(Text, nullable=False)
     subject: Mapped[str | None] = mapped_column(Text)
+    # Optional FK into the new ``folders`` table. Nullable so legacy uploads
+    # that predate the V-Studio folder concept keep working; the 0021
+    # migration backfills all existing rows into a default folder.
+    folder_id: Mapped[UUID | None] = mapped_column(
+        sa.Uuid(as_uuid=True),
+        ForeignKey("folders.id", ondelete="SET NULL"),
+        nullable=True,
+        index=True,
+    )
     pdf_url: Mapped[str | None] = mapped_column(Text)  # storage key (S3 or local)
     schema: Mapped[dict | None] = mapped_column(sa.JSON)
     analyser: Mapped[dict | None] = mapped_column(sa.JSON)

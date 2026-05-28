@@ -3,6 +3,7 @@ from app.models.figure import Figure
 from app.models.figure_reference import FigureReference
 from app.models.figure_regeneration import FigureRegeneration
 from app.models.final_draft import FinalDraft
+from app.models.folder import Folder
 from app.models.job import Job
 from app.models.qa_run import QARun
 from app.models.question import Question
@@ -23,6 +24,7 @@ __all__ = [
     "FigureReference",
     "FigureRegeneration",
     "FinalDraft",
+    "Folder",
     "QuestionBank",
     "QuestionRegeneration",
     "Question",
