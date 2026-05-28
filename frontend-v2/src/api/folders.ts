@@ -5,7 +5,7 @@
 // (chapters / questions / figures + status breakdown) so the library page
 // doesn't have to fan-out per folder.
 
-import { useCallback, useEffect, useState } from 'react';
+import { useQuery } from '@tanstack/react-query';
 
 import { ApiError, req } from './client';
 
@@ -50,23 +50,18 @@ type ListState =
   | { kind: 'error'; error: string };
 
 export function useFolders() {
-  const [state, setState] = useState<ListState>({ kind: 'loading' });
+  const q = useQuery({
+    queryKey: ['folders'],
+    queryFn: listFolders,
+  });
 
-  const load = useCallback(async () => {
-    setState({ kind: 'loading' });
-    try {
-      const folders = await listFolders();
-      setState({ kind: 'ready', folders });
-    } catch (err) {
-      setState({ kind: 'error', error: explain(err) });
-    }
-  }, []);
+  const state: ListState = q.isPending
+    ? { kind: 'loading' }
+    : q.error
+      ? { kind: 'error', error: explain(q.error) }
+      : { kind: 'ready', folders: q.data! };
 
-  useEffect(() => {
-    void load();
-  }, [load]);
-
-  return { ...state, refetch: load };
+  return { ...state, refetch: () => q.refetch() };
 }
 
 type OneState =
@@ -75,27 +70,21 @@ type OneState =
   | { kind: 'error'; error: string };
 
 export function useFolder(id: string | undefined) {
-  const [state, setState] = useState<OneState>({ kind: 'loading' });
+  const q = useQuery({
+    queryKey: ['folder', id],
+    queryFn: () => getFolder(id!),
+    enabled: Boolean(id),
+  });
 
-  const load = useCallback(async () => {
-    if (!id) {
-      setState({ kind: 'error', error: 'No folder id in URL' });
-      return;
-    }
-    setState({ kind: 'loading' });
-    try {
-      const folder = await getFolder(id);
-      setState({ kind: 'ready', folder });
-    } catch (err) {
-      setState({ kind: 'error', error: explain(err) });
-    }
-  }, [id]);
+  const state: OneState = !id
+    ? { kind: 'error', error: 'No folder id in URL' }
+    : q.isPending
+      ? { kind: 'loading' }
+      : q.error
+        ? { kind: 'error', error: explain(q.error) }
+        : { kind: 'ready', folder: q.data! };
 
-  useEffect(() => {
-    void load();
-  }, [load]);
-
-  return { ...state, refetch: load };
+  return { ...state, refetch: () => q.refetch() };
 }
 
 function explain(err: unknown): string {
