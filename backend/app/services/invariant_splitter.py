@@ -127,8 +127,18 @@ def merge_blocks_in_order(
     regenerated_free_blocks: list[dict],
 ) -> list[dict]:
     """Walk original blocks; at each position copy invariants verbatim and
-    pull in order from ``regenerated_free_blocks`` for free slots. Leftover
-    regen blocks are appended at the end.
+    pull in order from ``regenerated_free_blocks`` for free slots.
+
+    Defensive fallback: if the LLM under-produced free blocks (e.g. collapsed
+    multiple body paragraphs into one), the unfilled free slots now fall
+    back to the ORIGINAL block at that position instead of being silently
+    dropped. Without this fallback, missing free slots caused invariant
+    blocks (equations, figures) to visually cluster at the end of the
+    section, which reviewers reported as "equations dumped at end".
+
+    Leftover regen blocks (LLM over-produced) are still appended at the end
+    so nothing is lost; usually this combined with the prompt's block-count
+    rule means the leftover list is empty in practice.
     """
     merged: list[dict] = []
     free_idx = 0
@@ -139,6 +149,11 @@ def merge_blocks_in_order(
             if free_idx < len(regenerated_free_blocks):
                 merged.append(regenerated_free_blocks[free_idx])
                 free_idx += 1
+            else:
+                # Defensive: regen under-produced → keep the original block
+                # at this position. Reviewer sees the original prose for
+                # this slot rather than the slot being silently dropped.
+                merged.append(dict(orig))
     while free_idx < len(regenerated_free_blocks):
         merged.append(regenerated_free_blocks[free_idx])
         free_idx += 1
