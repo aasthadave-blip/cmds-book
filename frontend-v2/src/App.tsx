@@ -14,6 +14,8 @@ import FolderPage from './pages/FolderPage';
 import DevExtractPage from './pages/DevExtractPage';
 import BookExtractPage from './pages/BookExtractPage';
 import ReviewPage from './pages/ReviewPage';
+import ComposerPage from './pages/ComposerPage';
+import PreviewPage from './pages/PreviewPage';
 import RegenConfigPage from './pages/RegenConfigPage';
 import RegenProgressPage from './pages/RegenProgressPage';
 import RegenReviewPage from './pages/RegenReviewPage';
@@ -40,6 +42,8 @@ export default function App() {
           <Route path="books/:bookId/regenerate"            element={<RegenConfigPage />} />
           <Route path="books/:bookId/regenerate/progress"   element={<RegenProgressPage />} />
           <Route path="books/:bookId/regen-review"          element={<RegenReviewPage />} />
+          <Route path="books/:bookId/compose"               element={<ComposerPage />} />
+          <Route path="books/:bookId/preview"               element={<PreviewPage />} />
           <Route path="books/:bookId/chapters/:chapterId"   element={<ChapterPage />} />
           <Route path="templates" element={<TemplatesPage />} />
           <Route path="settings"  element={<SettingsPage />} />
