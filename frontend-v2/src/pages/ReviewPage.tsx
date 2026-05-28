@@ -447,6 +447,13 @@ export default function ReviewPage() {
           gap: 14,
         }}
       >
+        <button
+          className="btn btn-ghost btn-sm"
+          onClick={() => navigate('/library')}
+          title="Back to library"
+        >
+          <Icon name="arrow-l" size={14} /> Back
+        </button>
         <div style={{ flex: 1 }}>
           <div
             style={{
@@ -491,13 +498,29 @@ export default function ReviewPage() {
         {hasRegen && (
           <button
             className="top-icon-btn"
-            title="Open regenerated content review (scroll-based, full chapter)"
+            title="Open regenerated content review"
             onClick={() => navigate(`/books/${bookId}/regen-review`)}
             style={{ width: 36, height: 36 }}
           >
             <Icon name="sparkles" size={16} />
           </button>
         )}
+        <button
+          className="top-icon-btn"
+          title="Open Composer (edit / reorder / add sections)"
+          onClick={() => navigate(`/books/${bookId}/compose`)}
+          style={{ width: 36, height: 36 }}
+        >
+          <Icon name="docx" size={16} />
+        </button>
+        <button
+          className="top-icon-btn"
+          title="Open clean preview"
+          onClick={() => navigate(`/books/${bookId}/preview`)}
+          style={{ width: 36, height: 36 }}
+        >
+          <Icon name="file" size={16} />
+        </button>
         {hasRegen && (
           <button
             className="btn btn-ghost"

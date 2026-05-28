@@ -22,7 +22,7 @@
 import { useCallback, useEffect, useMemo, useRef, useState } from 'react';
 import { useNavigate, useParams } from 'react-router-dom';
 
-import { ApiError, req } from '../api/client';
+import { API_BASE, ApiError, req } from '../api/client';
 import { useBook } from '../api/books';
 import { useSections, type Section } from '../api/sections';
 import { useBookQuestions, type QuestionBankDetail } from '../api/questions';
@@ -172,15 +172,45 @@ export default function RegenReviewPage() {
   }, []);
 
   // ── Approve & Save ─────────────────────────────────────────────
+  // Backend endpoint POST /api/regenerations/:id/save requires
+  // {"confirmed_section_ids": [...]}. We approve EVERY section in the
+  // regen (user already reviewed them on this page).
+  //
+  // Where it saves:
+  //   Backend trims regen.blocks_by_section to only confirmed sections
+  //   and persists. The book in Library will now show this regen as
+  //   its "approved" variant — Composer + Preview pull from it.
+  //
+  // After save: we redirect to Composer so the user immediately sees
+  // their saved content + can edit/preview/export from there. This
+  // matches the OLD prod flow.
+  const [savedToast, setSavedToast] = useState(false);
   const handleApprove = useCallback(async () => {
     if (regenState.kind !== 'ready') return;
     setApproving(true);
     setError(null);
     try {
+      const allSectionIds = Object.keys(
+        regenState.latest.blocks_by_section ?? {},
+      );
       await req(`/api/regenerations/${regenState.latest.id}/save`, {
         method: 'POST',
+        body: JSON.stringify({ confirmed_section_ids: allSectionIds }),
       });
+      // Re-seed the FinalDraft from the now-saved regen so Composer
+      // has the latest content immediately. This is what OLD prod does.
+      try {
+        await req(`/api/books/${bookId}/final-draft/reseed`, { method: 'POST' });
+      } catch {
+        /* non-fatal — Composer can be re-seeded from its own button */
+      }
       regenState.refetch();
+      setSavedToast(true);
+      // Auto-redirect to Composer after 1.2s — gives the user time to
+      // see the success message, then takes them where they can act.
+      setTimeout(() => {
+        navigate(`/books/${bookId}/compose`);
+      }, 1200);
     } catch (e) {
       setError(
         e instanceof ApiError ? `Backend ${e.status}: ${e.message}` :
@@ -189,23 +219,28 @@ export default function RegenReviewPage() {
     } finally {
       setApproving(false);
     }
-  }, [regenState]);
+  }, [regenState, bookId, navigate]);
 
   // ── Reseed (per-section regen with custom instruction) ─────────
+  // Backend endpoint: POST /api/regenerations/:id/sections/:section_id/rerun
+  // Body: {"custom_instructions": "..."} (plural — singular was the bug).
+  // Returns: {section_id, blocks} — synchronous, no polling needed.
   const submitReseed = useCallback(
     async (instruction: string) => {
       if (!reseedModal || regenState.kind !== 'ready') return;
       try {
         await req(
-          `/api/regenerations/${regenState.latest.id}/sections/${encodeURIComponent(reseedModal.sectionRef)}/retry`,
+          `/api/regenerations/${regenState.latest.id}/sections/${encodeURIComponent(reseedModal.sectionRef)}/rerun`,
           {
             method: 'POST',
-            body: JSON.stringify({ custom_instruction: instruction }),
+            body: JSON.stringify({ custom_instructions: instruction }),
           },
         );
         setReseedModal(null);
-        // Refetch regen after a short delay to let backend kick off the task
-        setTimeout(() => regenState.refetch(), 1000);
+        // Refetch the regen to pick up the new blocks for this section.
+        regenState.refetch();
+        setError('✓ Section regenerated with custom instruction.');
+        setTimeout(() => setError(null), 2500);
       } catch (e) {
         setError(
           e instanceof ApiError ? `Backend ${e.status}: ${e.message}` :
@@ -216,10 +251,42 @@ export default function RegenReviewPage() {
     [reseedModal, regenState],
   );
 
-  // ── Export DOCX ────────────────────────────────────────────────
+  // ── Export DOCX (regenerated content) ─────────────────────────
+  // Uses the same endpoint pattern as OLD prod's FinalComposerPage:
+  // /api/books/:id/export/docx?regen_id=... so the export includes the
+  // regenerated theory. Falls back to plain extracted export if no
+  // regen exists.
   const exportDocx = useCallback(() => {
     if (!bookId) return;
-    window.open(`${req.length ? '' : ''}/api/books/${bookId}/export/docx`, '_blank');
+    const regenId = regenState.kind === 'ready' ? regenState.latest.id : null;
+    const qs = regenId ? `?regen_id=${regenId}` : '';
+    const url = `${API_BASE}/api/books/${bookId}/export/docx${qs}`;
+    // Use a hidden <a> with download attr so the browser treats it as
+    // a download (window.open opens it in a tab on some browsers).
+    const a = document.createElement('a');
+    a.href = url;
+    a.download = '';
+    document.body.appendChild(a);
+    a.click();
+    a.remove();
+  }, [bookId, regenState]);
+
+  // ── Re-seed (reseed the full final draft from the latest regen) ──
+  // Calls POST /api/books/:id/final-draft/reseed which rebuilds the
+  // FinalDraft items from the current regen. Used when the user wants
+  // to discard manual composer edits and start over from regen output.
+  const reseedFinalDraft = useCallback(async () => {
+    if (!bookId) return;
+    try {
+      await req(`/api/books/${bookId}/final-draft/reseed`, { method: 'POST' });
+      setError('✓ Re-seeded from regenerated content.');
+      setTimeout(() => setError(null), 2500);
+    } catch (e) {
+      setError(
+        e instanceof ApiError ? `Backend ${e.status}: ${e.message}` :
+        e instanceof Error ? e.message : 'Re-seed failed',
+      );
+    }
   }, [bookId]);
 
   // ── Render ────────────────────────────────────────────────────
@@ -336,33 +403,52 @@ export default function RegenReviewPage() {
             {book.title}
           </h1>
         </div>
+        {/* Back to chapter review */}
         <button
           className="btn btn-ghost btn-sm"
           onClick={() => navigate(`/books/${bookId}/review`)}
-          title="Back to extracted (original) content"
+          title="Back to chapter review"
         >
-          <Icon name="arrow-l" size={14} /> Original review
+          <Icon name="arrow-l" size={14} /> Back
         </button>
+        {/* Composer — opens the OLD prod composer (drag-reorder, edit, add) */}
         <button
           className="btn btn-ghost btn-sm"
-          onClick={() => navigate(`/books/${bookId}/regenerate`)}
-          title="Re-run regeneration with new parameters"
+          onClick={() => navigate(`/books/${bookId}/compose`)}
+          title="Open Composer — edit, reorder, add/remove sections"
         >
-          <Icon name="regen" size={14} /> Regen again
+          <Icon name="layers" size={14} /> Composer
         </button>
+        {/* Preview — clean read-only view of final document */}
+        <button
+          className="btn btn-ghost btn-sm"
+          onClick={() => navigate(`/books/${bookId}/preview`)}
+          title="Open clean read-only preview of the regenerated chapter"
+        >
+          <Icon name="eye" size={14} /> Preview
+        </button>
+        {/* Re-seed — rebuilds final draft from latest regen */}
+        <button
+          className="btn btn-ghost btn-sm"
+          onClick={() => void reseedFinalDraft()}
+          title="Re-seed: rebuild the final draft from the latest regenerated content (discards composer edits)"
+        >
+          <Icon name="regen" size={14} /> Re-seed
+        </button>
+        {/* Export DOCX */}
         <button
           className="btn btn-ghost btn-sm"
           onClick={exportDocx}
           title="Download regenerated chapter as DOCX"
         >
-          <Icon name="download" size={14} /> Export DOCX
+          <Icon name="docx" size={14} /> Export DOCX
         </button>
         {hasRegen && (
           <button
             className="btn btn-primary"
             onClick={() => void handleApprove()}
             disabled={approving}
-            title="Approve regenerated content and save as the final draft"
+            title="Approve all regenerated sections and save as the final draft"
           >
             {approving ? <span className="spinner" /> : <Icon name="check" size={14} />}
             Approve &amp; Save
@@ -374,13 +460,36 @@ export default function RegenReviewPage() {
         <div
           style={{
             padding: '8px 28px',
-            background: 'var(--red-50)',
-            borderBottom: '1px solid var(--red-100)',
-            color: 'var(--red-700)',
+            background: error.startsWith('✓') ? 'var(--success-bg, #DDF5E6)' : 'var(--red-50)',
+            borderBottom: '1px solid ' + (error.startsWith('✓') ? '#A8DCC4' : 'var(--red-100)'),
+            color: error.startsWith('✓') ? '#0B6A4F' : 'var(--red-700)',
             fontSize: 13,
           }}
         >
           {error}
+        </div>
+      )}
+      {savedToast && (
+        <div
+          style={{
+            position: 'fixed',
+            top: 24,
+            right: 24,
+            zIndex: 300,
+            padding: '14px 18px',
+            background: '#0B6A4F',
+            color: '#fff',
+            borderRadius: 10,
+            boxShadow: '0 10px 30px rgba(11, 106, 79, 0.35)',
+            fontSize: 14,
+            fontWeight: 600,
+            display: 'flex',
+            alignItems: 'center',
+            gap: 10,
+          }}
+        >
+          <Icon name="check" size={14} />
+          Saved to library · opening Composer…
         </div>
       )}
 
@@ -648,64 +757,43 @@ function SectionBlock({
       id={section.section_id}
       ref={refSetter}
       style={{
-        marginBottom: 40,
-        background: 'var(--surface)',
-        border: '1px solid var(--line)',
-        borderRadius: 10,
+        marginBottom: 44,
         scrollMarginTop: 20,
       }}
     >
-      {/* Section header with composer */}
+      {/* Section header — single title (no slug duplication), inline composer icons */}
       <div
         style={{
-          padding: '14px 20px',
-          borderBottom: '1px solid var(--line-2)',
           display: 'flex',
-          alignItems: 'center',
-          gap: 12,
-          background: '#fdfbf6',
+          alignItems: 'flex-end',
+          gap: 10,
+          marginBottom: 14,
+          paddingBottom: 6,
+          borderBottom: '1px solid var(--line-2)',
         }}
       >
-        <div style={{ flex: 1, minWidth: 0 }}>
-          <h3
-            style={{
-              fontSize: 17,
-              fontWeight: 700,
-              color: 'var(--ink-900)',
-              margin: 0,
-              lineHeight: 1.25,
-            }}
-          >
-            {section.title || section.section_id}
-          </h3>
-          <div
-            style={{
-              fontSize: 11,
-              color: 'var(--ink-500)',
-              fontFamily: 'var(--font-mono)',
-              marginTop: 4,
-              display: 'flex',
-              gap: 10,
-              alignItems: 'center',
-            }}
-          >
-            <span>{section.section_id}</span>
-            {qc && (
-              <>
-                <span style={{ opacity: 0.4 }}>·</span>
-                <WordRatioBadge ratio={qc.ratio} />
-              </>
-            )}
-          </div>
-        </div>
-
-        {/* Per-section composer (Tier A icons) */}
+        <h3
+          style={{
+            flex: 1,
+            fontSize: 19,
+            fontWeight: 800,
+            color: 'var(--ink-900)',
+            margin: 0,
+            lineHeight: 1.2,
+            letterSpacing: '-0.01em',
+          }}
+        >
+          {section.title || section.section_id}
+        </h3>
+        {qc && <WordRatioBadge ratio={qc.ratio} />}
+        {/* Per-section composer icons — visible only on theory/questions */}
         {(topTab === 'theory' || topTab === 'questions') && (
-          <div style={{ display: 'flex', gap: 4 }}>
+          <div style={{ display: 'flex', gap: 2 }}>
             <button
               className="btn btn-ghost btn-sm"
               onClick={onPreview}
               title="Open this section in a full-screen preview"
+              style={{ padding: '4px 8px' }}
             >
               <Icon name="eye" size={13} />
             </button>
@@ -713,7 +801,8 @@ function SectionBlock({
               <button
                 className="btn btn-ghost btn-sm"
                 onClick={onReseed}
-                title="Reseed (regenerate this section with custom instruction)"
+                title="Reseed: regenerate this section with a custom instruction"
+                style={{ padding: '4px 8px' }}
               >
                 <Icon name="regen" size={13} />
               </button>
@@ -722,32 +811,29 @@ function SectionBlock({
         )}
       </div>
 
-      {/* QC warnings panel */}
+      {/* QC warnings — compact inline strip, only when present */}
       {qc && qc.warnings.length > 0 && (
         <div
           style={{
-            padding: '8px 20px',
-            background: 'var(--amber-50, #FFF9E5)',
-            borderBottom: '1px solid var(--line-2)',
+            padding: '6px 10px',
+            background: '#FFF9E5',
+            borderLeft: '3px solid #C28000',
+            borderRadius: 4,
             color: '#8A5300',
-            fontSize: 12,
+            fontSize: 11,
+            marginBottom: 12,
             display: 'flex',
-            gap: 8,
-            alignItems: 'flex-start',
+            gap: 6,
+            alignItems: 'baseline',
           }}
         >
-          <span style={{ fontSize: 14 }}>⚠</span>
-          <div style={{ flex: 1 }}>
-            <div style={{ fontWeight: 600 }}>QC warnings for this section:</div>
-            {qc.warnings.map((w, i) => (
-              <div key={i}>• {w}</div>
-            ))}
-          </div>
+          <span>⚠</span>
+          <span>{qc.warnings.join(' · ')}</span>
         </div>
       )}
 
       {/* Body content based on subTab */}
-      <div style={{ padding: '18px 22px' }}>
+      <div>
         {topTab === 'theory' && (
           <TheoryBody
             section={section}
@@ -792,7 +878,7 @@ function TheoryBody({
   type Block = { t: string; [k: string]: unknown };
 
   if (subTab === 'original' || !hasRegen) {
-    return <TheoryView section={section} />;
+    return <TheoryView section={section} hideHeader flat />;
   }
 
   if (subTab === 'regenerated') {
@@ -800,7 +886,8 @@ function TheoryBody({
       <TheoryView
         section={section}
         blocksOverride={regenBlocks as Block[]}
-        banner={{ label: 'Regenerated', tone: 'regen' }}
+        hideHeader
+        flat
       />
     );
   }
@@ -817,7 +904,7 @@ function TheoryBody({
       <div>
         <div
           style={{
-            fontSize: 11,
+            fontSize: 10,
             fontWeight: 700,
             letterSpacing: '0.08em',
             textTransform: 'uppercase',
@@ -830,13 +917,14 @@ function TheoryBody({
         <TheoryView
           section={section}
           blocksOverride={origBlocks as Block[]}
-          banner={{ label: 'Original', tone: 'original' }}
+          hideHeader
+          flat
         />
       </div>
       <div>
         <div
           style={{
-            fontSize: 11,
+            fontSize: 10,
             fontWeight: 700,
             letterSpacing: '0.08em',
             textTransform: 'uppercase',
@@ -849,7 +937,8 @@ function TheoryBody({
         <TheoryView
           section={section}
           blocksOverride={regenBlocks as Block[]}
-          banner={{ label: 'Regenerated', tone: 'regen' }}
+          hideHeader
+          flat
         />
       </div>
     </div>
