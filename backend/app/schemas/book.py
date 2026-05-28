@@ -20,6 +20,7 @@ class BookCreate(BookBase):
 
 class BookOut(BookBase):
     id: UUID
+    folder_id: UUID | None = None
     pdf_url: str | None = None
     schema_: dict[str, Any] | None = None  # "schema" is reserved by pydantic
     analyser: dict[str, Any] | None = None
@@ -31,6 +32,7 @@ class BookOut(BookBase):
     def from_orm_book(cls, book) -> "BookOut":
         return cls(
             id=book.id,
+            folder_id=book.folder_id,
             title=book.title,
             subject=book.subject,
             pdf_url=book.pdf_url,

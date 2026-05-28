@@ -14,6 +14,7 @@ from app.api import (
     figures as figures_v2,
     final_draft,
     final_merge,
+    folders,
     jobs,
     providers,
     qa,
@@ -66,6 +67,7 @@ async def health() -> dict:
     }
 
 
+app.include_router(folders.router)
 app.include_router(books.router)
 app.include_router(sections.router)
 app.include_router(regenerations.router)

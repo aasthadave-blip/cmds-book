@@ -151,6 +151,8 @@ def _ensure_pandoc_on_path() -> str:
 async def create_book(
     file: UploadFile = File(...),
     title: str | None = Form(None),
+    folder_id: UUID | None = Form(None),
+    subject: str | None = Form(None),
     session: AsyncSession = Depends(get_session),
 ) -> BookUploadResponse:
     # Accept by content-type OR by .pdf extension (browsers sometimes send
@@ -176,6 +178,8 @@ async def create_book(
         title=title or (file.filename or "Untitled").rsplit(".", 1)[0],
         pdf_url=pdf_key,
         status="uploaded",
+        folder_id=folder_id,
+        subject=subject,
     )
     session.add(book)
     await session.flush()
