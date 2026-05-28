@@ -22,5 +22,9 @@ RUN pip install --upgrade pip setuptools wheel && \
 
 COPY . .
 
-# Railway injects $PORT. Fall back to 8000 for local test.
-CMD ["sh", "-c", "uvicorn app.main:app --host 0.0.0.0 --port ${PORT:-8000}"]
+# Single-container Celery: start.sh launches the Celery worker in the
+# background and uvicorn in the foreground. Both processes share /app
+# (and therefore the Railway volume at /app/storage), so PDFs uploaded
+# via the API are visible to the worker that extracts them.
+RUN chmod +x /app/start.sh
+CMD ["/app/start.sh"]
