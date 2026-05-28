@@ -29,22 +29,37 @@ MAX_TOKENS = 16000
 def free_blocks_to_text(free_blocks: list[dict]) -> str:
     """Flatten free blocks into the plain-text body used in the P5 user message.
 
-    Lists are wrapped in [LIST]...[/LIST] tags so the model knows to output
-    them back as list_item blocks rather than folding them into body paragraphs.
+    Each block is wrapped in explicit [BLOCK N type=X]…[/BLOCK N] markers so
+    the LLM knows EXACTLY how many blocks to produce and what type each one
+    must be. Without these markers the model frequently collapsed multiple
+    body paragraphs into one, which caused the downstream merge to leave
+    equation invariants visually clustered at the end of the section.
+
+    Lists are still wrapped in [LIST]...[/LIST] inside the block so the model
+    knows to output them back as list_item entries rather than folding into
+    a body paragraph.
     """
     parts: list[str] = []
-    for b in free_blocks:
+    for idx, b in enumerate(free_blocks, start=1):
         t = b.get("t")
         if t == "p":
-            parts.append(b.get("c", ""))
+            parts.append(
+                f"[BLOCK {idx} type=body]\n{b.get('c', '')}\n[/BLOCK {idx}]"
+            )
         elif t == "h3":
-            parts.append(f"\n### {b.get('c', '')}\n")
+            parts.append(
+                f"[BLOCK {idx} type=heading]\n{b.get('c', '')}\n[/BLOCK {idx}]"
+            )
         elif t == "kp":
-            parts.append(f"[KEY POINT: {b.get('c', '')}]")
+            parts.append(
+                f"[BLOCK {idx} type=key_point]\n{b.get('c', '')}\n[/BLOCK {idx}]"
+            )
         elif t == "list":
             items = b.get("items", []) or []
             numbered = "\n".join(f"{i + 1}. {item}" for i, item in enumerate(items))
-            parts.append(f"[LIST]\n{numbered}\n[/LIST]")
+            parts.append(
+                f"[BLOCK {idx} type=list]\n[LIST]\n{numbered}\n[/LIST]\n[/BLOCK {idx}]"
+            )
     return "\n\n".join(p for p in parts if p.strip())
 
 
@@ -53,6 +68,11 @@ def build_regen_system_prompt(params: RegenParams) -> str:
 
 
 def build_user_message(section_id: str, section_title: str, free_text: str) -> str:
+    # Count the input [BLOCK N ...] markers so we can tell the LLM exactly
+    # how many blocks it MUST produce. This stops the silent-omission bug
+    # where the model collapsed 5 paragraphs into 2 and equations downstream
+    # bunched at the end.
+    block_count = free_text.count("[BLOCK ")
     return (
         "Regenerate the theory content for this section according to your system parameters.\n\n"
         f"SECTION ID: {section_id}\n"
@@ -60,14 +80,20 @@ def build_user_message(section_id: str, section_title: str, free_text: str) -> s
         "IMPORTANT RULES:\n"
         "- You are only receiving the REWRITABLE blocks (prose, key points, lists).\n"
         "- Equations, definitions, figures, and examples are handled separately — do NOT add or modify them.\n"
-        "- Content wrapped in [LIST]...[/LIST] is a numbered list. "
-        "You MUST output each item as a separate \"list_item\" block — NEVER merge list items into a body paragraph.\n"
-        "- [KEY POINT: ...] blocks must be output as \"key_point\" type.\n"
-        "- Preserve the number of list items exactly — do not add or remove items.\n\n"
+        f"- The input below contains EXACTLY {block_count} blocks tagged "
+        "[BLOCK 1 type=…] through [BLOCK N type=…]. Your output JSON's \"paragraphs\" array MUST contain "
+        f"EXACTLY {block_count} entries (or {block_count} entries with each list expanded into N list_item entries).\n"
+        "- Map [BLOCK i type=body]   → output[i].type = \"body\"\n"
+        "- Map [BLOCK i type=heading] → output[i].type = \"heading\"\n"
+        "- Map [BLOCK i type=key_point] → output[i].type = \"key_point\"\n"
+        "- Map [BLOCK i type=list]   → emit one list_item block per numbered item (preserve count exactly).\n"
+        "- DO NOT merge two consecutive body blocks into one. DO NOT skip any block.\n"
+        "- Content wrapped in [LIST]...[/LIST] is a numbered list. Output each item as a separate "
+        "\"list_item\" block — NEVER merge list items into a body paragraph.\n"
+        "- [KEY POINT: ...] blocks must be output as \"key_point\" type.\n\n"
         "REWRITABLE CONTENT TO REGENERATE:\n"
         f"{free_text}\n\n"
-        "Return the regenerated JSON now. Output list items as list_item blocks, key points as key_point blocks, "
-        "paragraphs as body blocks, and subheadings as heading blocks."
+        "Return the regenerated JSON now. Preserve block count and order exactly."
     )
 
 

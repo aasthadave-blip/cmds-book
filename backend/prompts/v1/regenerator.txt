@@ -126,6 +126,28 @@ HARD RULES
     Every claim must be supportable from the source. Treat every regeneration as if
     it were going into a textbook.
 
+12. BLOCK COUNT INTEGRITY (CRITICAL — anti-omission rule).
+    The input contains explicit block markers: [BLOCK 1 type=…] through
+    [BLOCK N type=…]. Your output JSON's "paragraphs" array MUST contain
+    EXACTLY one entry per input block (with list blocks expanded into one
+    list_item per numbered item, preserving the item count exactly).
+    Mapping is strict and positional:
+      - [BLOCK i type=body]      → output[i].type = "body"
+      - [BLOCK i type=heading]   → output[i].type = "heading"
+      - [BLOCK i type=key_point] → output[i].type = "key_point"
+      - [BLOCK i type=list]      → emit M list_item entries (M = item count)
+
+    Forbidden:
+      • Merging two consecutive body blocks into one.
+      • Splitting one input block into multiple output blocks (except lists).
+      • Skipping any input block.
+      • Adding extra output blocks that have no input counterpart.
+
+    Before finalising output, count the input [BLOCK N ...] markers and
+    count your output blocks. If the counts (with list expansion) do not
+    match, regenerate the missing blocks until they do. A partial output
+    is not acceptable.
+
 ═══════════════════════════════════════════════════════
 OUTPUT FORMAT
 ═══════════════════════════════════════════════════════
