@@ -135,15 +135,64 @@ async def regenerate_section(
 
 
 def post_regen_qc(original_blocks: list[dict], regenerated_blocks: list[dict]) -> PostRegenQCResult:
-    """Value drift check — every >1-char numerical value in original must appear in regenerated."""
-    orig_text = blocks_to_plain_text(original_blocks)
-    regen_text = blocks_to_plain_text(regenerated_blocks).lower()
+    """Defensive QC on regenerated content. No extra LLM calls — purely
+    structural/textual checks that catch the failure modes we've seen:
 
+      1. Numerical value drift — every >1-char number in the original must
+         appear unchanged in the regenerated text.
+      2. Block count drift — the count of free blocks (p/h3/kp/list) in
+         regenerated should match original. Mismatch means the LLM
+         under- or over-produced (now structurally rare after R1.3 fixes,
+         but we still log a warning).
+      3. Word ratio drift — regenerated text length should stay within
+         ~0.7×–1.3× of original (prompt requires ±15%; we're a bit looser
+         here to avoid false positives on short sections).
+    """
+    from app.schemas.block import INVARIANT_TYPES
+
+    orig_text = blocks_to_plain_text(original_blocks)
+    regen_text_raw = blocks_to_plain_text(regenerated_blocks)
+    regen_text = regen_text_raw.lower()
+
+    # ── 1. Numerical drift ────────────────────────────────────────
     orig_numbers = extract_numbers(orig_text)
     drifted = [n for n in orig_numbers if len(n) > 1 and n.lower() not in regen_text]
 
+    # ── 2. Block count drift ──────────────────────────────────────
+    orig_free = sum(1 for b in original_blocks if b.get("t") not in INVARIANT_TYPES)
+    regen_free = sum(1 for b in regenerated_blocks if b.get("t") not in INVARIANT_TYPES)
+    warnings: list[str] = []
+    if orig_free > 0 and regen_free != orig_free:
+        warnings.append(
+            f"Block count drift: original had {orig_free} free blocks, "
+            f"regenerated has {regen_free}."
+        )
+
+    # ── 3. Word ratio drift ───────────────────────────────────────
+    orig_words = len(orig_text.split())
+    regen_words = len(regen_text_raw.split())
+    word_ratio = regen_words / orig_words if orig_words > 0 else 1.0
+    if orig_words > 50:  # only check meaningful sections (skip stub blocks)
+        if word_ratio < 0.7:
+            warnings.append(
+                f"Length shrank to {int(word_ratio * 100)}% of original — possible truncation."
+            )
+        elif word_ratio > 1.3:
+            warnings.append(
+                f"Length expanded to {int(word_ratio * 100)}% of original — possible runaway."
+            )
+
+    if drifted:
+        warnings.append(f"Numerical values changed: {', '.join(drifted[:5])}")
+
     return PostRegenQCResult(
-        pass_=(len(drifted) == 0),
+        pass_=(len(drifted) == 0 and len(warnings) == 0),
         drifted_values=drifted,
         original_number_count=len(orig_numbers),
+        block_count_original=orig_free,
+        block_count_regenerated=regen_free,
+        word_count_original=orig_words,
+        word_count_regenerated=regen_words,
+        word_ratio=round(word_ratio, 3),
+        warnings=warnings,
     )
