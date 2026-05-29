@@ -3,10 +3,12 @@
 from __future__ import annotations
 
 import asyncio
+from datetime import datetime
 from uuid import UUID
 
 from fastapi import APIRouter, Depends, HTTPException
 from fastapi.responses import StreamingResponse
+from sqlalchemy import select, update
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from app.core.db import async_session_factory, get_session
@@ -16,7 +18,36 @@ from app.utils.sse import sse_event
 
 router = APIRouter(prefix="/api/jobs", tags=["jobs"])
 
-_TERMINAL_STATUSES = {"succeeded", "failed"}
+_TERMINAL_STATUSES = {"succeeded", "failed", "cancelled"}
+
+
+@router.post("/cancel-all")
+async def cancel_all_jobs(
+    session: AsyncSession = Depends(get_session),
+) -> dict:
+    """Mark every non-terminal job as cancelled.
+
+    Doesn't actually kill the underlying Celery task (those need a worker
+    restart to stop mid-flight), but flips their DB status so the UI
+    stops showing them as in-flight, and the worker's per-task code can
+    see Job.status == 'cancelled' and bail early on next checkpoint.
+
+    Returns the count of jobs that were transitioned.
+    """
+    result = await session.execute(
+        update(Job)
+        .where(Job.status.in_(["queued", "running", "started", "pending"]))
+        .values(
+            status="cancelled",
+            error="Cancelled via /api/jobs/cancel-all",
+            finished_at=datetime.utcnow(),
+        )
+    )
+    await session.commit()
+    return {
+        "cancelled": int(result.rowcount or 0),
+        "message": "Restart the backend service to actually stop running tasks.",
+    }
 
 
 @router.get("/{job_id}", response_model=JobOut)
