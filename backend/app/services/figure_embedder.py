@@ -417,12 +417,14 @@ async def embed_figures_for_book(
                 )
             if label_match is not None:
                 matched_sec_id, matched_block_idx = label_match
-                # Sync the canonical Figure.section_id to the resolved
-                # section so the Figures page sidebar, exports, and any
-                # other UI that groups by Figure.section_id agree with
-                # the embedder's placement decision.
-                if fig.section_id != matched_sec_id:
-                    fig.section_id = matched_sec_id
+                # NOTE (E4 fix): we used to mutate fig.section_id here to
+                # match the label-match section. That made figures hop to
+                # whichever section happened to mention "Fig X.Y" in its
+                # text, which was often a cross-reference, not the home
+                # section. Keep Figure.section_id as the extraction anchor
+                # (page-based, more conservative). The FigureReference row
+                # below carries the per-mention section_ref independently,
+                # so theory-side rendering still works.
                 new_refs.append(FigureReference(
                     figure_id=fig.id,
                     book_id=book_id,
@@ -489,9 +491,9 @@ async def embed_figures_for_book(
                 if global_hit is not None:
                     q, offset = global_hit
                     resolved_sec = q.section_ref or section_id
-                    # Sync canonical Figure.section_id (see theory branch).
-                    if resolved_sec and fig.section_id != resolved_sec:
-                        fig.section_id = resolved_sec
+                    # NOTE (E4 fix): no longer mutate fig.section_id —
+                    # keep the extraction anchor. Reference row carries
+                    # the per-question placement independently.
                     new_refs.append(FigureReference(
                         figure_id=fig.id, book_id=book_id,
                         section_ref=resolved_sec,
@@ -614,9 +616,9 @@ def embed_figures_for_book_sync(session, book_id: UUID) -> dict[str, int]:
                 label_match = _pick_label_match(cands, fig.page_number, sections_by_id)
             if label_match is not None:
                 matched_sec_id, matched_block_idx = label_match
-                # Sync canonical Figure.section_id (see async variant).
-                if fig.section_id != matched_sec_id:
-                    fig.section_id = matched_sec_id
+                # NOTE (E4 fix, sync variant): do NOT mutate fig.section_id.
+                # Keep the extraction anchor; FigureReference below carries
+                # the per-mention section_ref independently.
                 session.add(FigureReference(
                     figure_id=fig.id, book_id=book_id, section_ref=matched_sec_id,
                     context="theory", question_id=None,
@@ -665,8 +667,7 @@ def embed_figures_for_book_sync(session, book_id: UUID) -> dict[str, int]:
                 if global_hit is not None:
                     q, offset = global_hit
                     resolved_sec = q.section_ref or section_id
-                    if resolved_sec and fig.section_id != resolved_sec:
-                        fig.section_id = resolved_sec
+                    # NOTE (E4 fix, sync variant): no Figure.section_id mutation.
                     session.add(FigureReference(
                         figure_id=fig.id, book_id=book_id,
                         section_ref=resolved_sec,

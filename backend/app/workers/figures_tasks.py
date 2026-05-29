@@ -216,9 +216,16 @@ def _extract_figures_v2(book_id: str, job_id: str) -> dict[str, Any]:
         session.query(Figure).filter_by(book_id=book_uuid).delete()
         session.commit()
 
+        # Memory guard — pop image bytes from the dict as we consume them
+        # (don't keep BOTH the full ``images`` dict AND the row-attached
+        # bytes in memory at once). Also commit every N inserts so the
+        # session doesn't accumulate all rows for the whole book — that
+        # was the OOM/SIGKILL trigger on big figure-heavy chapters.
+        _COMMIT_EVERY = 8
+        _since_commit = 0
         for fig_id_text, cands in grouped.items():
             head = cands[0]
-            img_bytes = images.get(fig_id_text)
+            img_bytes = images.pop(fig_id_text, None)
             source_hash = fig_cache.source_hash(img_bytes) if img_bytes else None
             # Determine the figure's primary section anchor — use the first
             # candidate's section_ref (already chosen most-specific by linker).
@@ -262,6 +269,13 @@ def _extract_figures_v2(book_id: str, job_id: str) -> dict[str, Any]:
                 )
                 session.add(ref)
                 inserted_refs += 1
+            _since_commit += 1
+            if _since_commit >= _COMMIT_EVERY:
+                session.commit()
+                # Detach so the next iteration doesn't keep these row
+                # objects (with their PNG bytes) alive in identity map.
+                session.expire_all()
+                _since_commit = 0
         session.commit()
 
         # 5b. Deterministic figure embedder — writes placement metadata
@@ -353,7 +367,12 @@ def _regenerate_figures_v2_section(
     # failure rate. Users who genuinely want the stage can opt in by passing
     # watermark_clean=True explicitly.
     watermark_clean = bool(params.get("watermark_clean", False))
-    overlay = bool(params.get("overlay", True))
+    # Overlay step OCRs the original figure's labels and paints them back
+    # onto the regenerated image. It was intended to preserve label accuracy
+    # but in practice it made regenerated images visually indistinguishable
+    # from originals (since labels dominate the visual signal). Default OFF
+    # so the reviewer sees the actual Gemini output. Callers can opt in.
+    overlay = bool(params.get("overlay", False))
     image_model = params.get("image_model") or None
     ocr_model = params.get("ocr_model") or None
     effective_image_model = image_model or "gemini-3.1-flash-image-preview"

@@ -205,10 +205,26 @@ async def list_book_figures(
             elif r.context == "question":
                 s["n_question"] += 1
 
+    # Lookup section titles from the book's schema so the response
+    # carries human-readable names alongside the id ref. Reviewers need
+    # to confirm "Fig 4.7 belongs to Quadratic Equations" without
+    # cross-referencing the sidebar.
+    title_by_id: dict[str, str] = {}
+    if book and book.schema:
+        try:
+            from app.schemas.analyser import BookSchema
+            from app.services.chunk_builder import flatten_sections as _flatten
+            schema_obj = BookSchema(**book.schema)
+            for ss in _flatten(schema_obj):
+                title_by_id[ss.id] = ss.title
+        except Exception:
+            pass
+
     out_sections = []
     for sref, s in sections.items():
         out_sections.append({
             "section_ref": sref,
+            "section_title": title_by_id.get(sref),
             "figures": s["figures"],
             "contexts": sorted(s["contexts"]),
             "n_theory": s["n_theory"],
@@ -293,7 +309,10 @@ class RegenFiguresRequest(BaseModel):
     # fresh image with no watermark anyway, so the stage is redundant. Opt-in
     # only.
     watermark_clean: bool = False
-    overlay: bool = True
+    # Default OFF so reviewers see the raw Gemini regen (the overlay step
+    # repaints original labels onto the regen image which made regen
+    # visually identical to the original — defeating the purpose).
+    overlay: bool = False
     image_model: str | None = None
     ocr_model: str | None = None
 
