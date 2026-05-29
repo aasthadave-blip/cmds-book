@@ -386,9 +386,13 @@ async def embed_figures_for_book(
     for fig in figures:
         counters["figures_seen"] += 1
         section_id = fig.section_id or ""
-        if not section_id or section_id == "_orphan":
-            counters["skipped_no_section"] += 1
-            continue
+        # NOTE (figures-orphan fix): even when the extractor couldn't pin
+        # this figure to a real section ("_orphan"), still try label-match
+        # across all theory + question text. A figure labelled "Figure 4.7"
+        # that's referenced in theory should embed there even if its
+        # extraction anchor was lost. Only fall back to "unattached" if
+        # the label genuinely isn't mentioned anywhere.
+        orphan = (not section_id or section_id == "_orphan")
 
         label_norm = (fig.normalized_label or _normalize_label(fig.figure_number) or "").strip()
         label_pattern = _build_label_pattern(label_norm)
@@ -442,12 +446,7 @@ async def embed_figures_for_book(
 
             # SECTION FALLBACK: when no label match anywhere AND the figure
             # has a section_id from the figure extractor (page-based), append
-            # the figure to that section at end-of-blocks. Flagged with
-            # placement_kind="page_fallback" so the UI can prompt the user to
-            # verify (page detection is less reliable than label matching at
-            # section boundaries). Only fires when section_id resolves to a
-            # known Section row — never blindly shoves figures under random
-            # sections.
+            # the figure to that section at end-of-blocks.
             if section_id and section_id in sections_by_id:
                 new_refs.append(FigureReference(
                     figure_id=fig.id, book_id=book_id, section_ref=section_id,
@@ -458,6 +457,31 @@ async def embed_figures_for_book(
                 ))
                 counters["theory_appended"] += 1
                 continue
+
+            # ORPHAN PAGE-RANGE FALLBACK: figure has no usable section_id
+            # but might still belong to a section if its page_number falls
+            # inside that section's page_start..page_end. Don't lose the
+            # figure to the void just because the extractor mis-anchored it.
+            if orphan and fig.page_number is not None:
+                page = fig.page_number
+                matched_section_id: str | None = None
+                for sid_iter, sec_iter in sections_by_id.items():
+                    ps = getattr(sec_iter, "page_start", None)
+                    pe = getattr(sec_iter, "page_end", None)
+                    if ps is not None and pe is not None and ps <= page <= pe:
+                        matched_section_id = sid_iter
+                        break
+                if matched_section_id:
+                    new_refs.append(FigureReference(
+                        figure_id=fig.id, book_id=book_id,
+                        section_ref=matched_section_id,
+                        context="theory", question_id=None,
+                        placeholder_text=fig.figure_number, link_method="auto",
+                        placement_kind="page_fallback", placement_block_idx=None,
+                        placement_char_offset=None,
+                    ))
+                    counters["theory_appended"] += 1
+                    continue
 
             # No label match + no usable section → Unattached panel.
             new_refs.append(FigureReference(
@@ -599,9 +623,13 @@ def embed_figures_for_book_sync(session, book_id: UUID) -> dict[str, int]:
     for fig in figures:
         counters["figures_seen"] += 1
         section_id = fig.section_id or ""
-        if not section_id or section_id == "_orphan":
-            counters["skipped_no_section"] += 1
-            continue
+        # NOTE (figures-orphan fix): even when the extractor couldn't pin
+        # this figure to a real section ("_orphan"), still try label-match
+        # across all theory + question text. A figure labelled "Figure 4.7"
+        # that's referenced in theory should embed there even if its
+        # extraction anchor was lost. Only fall back to "unattached" if
+        # the label genuinely isn't mentioned anywhere.
+        orphan = (not section_id or section_id == "_orphan")
 
         label_norm = (fig.normalized_label or _normalize_label(fig.figure_number) or "").strip()
         label_pattern = _build_label_pattern(label_norm)
@@ -642,6 +670,29 @@ def embed_figures_for_book_sync(session, book_id: UUID) -> dict[str, int]:
                 ))
                 counters["theory_appended"] += 1
                 continue
+
+            # ORPHAN PAGE-RANGE FALLBACK (sync variant) — match figure to
+            # any section whose page range contains it.
+            if orphan and fig.page_number is not None:
+                page = fig.page_number
+                matched_section_id: str | None = None
+                for sid_iter, sec_iter in sections_by_id.items():
+                    ps = getattr(sec_iter, "page_start", None)
+                    pe = getattr(sec_iter, "page_end", None)
+                    if ps is not None and pe is not None and ps <= page <= pe:
+                        matched_section_id = sid_iter
+                        break
+                if matched_section_id:
+                    session.add(FigureReference(
+                        figure_id=fig.id, book_id=book_id,
+                        section_ref=matched_section_id,
+                        context="theory", question_id=None,
+                        placeholder_text=fig.figure_number, link_method="auto",
+                        placement_kind="page_fallback", placement_block_idx=None,
+                        placement_char_offset=None,
+                    ))
+                    counters["theory_appended"] += 1
+                    continue
 
             session.add(FigureReference(
                 figure_id=fig.id, book_id=book_id, section_ref=section_id,
