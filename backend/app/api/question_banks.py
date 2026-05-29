@@ -577,6 +577,12 @@ async def _load_question_embedded_figures(
         f = fig_by_id.get(r.figure_id)
         if f is None:
             continue
+        # Skip ghost figures — references that point to a Figure row whose
+        # bytes never got persisted (figure extraction crashed mid-flight
+        # before image_bytes were committed). Including them produces broken
+        # <img> tags in the reviewer that confuse "is this regen working?".
+        if not f.regen_image_bytes and not f.image_bytes:
+            continue
         # Default to the regen variant whenever it exists — no approval gate.
         # Reviewer wants regenerated figure to appear automatically inside the
         # regenerated question; the explicit Approve step is for the Figures
