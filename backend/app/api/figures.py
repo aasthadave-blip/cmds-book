@@ -145,6 +145,37 @@ async def extract_figures_v2(
 # GET /api/books/{book_id}/figures
 # ---------------------------------------------------------------------------
 
+@books_router.post("/{book_id}/re-embed-figures")
+async def re_embed_figures(
+    book_id: UUID,
+    session: AsyncSession = Depends(get_session),
+) -> dict:
+    """Re-run the figure embedder for this book.
+
+    Useful when figures are extracted but their FigureReference rows are
+    missing (extractor crashed mid-flight before embedder ran, or
+    section_id ended up as '_orphan' so the embedder skipped them).
+    Idempotent — wipes existing refs for this book and rewrites them.
+    """
+    from app.services.figure_embedder import embed_figures_for_book_sync
+    from app.core.config import settings
+    from sqlalchemy import create_engine
+    from sqlalchemy.orm import sessionmaker
+
+    def _run():
+        engine = create_engine(settings.SYNC_DATABASE_URL, pool_pre_ping=True, future=True)
+        Session = sessionmaker(bind=engine, future=True, expire_on_commit=False)
+        with Session() as sync_session:
+            counters = embed_figures_for_book_sync(sync_session, book_id)
+            sync_session.commit()
+            return counters
+
+    # Run sync embedder in a thread (async route, sync ORM internals).
+    import asyncio
+    counters = await asyncio.to_thread(_run)
+    return {"ok": True, "counters": counters}
+
+
 @books_router.get("/{book_id}/figures")
 async def list_book_figures(
     book_id: UUID,
