@@ -1002,6 +1002,30 @@ async def build_final_merge(
             and not kept_questions
         ):
             continue
+
+        # F8 extension — also drop a worked-example subsection that
+        # consumed its OWN chip within itself. The chip-merge inlined the
+        # question; the section's remaining theory blocks repeat the
+        # solution prose. Without this, preview shows the inlined Q4.2
+        # immediately followed by the standalone EXAMPLE 4.2 with its
+        # broken-up solution paragraphs — visually identical content.
+        #
+        # Tight match conditions so we don't accidentally collapse a real
+        # subsection that happens to have a chip-match:
+        #   1. section id contains "-example-" OR title starts "EXAMPLE "
+        #   2. chip-merge actually inlined a question here
+        #   3. no standalone questions remain
+        title = (s.get("section_title") or "").strip().upper()
+        inlined_map = s.get("inlined_questions_by_block_idx") or {}
+        had_inline = any(qs for qs in inlined_map.values())
+        looks_like_example = (
+            (sid and "-example-" in sid.lower())
+            or title.startswith("EXAMPLE ")
+            or title.startswith("WORKED EXAMPLE")
+        )
+        if looks_like_example and had_inline and not kept_questions:
+            continue
+
         pruned_sections.append(s)
     merged_sections = pruned_sections
 

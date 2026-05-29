@@ -198,6 +198,29 @@ async def get_book(book_id: UUID, session: AsyncSession = Depends(get_session)) 
     book = await session.get(Book, book_id)
     if book is None:
         raise HTTPException(404, detail="Book not found")
+    # Self-heal stuck books — if the worker died mid-flight and left
+    # book.status="schema_ready" but every theory-bearing section actually
+    # finished (passed/failed), promote the book to "ready" so the UI
+    # unblocks. Idempotent: only flips schema_ready → ready, never the
+    # other direction.
+    if book.status == "schema_ready":
+        from sqlalchemy import func, select as _select
+        from app.models import Section
+        counts = (
+            await session.execute(
+                _select(Section.status, func.count(Section.id))
+                .where(Section.book_id == book_id)
+                .group_by(Section.status)
+            )
+        ).all()
+        by_status = {s: int(n) for s, n in counts}
+        total = sum(by_status.values())
+        terminal = by_status.get("passed", 0) + by_status.get("failed", 0)
+        # All sections in a terminal state and at least one passed → ready.
+        if total > 0 and terminal == total and by_status.get("passed", 0) > 0:
+            book.status = "ready"
+            await session.commit()
+            await session.refresh(book)
     return BookOut.from_orm_book(book)
 
 
