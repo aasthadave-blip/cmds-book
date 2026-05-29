@@ -776,6 +776,14 @@ export default function RegenReviewPage() {
               regenBlocks={regenBlocksBySection[section.section_id]}
               banksDetail={banksDetail}
               questionRegen={questionRegen}
+              onQuestionHidden={async () => {
+                // After a ✕ click on either Original or Regenerated side,
+                // refetch BOTH lists so the hidden row disappears from view.
+                await Promise.all([
+                  loadQuestionRegen(),
+                  questionsState.refetch?.(),
+                ]);
+              }}
               onSectionRetry={async (sectionRef, instruction) => {
                 if (!questionRegen?.regen?.id) {
                   setError(
@@ -856,6 +864,7 @@ function SectionBlock({
   regenBlocks,
   banksDetail,
   questionRegen,
+  onQuestionHidden,
   onSectionRetry,
   figuresData,
   bookId,
@@ -870,6 +879,7 @@ function SectionBlock({
   regenBlocks: Array<{ t: string; [k: string]: unknown }> | undefined;
   banksDetail: QuestionBankDetail | null;
   questionRegen: RegenQuestionsResponse | null;
+  onQuestionHidden: () => void | Promise<void>;
   onSectionRetry: (sectionRef: string, instruction: string) => void | Promise<void>;
   figuresData: BookFigures | null;
   bookId: string | undefined;
@@ -1004,6 +1014,7 @@ function SectionBlock({
             banksDetail={banksDetail}
             subTab={subTab}
             questionRegen={questionRegen}
+            onQuestionHidden={onQuestionHidden}
             onSectionRetry={onSectionRetry}
           />
         )}
@@ -1139,12 +1150,14 @@ function QuestionsBody({
   banksDetail,
   subTab,
   questionRegen,
+  onQuestionHidden,
   onSectionRetry,
 }: {
   section: Section;
   banksDetail: QuestionBankDetail | null;
   subTab: SubTab;
   questionRegen: RegenQuestionsResponse | null;
+  onQuestionHidden: () => void | Promise<void>;
   onSectionRetry: (sectionRef: string, instruction: string) => void | Promise<void>;
 }) {
   const originalQs =
@@ -1256,6 +1269,21 @@ function QuestionsBody({
     </div>
   ) : null;
 
+  // Empty-section guard: when neither original nor regen has any data
+  // for this section, surface a clear message instead of rendering blank
+  // panels (which made the tab look broken during partial loads).
+  if (!originalQs && !regenQs) {
+    return (
+      <>
+        {retryButton}
+        <div style={{ padding: 40, color: 'var(--ink-500)', textAlign: 'center' }}>
+          No questions extracted for this section yet.
+        </div>
+        {retryDialog}
+      </>
+    );
+  }
+
   // Compare mode — per-QUESTION pairing: each original question shown
   // alongside its regen variants. Sections that have multiple questions
   // (Exercise / CLASSROOM WING etc.) render one pair per question for
@@ -1363,8 +1391,10 @@ function QuestionsBody({
                         onClick={async () => {
                           try {
                             await hideQuestion(oq.id);
+                            // Refetch so the hidden row disappears from view.
+                            await onQuestionHidden();
                           } catch (_e) {
-                            // ignored — UI shows hidden state on refetch
+                            // ignored — server will retry on next refetch
                           }
                         }}
                         style={{
@@ -1427,6 +1457,7 @@ function QuestionsBody({
                                 onClick={async () => {
                                   try {
                                     await hideQuestion(rq.id);
+                                    await onQuestionHidden();
                                   } catch (_e) {/* ignored */}
                                 }}
                                 style={{

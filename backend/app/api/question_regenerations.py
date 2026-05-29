@@ -245,10 +245,12 @@ async def list_regen_questions(
         raise HTTPException(404, detail="Regeneration not found")
 
     # Regen questions (rows with regen_id set on this run).
+    # Skip hidden ones — ✕ button on a regen variant must remove it from view.
     rows = (
         await session.execute(
             select(Question)
             .where(Question.regen_id == regen_id)
+            .where(Question.is_hidden.is_(False))
             .order_by(
                 Question.section_ref.nulls_last(),
                 Question.source_question_id.nulls_last(),

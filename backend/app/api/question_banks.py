@@ -577,7 +577,11 @@ async def _load_question_embedded_figures(
         f = fig_by_id.get(r.figure_id)
         if f is None:
             continue
-        variant = "regen" if (f.regen_image_bytes and f.approved_at) else "original"
+        # Default to the regen variant whenever it exists — no approval gate.
+        # Reviewer wants regenerated figure to appear automatically inside the
+        # regenerated question; the explicit Approve step is for the Figures
+        # tab QA workflow, not a precondition for display here.
+        variant = "regen" if f.regen_image_bytes else "original"
         out.setdefault(str(r.question_id), []).append({
             "ref_id": str(r.id),
             "figure_id": str(f.id),
@@ -610,10 +614,14 @@ async def list_questions(
     # endpoint (/api/question-regenerations/{regen_id}/questions). Leaking
     # them into the bank's question list caused them to appear under both
     # Original and Regenerated.
+    # Also exclude hidden questions — when a user clicks ✕ on a question
+    # in the reviewer, we set is_hidden=True and it should disappear from
+    # every list endpoint (not just the regen overlay).
     result = await session.execute(
         select(Question)
         .where(Question.bank_id == bank_id)
         .where(Question.regen_id.is_(None))
+        .where(Question.is_hidden.is_(False))
         .order_by(Question.section_ref, Question.page_start, Question.created_at)
     )
     questions = result.scalars().all()
