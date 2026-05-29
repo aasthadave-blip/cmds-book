@@ -100,6 +100,25 @@ export default function RegenReviewPage() {
   }, [loadQuestionRegen]);
 
   const [topTab, setTopTab] = useState<TopTab>('theory');
+
+  // Refetch fresh data when the user lands on a tab. The hooks only fetch
+  // once on mount otherwise — if a background regen completes after mount
+  // (and before the user opens the relevant tab), the cached state would
+  // make the tab look stuck on empty / old data. This is cheap and snaps
+  // the UI back to truth whenever the user switches view.
+  useEffect(() => {
+    if (topTab === 'theory') {
+      void regenState.refetch?.();
+    } else if (topTab === 'questions') {
+      void questionsState.refetch?.();
+    } else if (topTab === 'figures') {
+      void figuresState.refetch?.();
+    }
+    // We intentionally do NOT include the refetch fns in deps — they are
+    // stable callbacks from useCallback inside their hooks and including
+    // them would refire this effect on every render.
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [topTab]);
   const [subTab, setSubTab] = useState<SubTab>('regenerated');
   const [activeSectionId, setActiveSectionId] = useState<string | null>(null);
   const [reseedModal, setReseedModal] = useState<{

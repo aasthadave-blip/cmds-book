@@ -125,7 +125,12 @@ export function FiguresView({
           }}
         >
           {sectionFigures.figures.map((f) => (
-            <FigureCard key={f.id} figure={f} />
+            <FigureCard
+              key={f.id}
+              figure={f}
+              sectionRef={sectionFigures.section_ref}
+              sectionTitle={null}
+            />
           ))}
         </div>
       </div>
@@ -133,19 +138,30 @@ export function FiguresView({
   );
 }
 
-function FigureCard({ figure: f }: { figure: Figure }) {
+function FigureCard({
+  figure: f,
+  sectionRef,
+  sectionTitle,
+}: {
+  figure: Figure;
+  sectionRef: string;
+  sectionTitle: string | null;
+}) {
   const [imgErr, setImgErr] = useState(false);
-  // Tab state: which variant to display. Default to Regenerated when one
-  // exists, otherwise show Original. Reset imgErr whenever variant changes.
-  const [variant, setVariant] = useState<'original' | 'regen'>(
-    f.has_regen ? 'regen' : 'original',
-  );
-  const url =
-    variant === 'regen' && f.has_regen
-      ? figureImageUrl(f.id, true)
-      : f.has_original
-        ? figureImageUrl(f.id)
-        : null;
+  const [compareOpen, setCompareOpen] = useState(false);
+
+  // Default rule: if a regenerated variant exists, show it. Else fall back
+  // to the original. No more Original/Regenerated toggle — the side-by-side
+  // comparison lives behind a single ↔ button so the default card is clean.
+  const showingRegen = f.has_regen;
+  const url = showingRegen
+    ? figureImageUrl(f.id, true)
+    : f.has_original
+      ? figureImageUrl(f.id)
+      : null;
+
+  const canCompare = f.has_original && f.has_regen;
+
   return (
     <div
       className="card"
@@ -156,53 +172,6 @@ function FigureCard({ figure: f }: { figure: Figure }) {
         flexDirection: 'column',
       }}
     >
-      {/* Original / Regenerated toggle — only visible when both exist */}
-      {f.has_original && f.has_regen && (
-        <div
-          style={{
-            display: 'flex',
-            borderBottom: '1px solid var(--line)',
-            background: 'var(--surface-2)',
-          }}
-        >
-          <button
-            onClick={() => { setVariant('original'); setImgErr(false); }}
-            style={{
-              flex: 1,
-              padding: '8px 12px',
-              fontSize: 11,
-              fontWeight: 700,
-              letterSpacing: '0.06em',
-              textTransform: 'uppercase',
-              background: variant === 'original' ? 'var(--surface)' : 'transparent',
-              color: variant === 'original' ? 'var(--ink-900)' : 'var(--ink-500)',
-              border: 'none',
-              borderBottom: variant === 'original' ? '2px solid var(--ink-900)' : '2px solid transparent',
-              cursor: 'pointer',
-            }}
-          >
-            Original
-          </button>
-          <button
-            onClick={() => { setVariant('regen'); setImgErr(false); }}
-            style={{
-              flex: 1,
-              padding: '8px 12px',
-              fontSize: 11,
-              fontWeight: 700,
-              letterSpacing: '0.06em',
-              textTransform: 'uppercase',
-              background: variant === 'regen' ? 'var(--surface)' : 'transparent',
-              color: variant === 'regen' ? 'var(--indigo-700)' : 'var(--ink-500)',
-              border: 'none',
-              borderBottom: variant === 'regen' ? '2px solid var(--indigo-700)' : '2px solid transparent',
-              cursor: 'pointer',
-            }}
-          >
-            ✨ Regenerated
-          </button>
-        </div>
-      )}
       <div
         style={{
           minHeight: 420,
@@ -217,8 +186,7 @@ function FigureCard({ figure: f }: { figure: Figure }) {
       >
         {url && !imgErr ? (
           <img
-            // Key forces re-mount on variant change so cached error state is cleared
-            key={`${f.id}-${variant}`}
+            key={`${f.id}-${showingRegen ? 'regen' : 'orig'}`}
             src={url}
             alt={f.caption ?? f.figure_number ?? 'Figure'}
             onError={() => setImgErr(true)}
@@ -239,23 +207,51 @@ function FigureCard({ figure: f }: { figure: Figure }) {
           >
             <Icon name="image" size={28} />
             <div style={{ marginTop: 6 }}>
-              {imgErr
-                ? 'Image unavailable'
-                : variant === 'regen'
-                  ? 'No regenerated image'
-                  : 'No original'}
+              {imgErr ? 'Image unavailable' : 'No image yet'}
             </div>
           </div>
         )}
-        {/* If both exist but toggle is hidden (no toggle shown for single-variant figures),
-            still show a small badge for the regen-only case. */}
-        {f.has_regen && !f.has_original && (
-          <span
-            className="badge regen"
-            style={{ position: 'absolute', top: 8, right: 8, fontSize: 10 }}
+        {/* Variant indicator — small chip top-right so reviewers know
+            whether they're looking at original or regen by default. */}
+        <span
+          className={showingRegen ? 'badge regen' : 'badge'}
+          style={{
+            position: 'absolute',
+            top: 8,
+            right: 8,
+            fontSize: 10,
+            background: showingRegen ? undefined : 'var(--surface)',
+          }}
+        >
+          {showingRegen ? (
+            <>
+              <Icon name="sparkles" size={10} /> regenerated
+            </>
+          ) : (
+            'original'
+          )}
+        </span>
+        {/* ↔ Compare button — only useful when both variants exist */}
+        {canCompare && (
+          <button
+            onClick={() => setCompareOpen(true)}
+            title="Compare original vs regenerated"
+            style={{
+              position: 'absolute',
+              top: 8,
+              left: 8,
+              fontSize: 11,
+              padding: '4px 10px',
+              border: '1px solid var(--line)',
+              borderRadius: 6,
+              background: 'var(--surface)',
+              color: 'var(--ink-900)',
+              cursor: 'pointer',
+              fontWeight: 700,
+            }}
           >
-            <Icon name="sparkles" size={10} /> regen
-          </span>
+            ↔ Compare
+          </button>
         )}
       </div>
       <div style={{ padding: '14px 16px' }}>
@@ -279,7 +275,6 @@ function FigureCard({ figure: f }: { figure: Figure }) {
           >
             {f.figure_number ?? (f.normalized_label ? `Figure ${f.normalized_label}` : 'Figure')}
           </div>
-          {/* Where the figure is embedded — theory or question */}
           {f.context_hint && (
             <span
               className="kbd"
@@ -303,7 +298,20 @@ function FigureCard({ figure: f }: { figure: Figure }) {
             </span>
           )}
         </div>
-        {/* Caption / figure name */}
+        {/* Section anchor — always visible so reviewers can confirm the
+            figure is filed under the right section without scrolling. */}
+        <div
+          style={{
+            fontSize: 11,
+            color: 'var(--ink-500)',
+            fontFamily: 'var(--font-mono)',
+            letterSpacing: '0.04em',
+            marginBottom: 6,
+          }}
+        >
+          {sectionRef}
+          {sectionTitle ? ` · ${sectionTitle}` : ''}
+        </div>
         {f.caption && (
           <div
             style={{
@@ -327,13 +335,123 @@ function FigureCard({ figure: f }: { figure: Figure }) {
         >
           {f.page_number && <span>p.{f.page_number}</span>}
           {f.semantic_type && <span>{f.semantic_type}</span>}
-          {f.context_hint && (
-            <span className="kbd" style={{ fontSize: 10 }}>
-              {f.context_hint}
-            </span>
-          )}
         </div>
       </div>
+
+      {/* Compare modal — side-by-side Original vs Regenerated */}
+      {compareOpen && canCompare && (
+        <div
+          onClick={() => setCompareOpen(false)}
+          style={{
+            position: 'fixed',
+            inset: 0,
+            background: 'rgba(0,0,0,0.6)',
+            zIndex: 1000,
+            display: 'grid',
+            placeItems: 'center',
+            padding: 24,
+          }}
+        >
+          <div
+            onClick={(e) => e.stopPropagation()}
+            style={{
+              background: 'var(--bg)',
+              borderRadius: 12,
+              padding: 20,
+              maxWidth: 1200,
+              width: '100%',
+              maxHeight: '90vh',
+              overflow: 'auto',
+              boxShadow: '0 20px 60px rgba(0,0,0,0.4)',
+            }}
+          >
+            <div
+              style={{
+                display: 'flex',
+                justifyContent: 'space-between',
+                alignItems: 'center',
+                marginBottom: 12,
+              }}
+            >
+              <div style={{ fontWeight: 800, fontSize: 16 }}>
+                {f.figure_number ?? 'Figure'} — Original vs Regenerated
+              </div>
+              <button
+                onClick={() => setCompareOpen(false)}
+                style={{
+                  border: 'none',
+                  background: 'transparent',
+                  fontSize: 20,
+                  cursor: 'pointer',
+                  color: 'var(--ink-500)',
+                }}
+              >
+                ✕
+              </button>
+            </div>
+            <div
+              style={{
+                display: 'grid',
+                gridTemplateColumns: '1fr 1fr',
+                gap: 12,
+              }}
+            >
+              <div>
+                <div
+                  style={{
+                    fontSize: 11,
+                    fontWeight: 700,
+                    letterSpacing: '0.1em',
+                    textTransform: 'uppercase',
+                    color: 'var(--ink-500)',
+                    marginBottom: 6,
+                  }}
+                >
+                  Original
+                </div>
+                <img
+                  src={figureImageUrl(f.id, false)}
+                  alt="original"
+                  style={{
+                    width: '100%',
+                    maxHeight: '70vh',
+                    objectFit: 'contain',
+                    background: 'var(--surface-2)',
+                    border: '1px solid var(--line)',
+                    borderRadius: 8,
+                  }}
+                />
+              </div>
+              <div>
+                <div
+                  style={{
+                    fontSize: 11,
+                    fontWeight: 700,
+                    letterSpacing: '0.1em',
+                    textTransform: 'uppercase',
+                    color: 'var(--indigo-700)',
+                    marginBottom: 6,
+                  }}
+                >
+                  ✨ Regenerated
+                </div>
+                <img
+                  src={figureImageUrl(f.id, true)}
+                  alt="regenerated"
+                  style={{
+                    width: '100%',
+                    maxHeight: '70vh',
+                    objectFit: 'contain',
+                    background: 'var(--surface-2)',
+                    border: '1px solid var(--line)',
+                    borderRadius: 8,
+                  }}
+                />
+              </div>
+            </div>
+          </div>
+        </div>
+      )}
     </div>
   );
 }

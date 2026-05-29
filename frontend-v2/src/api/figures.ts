@@ -42,8 +42,11 @@ export const getBookFigures = (bookId: string) =>
   req<BookFigures>(`/api/books/${bookId}/figures`);
 
 // Image bytes endpoint — returns the figure image bytes. Use in <img src>.
+// Backend variant strings are "regenerated" | "original" | "auto"; we send
+// the explicit one when caller asked for regen so we never depend on the
+// auto-fallback. Omitting the param lets the backend choose (auto).
 export const figureImageUrl = (figureId: string, regen = false) =>
-  `${API_BASE}/api/figures/${figureId}/image${regen ? '?variant=regen' : ''}`;
+  `${API_BASE}/api/figures/${figureId}/image${regen ? '?variant=regenerated' : ''}`;
 
 // Per-section figure regen — POSTs to backend with optional custom instructions.
 // Backend dispatches an async worker. Caller should refetch figures after.
