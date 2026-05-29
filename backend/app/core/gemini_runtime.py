@@ -34,12 +34,12 @@ DEFAULT_TIMEOUT_S = 150
 # Process-wide concurrency cap on in-flight Gemini calls. Without this, a
 # 39-section book with parallel workers fires 30+ simultaneous calls, hits
 # Gemini quota, and triggers timeouts that look like hangs.
-# 12 in-flight on Pro Tier 1 (360 RPM / 4M TPM) is ~6% of quota — leaves
-# plenty of headroom for transient retries. Drops the "stuck at end"
-# delay from ~60s to ~40s on typical 14-section chapters.
-# Bump up to 16-24 if you move to higher tiers; bump down to 4 if you
-# regress to free tier.
-_MAX_IN_FLIGHT = 12
+# 8 in-flight is the sweet spot for Railway's container memory budget —
+# tried 12 and Celery workers were OOM-killed by the kernel (SIGKILL)
+# during figure extraction. Each in-flight call holds the PDF slice,
+# Gemini request buffer, and (for figures) PNG bytes — memory adds up
+# fast. Stay at 8 until the container is upgraded.
+_MAX_IN_FLIGHT = 8
 _inflight_sem = threading.BoundedSemaphore(_MAX_IN_FLIGHT)
 
 # Retry policy on transient errors (5xx, timeouts, connection resets). Total

@@ -356,7 +356,7 @@ def extract_book_task(self, book_id: str, job_id: str) -> dict:
             #      any cross-section write corruption with a loud assert.
             #   6. Schema postpass + example_linker still run AFTER all
             #      sections complete — same invariant as the sequential loop.
-            CONCURRENCY = max(1, int(os.environ.get("THEORY_SECTION_CONCURRENCY", "12")))
+            CONCURRENCY = max(1, int(os.environ.get("THEORY_SECTION_CONCURRENCY", "8")))
 
             # Pre-compute per-section payloads sequentially (cheap — just
             # arithmetic + schema lookups, no Gemini calls). Captures the
