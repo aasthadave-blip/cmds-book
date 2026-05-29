@@ -76,6 +76,20 @@ def _sanitize_schema(data: dict) -> dict:
                 t = s.get("title", "")
                 if t and t not in excluded_titles:
                     excluded_titles.append(t)
+            # Remove "Mixed" content_types — a section is EITHER theory OR
+            # questions, never both. If both are present, the section is
+            # theory-bearing (its Cat A items are nested subsections with
+            # their own ["questions"] content_types).
+            ct = s.get("content_types") or []
+            if isinstance(ct, list) and "theory" in ct and "questions" in ct:
+                new_ct = [c for c in ct if c != "questions"]
+                if "theory" not in new_ct:
+                    new_ct.insert(0, "theory")
+                logger.debug(
+                    "Normalizing Mixed content_types %r → %r (id=%s)",
+                    ct, new_ct, s.get("id"),
+                )
+                s["content_types"] = new_ct
             _fix_sections(s.get("subsections") or [])
 
     _fix_sections(data.get("sections") or [])

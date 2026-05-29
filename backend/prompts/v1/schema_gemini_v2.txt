@@ -18,13 +18,8 @@ Both numbered and unnumbered headings are equally important.
 
 - **Numbered:** Chapter 8, Unit 3, 8.1, 8.4.1, 8.5.3.1
 - **Unnumbered:** any text that is (bold OR larger font OR distinct color OR in a styled box) AND introduces content. Examples: Introduction, Summary, Did You Know, Key Concepts, About G.N. Ramachandran, Historical Background, Applications
-- **Lettered / list-style sub-section headings:** when a printed line starts with `(A)`, `(B)`, `(C)`, `(D)` … OR `A.`, `B.`, `C.` … OR `1.`, `2.`, `3.` … AND is followed by a heading-like phrase that introduces a distinct sub-concept, treat each as its OWN subsection of the surrounding theory heading. Books commonly explain a topic with multiple sub-points labelled `(A) (B) (C) (D)` — each gets its own subsection. These subsections can have Cat A items (Examples / Exercises) nested INSIDE them, so EXAMPLE 3.5 may belong to `(A)`, EXAMPLE 3.6 to `(B)`, etc.
-  - id format: `<parent-id>-a`, `<parent-id>-b`, `<parent-id>-1` (lowercased letter / digit)
-  - title verbatim: `"(A) One value as a percentage of the other"`
-  - `content_types: ["theory"]`, `type: "subsection"`
-  - DO NOT use this rule for inline bullet/list items inside a paragraph — only when the lettered/numbered line is visually distinct (own line, larger font, or introduces a sub-topic followed by explanatory prose).
 
-Commonly missed (look for them): unnumbered intro before Section 1; biographical sidebars; chapter-end summaries; mid-chapter callouts that introduce a new topic; lettered sub-points `(A) (B) (C)` between examples.
+Commonly missed (look for them): unnumbered intro before Section 1; biographical sidebars; chapter-end summaries; mid-chapter callouts that introduce a new topic.
 
 Wrapped titles: a heading that spans two printed lines is ONE heading — capture the full title.
 
@@ -75,7 +70,7 @@ Examples, Exercises, Illustrations, Activities, etc. that appear INSIDE a theory
 | Cat | Printed labels (any of) | Schema entry | `content_types` | Chip in sidebar? | Body extracted by |
 |---|---|---|---|---|---|
 | **A — Questions** | EXAMPLE, Worked Example, Solved Example, Exercise N.M, Problem, Practice Problem, Practice, In-text Question, Drill, Workout | `type="subsection"` | `["questions"]` | yes | question pipeline |
-| **B — Theory aid** | Illustration, Progress Check, Activity, Try It, Quick Check, Test Yourself, Self-Check, Check Your Understanding | `type="subsection"` | `["theory"]` | no | theory pipeline (as body) |
+| **B — Theory aid** | Illustration, Progress Check, Activity, Try It, Quick Check, Test Yourself, Self-Check, Check Your Understanding, Crossword, Word Puzzle | `type="subsection"` | `["theory"]` | no | theory pipeline (as body) |
 | **C — Inline callout** | Note, Remember, DO YOU KNOW, Thinking Corner, Key Point, Recall, Errata, Note to Teacher, Scientific Cryptic | **NO schema entry** | n/a | n/a | theory pipeline (as `key_point` inside parent's body) |
 
 If a label doesn't match anything above:
@@ -131,7 +126,7 @@ subsections:              [each labeled item as its own subsection]
 ### Section-level vs end-of-chapter exercises
 
 - Inline numbered exercises (Exercise 1.1, Exercise 8.3) **between theory sections and BEFORE the chapter's last theory heading** → nest under the immediately-preceding theory heading using the parent rule. `type="subsection"`, `content_types=["questions"]`.
-- Exercise/question blocks **AFTER the last theory heading** (rest of chapter is only questions + answer keys) → `excluded_sections`. Examples: Unit Exercise, Question Bank, MCQ Bank, final review block. **Note:** Crosswords / Word Puzzles do NOT get their own schema entry — their text is transcribed as part of the surrounding theory section's body content (no subsection, no chip).
+- Exercise/question blocks **AFTER the last theory heading** (rest of chapter is only questions + answer keys) → `excluded_sections`. Examples: Unit Exercise, Question Bank, MCQ Bank, final review block. **Note:** Crosswords and Word Puzzles are NOT excluded — they're Category B (theory aid), nest under preceding theory heading.
 
 ## PASS 4 — Question census
 
@@ -139,7 +134,7 @@ For every section AND every `excluded_sections` entry, set `expected_question_co
 
 **Count:** numbered exercises (1., 2., Q.3) · each numbered MCQ stem (not per-option) · "Try It" / "Activity" / "Check Your Understanding" prompts · worked examples that pose a problem · short-/long-answer / numerical prompts · numbered sub-parts with own number = separate; (a)(b)(c) under same number = 1.
 
-**Don't count:** fill-in-blank decorative panels, hint boxes, "Did You Know", learning objectives, summaries, standalone answer keys, headings, crosswords / word puzzles (these are part of the surrounding theory body, not a separate counted section).
+**Don't count:** fill-in-blank decorative panels, hint boxes, "Did You Know", learning objectives, summaries, standalone answer keys, headings. (Crosswords / word puzzles → Category B theory aid; they have `expected_question_count: 0` like other theory aids.)
 
 Pure theory section → 0. End-of-chapter "Exercises" / "Practice Questions" almost always have a non-zero count — don't leave at 0 by default.
 
@@ -152,7 +147,7 @@ Pure theory section → 0. End-of-chapter "Exercises" / "Practice Questions" alm
 
 Return valid JSON only — no markdown fences, no explanation before or after.
 
-Valid `content_types` values: **exactly one of** `["theory"]` or `["questions"]`. (Optionally append `"figures"` if figures are present: `["theory", "figures"]` or `["questions", "figures"]`.) **NEVER emit `["theory", "questions"]`** — a theory section that contains Cat A items (Example, Exercise, Drill) inside it is STILL `["theory"]`; the Cat A items are nested subsections with their OWN `["questions"]` content_types. A section is EITHER theory-bearing OR a pure question container — never both.
+Valid `content_types` values: `["theory"]`, `["questions"]`, `["theory", "figures"]`, `["theory", "questions"]`, `["questions", "figures"]`. Do not invent other combinations.
 
 ```
 {

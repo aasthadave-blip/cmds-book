@@ -1,7 +1,0 @@
-
-
-STRICT VERBATIM MODE — Two previous attempts failed QC.
-Remaining issues to fix:
-{formatted_qc_issues}
-For these specific parts: copy the source sentences WORD FOR WORD.
-Do not paraphrase. Do not improve the language. Copy exactly.

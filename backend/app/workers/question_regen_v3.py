@@ -819,7 +819,15 @@ async def _run_regen_one_section_v3(
     regen_id: UUID,
     section_ref: str,
     job_id: UUID,
+    section_custom_instructions: str | None = None,
 ) -> dict[str, Any]:
+    """Re-run regeneration for ONE section.
+
+    If `section_custom_instructions` is provided, it OVERRIDES the regen's
+    persisted custom_instructions for this single retry — the regen record
+    itself is NOT mutated. This is how the UI's "Reseed this section" dialog
+    layers per-section instructions on top of the broader regen params.
+    """
     with SyncSession() as session:
         regen = session.get(QuestionRegeneration, regen_id)
         if regen is None:
@@ -849,7 +857,12 @@ async def _run_regen_one_section_v3(
         )
         if priority_mode not in _VALID_PRIORITY_MODES:
             priority_mode = DEFAULT_PRIORITY_MODE
-        custom_instructions = (regen.custom_instructions or "").strip() or None
+        # Section-level instructions OVERRIDE the regen's persisted custom
+        # instructions for this single retry. The regen record stays clean.
+        if section_custom_instructions and section_custom_instructions.strip():
+            custom_instructions = section_custom_instructions.strip()
+        else:
+            custom_instructions = (regen.custom_instructions or "").strip() or None
         subject = bank.subject or None
         grade = getattr(book, "grade_level", None) or None
         board = getattr(book, "board", None) or None
@@ -1082,13 +1095,21 @@ def _extract_questions_regen_v3(regen_id: str, job_id: str) -> dict[str, Any]:
 
 
 def _retry_regen_section_v3(
-    regen_id: str, section_ref: str, job_id: str,
+    regen_id: str,
+    section_ref: str,
+    job_id: str,
+    section_custom_instructions: str | None = None,
 ) -> dict[str, Any]:
     regen_uuid = UUID(regen_id)
     job_uuid = UUID(job_id)
     try:
         return asyncio.run(
-            _run_regen_one_section_v3(regen_uuid, section_ref, job_uuid)
+            _run_regen_one_section_v3(
+                regen_uuid,
+                section_ref,
+                job_uuid,
+                section_custom_instructions=section_custom_instructions,
+            )
         )
     except Exception as e:
         logger.exception("retry_regen_section_v3 failed")
@@ -1108,8 +1129,16 @@ def extract_questions_regen_v3_task(self, regen_id: str, job_id: str) -> dict[st
 
 
 @celery_app.task(name="retry_regen_section_v3", bind=True)
-def retry_regen_section_v3_task(self, regen_id: str, section_ref: str, job_id: str) -> dict[str, Any]:
-    return _retry_regen_section_v3(regen_id, section_ref, job_id)
+def retry_regen_section_v3_task(
+    self,
+    regen_id: str,
+    section_ref: str,
+    job_id: str,
+    section_custom_instructions: str | None = None,
+) -> dict[str, Any]:
+    return _retry_regen_section_v3(
+        regen_id, section_ref, job_id, section_custom_instructions
+    )
 
 
 register_task("extract_questions_regen_v3", _extract_questions_regen_v3)
