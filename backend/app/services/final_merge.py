@@ -1018,13 +1018,33 @@ async def build_final_merge(
         title = (s.get("section_title") or "").strip().upper()
         inlined_map = s.get("inlined_questions_by_block_idx") or {}
         had_inline = any(qs for qs in inlined_map.values())
-        looks_like_example = (
-            (sid and "-example-" in sid.lower())
+        # Match any question-kind section (Example, Exercise, Problem,
+        # Practice, etc) — both by id pattern and by title prefix. Whatever
+        # form the schema uses, if the section is question-content and the
+        # chip-merge picked up its content, the standalone section
+        # rendering is redundant.
+        sid_lower = (sid or "").lower()
+        looks_like_question_section = (
+            "-example-" in sid_lower
+            or "-exercise-" in sid_lower
+            or "-problem-" in sid_lower
+            or "-practice-" in sid_lower
+            or "-question-" in sid_lower
             or title.startswith("EXAMPLE ")
+            or title.startswith("EXERCISE ")
             or title.startswith("WORKED EXAMPLE")
+            or title.startswith("PROBLEM ")
+            or title.startswith("PRACTICE ")
         )
-        if looks_like_example and had_inline and not kept_questions:
-            continue
+        if looks_like_question_section and not kept_questions:
+            # If chip-match inlined its questions (had_inline) OR this
+            # section was hoisted via a parent chip (consumed_qids_by_origin
+            # already caught above), drop it. The "had_inline OR consumed"
+            # check now covers both same-section and cross-section cases.
+            had_inline = any(qs for qs in (s.get("inlined_questions_by_block_idx") or {}).values())
+            was_consumed = sid in consumed_qids_by_origin
+            if had_inline or was_consumed:
+                continue
 
         pruned_sections.append(s)
     merged_sections = pruned_sections
