@@ -327,6 +327,14 @@ async def link_examples_to_theory(
             n_skipped_no_parent += 1
             continue
 
+        # Skip injecting chips into a parent that is ITSELF a question-kind
+        # section (Exercise/Example/Problem etc). The user's rule: theory
+        # sections get a single chip pointing to the parent exercise, NOT
+        # 20 individual question-level chips inside that exercise. Those
+        # questions get rendered by the question extraction pipeline.
+        if _split_question_id(parent.section_id) is not None:
+            continue
+
         label = _label_for(child.title or "", num, kind=kind)
         question_id = questions_by_section.get(child.section_id)
 
@@ -433,6 +441,14 @@ def link_examples_to_theory_sync(session, book_id: UUID) -> dict:
         parent = by_id.get(parent_id)
         if parent is None:
             n_skipped_no_parent += 1
+            continue
+
+        # Skip injecting chips into a parent that is ITSELF a question-kind
+        # section (Exercise/Example/Problem etc). The user's rule: theory
+        # sections get a single chip pointing to the parent exercise, NOT
+        # 20 individual question-level chips inside that exercise. Those
+        # questions get rendered by the question extraction pipeline.
+        if _split_question_id(parent.section_id) is not None:
             continue
 
         label = _label_for(child.title or "", num, kind=kind)

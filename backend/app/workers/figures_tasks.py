@@ -36,6 +36,17 @@ class _FigureTimeout(Exception):
     failure (figure marked failed, loop continues)."""
 
 
+# Process-wide semaphore — at most ONE figure EXTRACT runs at a time
+# in this worker process. The Gemini call returns ALL figure PNGs in a
+# single response (can be 100s of MB on figure-heavy chapters); running
+# two of these in parallel reliably OOMs the Railway container. Other
+# Celery tasks (theory, questions, regen) are unaffected — they keep
+# the per-process concurrency=8 budget. Override via env if needed.
+_FIGURE_EXTRACT_INFLIGHT = threading.BoundedSemaphore(
+    int(os.environ.get("FIGURE_EXTRACT_MAX_INFLIGHT", "1"))
+)
+
+
 def _run_with_timeout(fn, timeout_s: int):
     """Run fn() in a worker thread; raise _FigureTimeout if it doesn't
     finish within timeout_s. The thread is abandoned on timeout — the
@@ -106,7 +117,16 @@ def _extract_figures_v2(book_id: str, job_id: str) -> dict[str, Any]:
     Single Gemini call (per Figure Handling.docx cost analysis: ~$0.30/book).
     All section-mapping and question-linking happens CPU-side via the linker
     service. No additional Gemini calls.
+
+    Wrapped in _FIGURE_EXTRACT_INFLIGHT — blocks until a free slot. Other
+    Celery tasks aren't held up; only concurrent figure-extracts wait.
     """
+    with _FIGURE_EXTRACT_INFLIGHT:
+        return _extract_figures_v2_impl(book_id, job_id)
+
+
+def _extract_figures_v2_impl(book_id: str, job_id: str) -> dict[str, Any]:
+    """Inner implementation — semaphore-protected. See _extract_figures_v2."""
     from app.services.figures import extractor as fig_extractor
     from app.services.figures import linker as fig_linker
     from app.services.figures import cache as fig_cache
