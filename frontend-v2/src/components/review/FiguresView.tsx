@@ -129,7 +129,7 @@ export function FiguresView({
               key={f.id}
               figure={f}
               sectionRef={sectionFigures.section_ref}
-              sectionTitle={null}
+              sectionTitle={sectionFigures.section_title ?? null}
             />
           ))}
         </div>
@@ -231,6 +231,29 @@ function FigureCard({
             'original'
           )}
         </span>
+        {/* Failed-regen badge — reviewer can see at a glance which figures
+            need a retry. Section-level "Reseed figures" button picks them
+            up on next run. */}
+        {f.regen_status === 'failed' && (
+          <span
+            style={{
+              position: 'absolute',
+              bottom: 8,
+              left: 8,
+              fontSize: 10,
+              padding: '3px 8px',
+              border: '1px solid var(--red-200, #fca5a5)',
+              borderRadius: 6,
+              background: 'var(--red-50, #fee2e2)',
+              color: 'var(--red-700, #b91c1c)',
+              fontWeight: 700,
+              letterSpacing: '0.04em',
+            }}
+            title="Last regen attempt failed — use Reseed Figures for this section to retry."
+          >
+            ⚠ regen failed
+          </span>
+        )}
         {/* ↔ Compare button — only useful when both variants exist */}
         {canCompare && (
           <button

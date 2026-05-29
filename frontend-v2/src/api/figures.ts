@@ -26,6 +26,9 @@ export type Figure = {
 
 export type SectionFigures = {
   section_ref: string;
+  // Human-readable section title (from book schema). Falls back to null
+  // when the section couldn't be matched (e.g. orphan figures).
+  section_title?: string | null;
   figures: Figure[];
   n_theory: number;
   n_question: number;

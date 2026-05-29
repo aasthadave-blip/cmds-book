@@ -217,6 +217,25 @@ function QuestionCard({ q }: { q: ExtractedQuestion }) {
           {q.page_start ? `p.${q.page_start}` : ''}
         </span>
       </div>
+      {/* Section anchor — always shown below the Q label so reviewers
+          can confirm at a glance which section the question is filed
+          under. Falls back to just the ref when no title available. */}
+      {(q.section_title || q.section_ref) && (
+        <div
+          style={{
+            fontSize: 11,
+            color: 'var(--ink-500)',
+            fontFamily: 'var(--font-mono)',
+            letterSpacing: '0.04em',
+            marginBottom: 8,
+            paddingBottom: 6,
+            borderBottom: '1px dashed var(--line)',
+          }}
+        >
+          {q.section_ref}
+          {q.section_title ? ` · ${q.section_title}` : ''}
+        </div>
+      )}
       <div
         style={{
           fontSize: 14.5,

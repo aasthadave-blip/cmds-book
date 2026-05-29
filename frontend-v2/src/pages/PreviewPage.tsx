@@ -12,6 +12,7 @@ import { useNavigate, useParams } from 'react-router-dom';
 import { API_BASE, ApiError, req } from '../api/client';
 import { useBook } from '../api/books';
 import { Icon } from '../components/Icon';
+import { MathMarkdown } from '../components/MathMarkdown';
 
 type Block = { t: string; [k: string]: unknown };
 
@@ -298,11 +299,29 @@ function renderItem(item: FinalDraftItem): React.ReactElement | null {
       ? item.figure.image_url
       : `${API_BASE}${item.figure.image_url}`;
     return (
-      <figure key={item.id} style={{ margin: '16px 0', textAlign: 'center' }}>
+      // display:block on the figure (was the default) lets two adjacent
+      // <figure> items align side-by-side via flex; explicitly stack
+      // them so trailing figures never render as a 2-up row.
+      <figure
+        key={item.id}
+        style={{
+          display: 'block',
+          margin: '16px auto',
+          maxWidth: 640,
+          textAlign: 'center',
+        }}
+      >
         <img
           src={src}
           alt={item.figure.label}
-          style={{ maxWidth: '100%', borderRadius: 6, border: '1px solid var(--line-2)' }}
+          style={{
+            display: 'block',
+            margin: '0 auto',
+            maxWidth: '100%',
+            maxHeight: 420,
+            borderRadius: 6,
+            border: '1px solid var(--line-2)',
+          }}
           onError={(e) => { (e.target as HTMLImageElement).style.display = 'none'; }}
         />
         <figcaption style={{ fontSize: 12, color: 'var(--ink-500)', marginTop: 6, fontStyle: 'italic' }}>
@@ -313,6 +332,17 @@ function renderItem(item: FinalDraftItem): React.ReactElement | null {
   }
   if (item.type === 'question') {
     const q = item.question;
+    // Embedded figures attached to this question (e.g. "see Figure 4.7"
+    // resolved by the figure embedder). These should render inside the
+    // question card — losing them in preview was a real bug.
+    const embedded = (q as { embedded_figures?: Array<{
+      ref_id?: string;
+      figure_id: string;
+      label?: string;
+      caption?: string;
+      variant?: string;
+      image_url: string;
+    }> }).embedded_figures ?? [];
     return (
       <div
         key={item.id}
@@ -335,9 +365,49 @@ function renderItem(item: FinalDraftItem): React.ReactElement | null {
         >
           {q.question_number ? `Q${q.question_number}` : (q.exercise_ref || 'Question')}
         </div>
-        <div style={{ fontSize: 14, color: 'var(--ink-900)', lineHeight: 1.55, whiteSpace: 'pre-wrap' }}>
-          {q.raw_text || '(no text)'}
+        <div style={{ fontSize: 14, color: 'var(--ink-900)', lineHeight: 1.55 }}>
+          <MathMarkdown>{q.raw_text || '(no text)'}</MathMarkdown>
         </div>
+        {/* Embedded figures inline at the bottom of the question text */}
+        {embedded.length > 0 && (
+          <div style={{ marginTop: 10, display: 'flex', flexDirection: 'column', gap: 10 }}>
+            {embedded.map((ef) => {
+              const src = ef.image_url.startsWith('http')
+                ? ef.image_url
+                : `${API_BASE}${ef.image_url}`;
+              return (
+                <figure key={ef.ref_id ?? ef.figure_id} style={{ margin: 0, textAlign: 'center' }}>
+                  <img
+                    src={src}
+                    alt={ef.caption || ef.label || 'Figure'}
+                    style={{
+                      maxWidth: '100%',
+                      maxHeight: 320,
+                      borderRadius: 6,
+                      border: '1px solid var(--line-2)',
+                      background: 'var(--surface-2)',
+                    }}
+                    onError={(e) => { (e.target as HTMLImageElement).style.display = 'none'; }}
+                  />
+                  {(ef.label || ef.caption) && (
+                    <figcaption
+                      style={{
+                        fontSize: 12,
+                        color: 'var(--ink-500)',
+                        marginTop: 4,
+                        fontStyle: 'italic',
+                      }}
+                    >
+                      {ef.label && <strong>{ef.label}</strong>}
+                      {ef.label && ef.caption && ' — '}
+                      {ef.caption}
+                    </figcaption>
+                  )}
+                </figure>
+              );
+            })}
+          </div>
+        )}
         {q.solution_text && (
           <details style={{ marginTop: 8 }}>
             <summary style={{ fontSize: 12, color: 'var(--ink-500)', cursor: 'pointer' }}>
@@ -350,10 +420,12 @@ function renderItem(item: FinalDraftItem): React.ReactElement | null {
                 background: 'var(--bg-tint)',
                 fontSize: 13,
                 lineHeight: 1.55,
-                whiteSpace: 'pre-wrap',
               }}
             >
-              {q.solution_text}
+              {/* Same renderer as the question body so math + markdown
+                  + tables (the "| X | 0 | 1 |" raw pipes bug) all
+                  display consistently. */}
+              <MathMarkdown>{q.solution_text}</MathMarkdown>
             </div>
           </details>
         )}
@@ -387,16 +459,26 @@ function BlockRow({ block }: { block: Block }) {
   const t = String(block.t ?? '');
   const c = String((block as { c?: string }).c ?? '');
   if (t === 'h3') return <h3 style={{ fontSize: 17, fontWeight: 700, marginTop: 18, marginBottom: 8, color: 'var(--ink-900)' }}>{c}</h3>;
-  if (t === 'p') return <p style={{ marginBottom: 12, lineHeight: 1.65, fontSize: 15, color: 'var(--ink-900)', whiteSpace: 'pre-wrap' }}>{c}</p>;
+  if (t === 'p') return (
+    <div style={{ marginBottom: 12, lineHeight: 1.65, fontSize: 15, color: 'var(--ink-900)' }}>
+      <MathMarkdown>{c}</MathMarkdown>
+    </div>
+  );
   if (t === 'kp') return (
     <div style={{ background: '#FFF9E5', border: '1px solid #FFE7A1', borderLeft: '4px solid #C28000', padding: '12px 16px', borderRadius: 4, marginBottom: 12 }}>
       <div style={{ fontSize: 11, fontWeight: 800, color: '#8A5300', letterSpacing: '0.1em', marginBottom: 4, textTransform: 'uppercase' }}>Key Point</div>
-      <div style={{ fontSize: 14, lineHeight: 1.55 }}>{c}</div>
+      <div style={{ fontSize: 14, lineHeight: 1.55 }}>
+        <MathMarkdown>{c}</MathMarkdown>
+      </div>
     </div>
   );
   if (t === 'eq') return (
-    <div style={{ background: 'var(--bg-tint)', padding: '10px 14px', borderRadius: 6, marginBottom: 12, fontFamily: 'var(--font-mono)', fontSize: 14, color: 'var(--indigo-700)', textAlign: 'center' }}>
-      {c}
+    <div style={{ background: 'var(--bg-tint)', padding: '10px 14px', borderRadius: 6, marginBottom: 12, fontSize: 14, color: 'var(--indigo-700)', textAlign: 'center' }}>
+      {/* Wrap in $$ if the content doesn't already have math delimiters
+          — equations from extraction are often bare LaTeX like "x = 5". */}
+      <MathMarkdown>
+        {c.includes('$') ? c : `$$${c}$$`}
+      </MathMarkdown>
     </div>
   );
   if (t === 'def') {

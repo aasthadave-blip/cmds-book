@@ -114,11 +114,32 @@ export default function RegenReviewPage() {
     } else if (topTab === 'figures') {
       void figuresState.refetch?.();
     }
-    // We intentionally do NOT include the refetch fns in deps — they are
-    // stable callbacks from useCallback inside their hooks and including
-    // them would refire this effect on every render.
     // eslint-disable-next-line react-hooks/exhaustive-deps
   }, [topTab]);
+
+  // Also poll while the user is sitting on a tab and a regen is mid-flight.
+  // Without this, the user has to manually switch tabs to see fresh state
+  // (the "tab stuck" complaint). Cheap GET, fires every 6s only when there's
+  // a reason to (some regen reports a non-terminal status).
+  useEffect(() => {
+    const inFlightStatuses = new Set(['running', 'queued', 'pending', 'started']);
+    const theoryBusy =
+      regenState.kind === 'ready' &&
+      typeof regenState.latest?.status === 'string' &&
+      inFlightStatuses.has(regenState.latest.status);
+    const questionsBusy =
+      !!questionRegen?.regen?.status &&
+      inFlightStatuses.has(questionRegen.regen.status);
+
+    if (!theoryBusy && !questionsBusy) return;
+
+    const id = window.setInterval(() => {
+      if (theoryBusy) void regenState.refetch?.();
+      if (questionsBusy) void loadQuestionRegen();
+    }, 6000);
+    return () => window.clearInterval(id);
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [regenState.kind, (regenState as { latest?: { status?: string } }).latest?.status, questionRegen?.regen?.status]);
   const [subTab, setSubTab] = useState<SubTab>('regenerated');
   const [activeSectionId, setActiveSectionId] = useState<string | null>(null);
   const [reseedModal, setReseedModal] = useState<{
@@ -675,21 +696,25 @@ export default function RegenReviewPage() {
           flexShrink: 0,
         }}
       >
-        {(
-          [
-            { id: 'regenerated', label: '✨ Regenerated' },
-            { id: 'original', label: 'Original' },
-            { id: 'compare', label: 'Comparison' },
-          ] as Array<{ id: SubTab; label: string }>
-        ).map((sub) => (
-          <button
-            key={sub.id}
-            onClick={() => setSubTab(sub.id)}
-            className={`btn btn-sm ${subTab === sub.id ? 'btn-soft' : 'btn-ghost'}`}
-          >
-            {sub.label}
-          </button>
-        ))}
+        {/* Figures tab uses the FiguresView's own per-card ↔ Compare modal —
+            the global Regenerated / Original / Comparison toggle doesn't
+            apply there, so we hide it. Theory & Questions keep the strip. */}
+        {topTab !== 'figures' &&
+          (
+            [
+              { id: 'regenerated', label: '✨ Regenerated' },
+              { id: 'original', label: 'Original' },
+              { id: 'compare', label: 'Comparison' },
+            ] as Array<{ id: SubTab; label: string }>
+          ).map((sub) => (
+            <button
+              key={sub.id}
+              onClick={() => setSubTab(sub.id)}
+              className={`btn btn-sm ${subTab === sub.id ? 'btn-soft' : 'btn-ghost'}`}
+            >
+              {sub.label}
+            </button>
+          ))}
       </div>
 
       {/* Layout: sidebar + main scrollable */}
