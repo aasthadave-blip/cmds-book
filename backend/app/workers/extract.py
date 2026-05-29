@@ -279,7 +279,24 @@ def extract_book_task(self, book_id: str, job_id: str) -> dict:
             if not all_sections:
                 raise RuntimeError("No sections in schema — approve the schema before extracting")
 
-            to_extract = all_sections
+            # Skip pure Cat A (questions-only) sections from theory extraction.
+            # They're handled by the question pipeline as placeholders. Calling
+            # Gemini on them wastes attempts (Gemini correctly returns nothing
+            # per the placeholder rule, QC fails, retries burn out).
+            # Sections with "theory" in content_types (including Mixed
+            # "theory + questions") DO get extracted as theory.
+            to_extract = [
+                s for s in all_sections
+                if "theory" in (s.content_types or ["theory"])
+            ]
+
+            skipped_cat_a = len(all_sections) - len(to_extract)
+            if skipped_cat_a > 0:
+                logger.info(
+                    "Skipping %d Cat A (questions-only) sections from theory extraction "
+                    "(handled by question pipeline as placeholders)",
+                    skipped_cat_a,
+                )
 
             # Top-level section IDs (direct children of schema root).
             # These get extracted with their FULL page range to give a complete
@@ -323,7 +340,7 @@ def extract_book_task(self, book_id: str, job_id: str) -> dict:
             # Each section's Gemini call is an independent HTTP request — no
             # shared context, no cross-section bleeding (impossible by design,
             # since Gemini doesn't keep state between requests). Concurrency
-            # controlled by THEORY_SECTION_CONCURRENCY env var (default 4).
+            # controlled by THEORY_SECTION_CONCURRENCY env var (default 8).
             # Set to 1 to revert to sequential behaviour byte-for-byte.
             #
             # SAFETY GUARDS (all preserved from sequential version):
@@ -339,7 +356,7 @@ def extract_book_task(self, book_id: str, job_id: str) -> dict:
             #      any cross-section write corruption with a loud assert.
             #   6. Schema postpass + example_linker still run AFTER all
             #      sections complete — same invariant as the sequential loop.
-            CONCURRENCY = max(1, int(os.environ.get("THEORY_SECTION_CONCURRENCY", "4")))
+            CONCURRENCY = max(1, int(os.environ.get("THEORY_SECTION_CONCURRENCY", "12")))
 
             # Pre-compute per-section payloads sequentially (cheap — just
             # arithmetic + schema lookups, no Gemini calls). Captures the

@@ -98,7 +98,9 @@ def paragraphs_to_blocks(paragraphs: list[dict]) -> list[dict]:
                 }
             )
         elif short == "fig":
-            c = (p.get("content") or p.get("c") or "").strip()
+            # extractor_v2 emits {label, caption}; extractor v1 emits {content}.
+            # Accept all three field names so a prompt swap is backward-compatible.
+            c = (p.get("caption") or p.get("content") or p.get("c") or "").strip()
             label = (p.get("label") or "").strip()
             # accept empty content if a label is present (pure label placeholder)
             if not c and not label:

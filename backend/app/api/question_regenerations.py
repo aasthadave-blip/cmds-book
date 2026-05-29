@@ -348,8 +348,13 @@ class RetrySectionRequest(BaseModel):
 
     section_ref is passed in body (not path) because it may contain "::"
     separators or other characters that complicate URL encoding.
+
+    custom_instructions (optional) — section-level user instruction layered
+    on top of the regen's original params. When present, the question
+    regenerator merges it into its prompt for THIS section only.
     """
     section_ref: str = Field(min_length=1, max_length=255)
+    custom_instructions: str | None = None
 
 
 @regens_router.post("/{regen_id}/retry-section")
@@ -386,11 +391,17 @@ async def retry_regen_section(
     import app.workers.question_regen_v3  # noqa: F401
     from app.workers.runner import dispatch
 
+    # Section-level custom_instructions: pass to worker as 4th positional
+    # arg. Worker layers it on top of regen.custom_instructions for THIS
+    # retry only (does NOT mutate the persisted regen record).
+    section_custom = (payload.custom_instructions or "").strip() or None
+
     dispatch(
         "retry_regen_section_v3",
         str(r.id),
         payload.section_ref,
         str(job.id),
+        section_custom,
     )
 
     return {

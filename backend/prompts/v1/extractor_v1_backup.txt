@@ -28,19 +28,6 @@ BLOCK TYPES — return EXACTLY these type values:
 - "exercise_ref" : PLACEHOLDER for an exercise / problem item — fields: type, label, number
 - "question_ref" : PLACEHOLDER for a question prompt (Try It / Quick Check / etc.) — fields: type, label, number
 
-OPERATOR PRESERVATION — STRICTEST:
-- Every printed mathematical expression — even single inline ones like "v = 10 m/s" — gets its OWN `equation` block. Do NOT merge an equation into surrounding body text.
-- Critical operators that get LOST in poor OCR — MUST be preserved verbatim if they appear on the page: `/`, `÷`, `×`, `·`, `→`, `±`, `∝`, `≈`, `≤`, `≥`, `∫`, `Σ`, `√`, `°`, `Δ`, `∂`, fractions like `a/b` or `\frac{a}{b}`
-- Multi-line derivations: each printed line of a derivation is its OWN `equation` block, in printed order. Do NOT collapse them into a single block.
-- If any character of an equation is unclear → wrap that portion in `[UNCLEAR: best-guess]`, NEVER drop the operator entirely.
-
-INTERLEAVED THEORY — KEEP TRANSCRIBING BETWEEN PLACEHOLDERS — CRITICAL:
-- A common textbook pattern: `theory paragraph A → EXAMPLE 5.1 → theory paragraph B (1-2 lines) → EXAMPLE 5.2 → theory paragraph C`
-- Correct output: `[body(A), example_ref(5.1), body(B), example_ref(5.2), body(C)]`
-- WRONG output (do NOT do this): `[body(A), example_ref(5.1), example_ref(5.2), body(B+C merged)]` — batching placeholders at end, losing the 1-2 lines of theory between them.
-- After emitting any placeholder, CONTINUE transcribing every line of prose, equation, key_point, list_item between the placeholder and the next heading or next placeholder. Even 1 line of theory between two placeholders MUST be captured before the next placeholder.
-- The output order is the printed reading order across the pages. NEVER re-order to group placeholders together at the end of the section.
-
 PLACEHOLDER RULE — TRUE QUESTIONS ONLY — CRITICAL:
 - The full body of any TRUE question is captured by a separate question-extraction pipeline.
 - For TRUE questions, theory's job is ONLY to mark their POSITION with a placeholder block (similar to how a figure is just a placeholder, not the diagram itself).
