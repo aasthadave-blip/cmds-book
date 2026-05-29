@@ -364,17 +364,33 @@ export default function RegenReviewPage() {
   // Returns: {section_id, blocks} — synchronous, no polling needed.
   const submitReseed = useCallback(
     async (instruction: string) => {
-      if (!reseedModal || regenState.kind !== 'ready') return;
+      if (!reseedModal || !bookId) return;
       try {
+        let regenId: string | null = null;
+        if (regenState.kind === 'ready') {
+          regenId = regenState.latest.id;
+        } else {
+          // No theory regen yet — start a fresh one for the whole book first,
+          // then run the per-section reseed. Lets users hit "Regenerate this
+          // section" on any section without having to start a book-wide
+          // regen separately.
+          setError('Starting fresh theory regen first…');
+          const started = await req<{ regen_id: string }>(
+            `/api/books/${bookId}/regenerate`,
+            { method: 'POST', body: JSON.stringify({}) },
+          );
+          regenId = started.regen_id;
+          // Wait a moment for backend to persist + index the regen row.
+          await new Promise((r) => setTimeout(r, 1200));
+        }
         await req(
-          `/api/regenerations/${regenState.latest.id}/sections/${encodeURIComponent(reseedModal.sectionRef)}/rerun`,
+          `/api/regenerations/${regenId}/sections/${encodeURIComponent(reseedModal.sectionRef)}/rerun`,
           {
             method: 'POST',
             body: JSON.stringify({ custom_instructions: instruction }),
           },
         );
         setReseedModal(null);
-        // Refetch the regen to pick up the new blocks for this section.
         regenState.refetch();
         setError('✓ Section regenerated with custom instruction.');
         setTimeout(() => setError(null), 2500);
@@ -385,7 +401,7 @@ export default function RegenReviewPage() {
         );
       }
     },
-    [reseedModal, regenState],
+    [reseedModal, regenState, bookId],
   );
 
   // ── Export DOCX (regenerated content) ─────────────────────────
@@ -1008,16 +1024,19 @@ function SectionBlock({
             >
               <Icon name="eye" size={13} />
             </button>
-            {hasRegen && (
-              <button
-                className="btn btn-ghost btn-sm"
-                onClick={onReseed}
-                title="Reseed: regenerate this section with a custom instruction"
-                style={{ padding: '4px 8px' }}
-              >
-                <Icon name="regen" size={13} />
-              </button>
-            )}
+            {/* Regen button always visible. If no theory regen exists yet,
+                the onReseed flow now starts a book-wide regen first (see
+                submitReseed) and then queues this section. */}
+            <button
+              className="btn btn-ghost btn-sm"
+              onClick={onReseed}
+              title={hasRegen
+                ? 'Reseed: regenerate this section with a custom instruction'
+                : 'Regenerate this section (will start a fresh theory regen)'}
+              style={{ padding: '4px 8px' }}
+            >
+              <Icon name="regen" size={13} />
+            </button>
           </div>
         )}
       </div>

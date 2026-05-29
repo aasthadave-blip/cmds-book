@@ -767,6 +767,38 @@ async def build_final_merge(
             if q.section_ref and q.section_ref in sections_to_overlay:
                 questions_by_section.setdefault(q.section_ref, []).append(q)
 
+    # Sort each section's questions by parsed question_number so cards
+    # render in natural numeric order (Q1, Q2, ..., Q10) instead of the
+    # SQL row order (which was effectively by created_at and produced
+    # sequences like Q2, Q3, Q1, Q4 reported by reviewers).
+    import re as _re
+
+    def _qnum_sort_key(q) -> tuple:
+        raw = (getattr(q, "question_number", "") or "").strip()
+        if not raw:
+            return (10**9,)  # blanks sink to the end
+        # Split on non-digit separators: "1.10(ii)" -> [1, 10, 2]
+        # Roman numerals (i, ii, iii, iv, v) → numeric 1..5 so 1.(ii) > 1.(i)
+        roman = {"i": 1, "ii": 2, "iii": 3, "iv": 4, "v": 5,
+                 "vi": 6, "vii": 7, "viii": 8, "ix": 9, "x": 10}
+        parts: list[int] = []
+        for tok in _re.split(r"[^\w]+", raw):
+            tok = tok.strip().lower()
+            if not tok:
+                continue
+            if tok.isdigit():
+                parts.append(int(tok))
+            elif tok in roman:
+                parts.append(roman[tok])
+            else:
+                # Mixed alpha — fall through using ord of first char so it
+                # at least sorts deterministically.
+                parts.append(ord(tok[0]) + 1000)
+        return tuple(parts) if parts else (10**9,)
+
+    for _sec_ref, _qs in questions_by_section.items():
+        _qs.sort(key=_qnum_sort_key)
+
     # 5. Assemble ordered sections
     # CROSS-SECTION CHIP MATCHING — schemas often split worked examples into
     # their own subsection (e.g. "3-percentage-example-3-1"). A chip in the
