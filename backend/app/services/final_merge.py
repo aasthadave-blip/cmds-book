@@ -868,11 +868,29 @@ async def build_final_merge(
     # Auto-append them to the final merge so the chapter feels complete.
     # User can remove them individually from the Composer if they want.
     used_excluded_titles: set[str] = set()
+    # Build a normalized index over questions_by_section so we can find
+    # excluded-section questions even when the writer stored them under a
+    # slightly different key (whitespace, case, trailing punctuation, or
+    # an explicit id rather than the title verbatim). Avoids silently
+    # losing end-of-chapter banks like "PRACTICE QUESTIONS - CLASSROOM WING".
+    def _norm_key(s: str) -> str:
+        return " ".join((s or "").lower().split()).strip(" .:-")
+    normalized_index: dict[str, list] = {}
+    for k, v in questions_by_section.items():
+        normalized_index.setdefault(_norm_key(k), []).extend(v)
+
     for ex in getattr(schema_obj, "excluded_sections", []) or []:
         title = (ex.title or "").strip()
         if not title:
             continue
+        # Lookup order: exact title → explicit id (if model has one) → normalized.
         qs = questions_by_section.get(title, [])
+        if not qs:
+            ex_id = getattr(ex, "id", None) or ""
+            if ex_id:
+                qs = questions_by_section.get(ex_id, [])
+        if not qs:
+            qs = normalized_index.get(_norm_key(title), [])
         if not qs:
             continue  # excluded section with no extracted questions → skip
         used_excluded_titles.add(title)

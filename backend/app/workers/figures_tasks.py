@@ -18,9 +18,47 @@ from __future__ import annotations
 import hashlib
 import json
 import logging
+import os
+import threading
 from datetime import datetime
 from typing import Any
 from uuid import UUID
+
+# Hard ceiling per figure regen call. Default 90s — Gemini image generation
+# usually finishes in 15-40s; past 90s the call is hung and we should abandon
+# it and move on to the next figure rather than let one stuck figure block
+# an entire section reseed. Override via env if needed.
+PER_FIGURE_REGEN_TIMEOUT_S = int(os.environ.get("FIGURE_REGEN_TIMEOUT_S", "90"))
+
+
+class _FigureTimeout(Exception):
+    """Per-figure regen call exceeded the timeout. Treated as transient
+    failure (figure marked failed, loop continues)."""
+
+
+def _run_with_timeout(fn, timeout_s: int):
+    """Run fn() in a worker thread; raise _FigureTimeout if it doesn't
+    finish within timeout_s. The thread is abandoned on timeout — the
+    underlying HTTP socket may still be open until its own deadline, but
+    the Celery worker can move on instead of hanging forever.
+    """
+    result: dict[str, Any] = {}
+    err: dict[str, BaseException] = {}
+
+    def _target():
+        try:
+            result["v"] = fn()
+        except BaseException as e:  # capture all so the caller can re-raise
+            err["e"] = e
+
+    t = threading.Thread(target=_target, daemon=True)
+    t.start()
+    t.join(timeout_s)
+    if t.is_alive():
+        raise _FigureTimeout(f"figure regen exceeded {timeout_s}s")
+    if "e" in err:
+        raise err["e"]
+    return result.get("v")
 
 from sqlalchemy import create_engine, select
 from sqlalchemy.orm import Session, sessionmaker
@@ -322,11 +360,32 @@ def _regenerate_figures_v2_section(
 
     Session = _sync_session()
     with Session() as session:
-        figures = list(session.execute(
+        # Catch every figure that touches this section — either it was
+        # anchored here at extraction time (Figure.section_id) OR the
+        # embedder placed a reference to it from this section's theory /
+        # questions (FigureReference.section_ref). The embedder sometimes
+        # re-homes a figure to a different section based on label-match,
+        # which used to make reseed miss those figures silently.
+        anchored = list(session.execute(
             select(Figure)
             .where(Figure.book_id == book_uuid)
             .where(Figure.section_id == section_ref)
         ).scalars().all())
+        referenced = list(session.execute(
+            select(Figure)
+            .join(FigureReference, FigureReference.figure_id == Figure.id)
+            .where(Figure.book_id == book_uuid)
+            .where(FigureReference.section_ref == section_ref)
+            .distinct()
+        ).scalars().all())
+        # Union, preserve order
+        seen: set = set()
+        figures: list[Figure] = []
+        for f in anchored + referenced:
+            if f.id in seen:
+                continue
+            seen.add(f.id)
+            figures.append(f)
         total = len(figures)
         if total == 0:
             _update_job(
@@ -398,12 +457,18 @@ def _regenerate_figures_v2_section(
             }
 
             try:
-                new_bytes = fig_regen.regenerate(
-                    fig_row.image_bytes,
-                    style=style,
-                    custom_instructions=custom,
-                    figure_meta=figure_meta,
-                    model=image_model,
+                # Per-figure timeout — if Gemini hangs on one figure we
+                # mark it failed and continue with the next. Without this,
+                # a single stuck call would freeze the entire section reseed.
+                new_bytes = _run_with_timeout(
+                    lambda: fig_regen.regenerate(
+                        fig_row.image_bytes,
+                        style=style,
+                        custom_instructions=custom,
+                        figure_meta=figure_meta,
+                        model=image_model,
+                    ),
+                    timeout_s=PER_FIGURE_REGEN_TIMEOUT_S,
                 )
                 if watermark_clean:
                     try:
