@@ -235,7 +235,21 @@ export default function PreviewPage() {
               Draft is empty. Open Composer to start authoring.
             </div>
           )}
-          {items.map((item) => renderItem(item))}
+          {/* Dedupe: drop the first section_heading item if it matches the page title (book title). */}
+          {(() => {
+            const norm = (s: string) =>
+              s.toLowerCase().replace(/[^a-z0-9]+/g, ' ').trim();
+            let displayItems = items;
+            if (
+              items.length > 0 &&
+              items[0].type === 'section_heading' &&
+              title &&
+              norm(items[0].title) === norm(title)
+            ) {
+              displayItems = items.slice(1);
+            }
+            return displayItems.map((item) => renderItem(item));
+          })()}
         </div>
       </div>
     </div>

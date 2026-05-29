@@ -118,8 +118,10 @@ export function FiguresView({
         <div
           style={{
             display: 'grid',
-            gridTemplateColumns: 'repeat(auto-fill, minmax(280px, 1fr))',
-            gap: 16,
+            // Bigger cards — 1 column up to ~720px, 2 columns above that.
+            // Each card is full-width so the image is genuinely big.
+            gridTemplateColumns: 'repeat(auto-fill, minmax(420px, 1fr))',
+            gap: 20,
           }}
         >
           {sectionFigures.figures.map((f) => (
@@ -133,7 +135,17 @@ export function FiguresView({
 
 function FigureCard({ figure: f }: { figure: Figure }) {
   const [imgErr, setImgErr] = useState(false);
-  const url = f.has_original ? figureImageUrl(f.id) : null;
+  // Tab state: which variant to display. Default to Regenerated when one
+  // exists, otherwise show Original. Reset imgErr whenever variant changes.
+  const [variant, setVariant] = useState<'original' | 'regen'>(
+    f.has_regen ? 'regen' : 'original',
+  );
+  const url =
+    variant === 'regen' && f.has_regen
+      ? figureImageUrl(f.id, true)
+      : f.has_original
+        ? figureImageUrl(f.id)
+        : null;
   return (
     <div
       className="card"
@@ -144,19 +156,69 @@ function FigureCard({ figure: f }: { figure: Figure }) {
         flexDirection: 'column',
       }}
     >
+      {/* Original / Regenerated toggle — only visible when both exist */}
+      {f.has_original && f.has_regen && (
+        <div
+          style={{
+            display: 'flex',
+            borderBottom: '1px solid var(--line)',
+            background: 'var(--surface-2)',
+          }}
+        >
+          <button
+            onClick={() => { setVariant('original'); setImgErr(false); }}
+            style={{
+              flex: 1,
+              padding: '8px 12px',
+              fontSize: 11,
+              fontWeight: 700,
+              letterSpacing: '0.06em',
+              textTransform: 'uppercase',
+              background: variant === 'original' ? 'var(--surface)' : 'transparent',
+              color: variant === 'original' ? 'var(--ink-900)' : 'var(--ink-500)',
+              border: 'none',
+              borderBottom: variant === 'original' ? '2px solid var(--ink-900)' : '2px solid transparent',
+              cursor: 'pointer',
+            }}
+          >
+            Original
+          </button>
+          <button
+            onClick={() => { setVariant('regen'); setImgErr(false); }}
+            style={{
+              flex: 1,
+              padding: '8px 12px',
+              fontSize: 11,
+              fontWeight: 700,
+              letterSpacing: '0.06em',
+              textTransform: 'uppercase',
+              background: variant === 'regen' ? 'var(--surface)' : 'transparent',
+              color: variant === 'regen' ? 'var(--indigo-700)' : 'var(--ink-500)',
+              border: 'none',
+              borderBottom: variant === 'regen' ? '2px solid var(--indigo-700)' : '2px solid transparent',
+              cursor: 'pointer',
+            }}
+          >
+            ✨ Regenerated
+          </button>
+        </div>
+      )}
       <div
         style={{
-          height: 200,
+          minHeight: 420,
           background: 'var(--surface-2)',
           display: 'grid',
           placeItems: 'center',
           borderBottom: '1px solid var(--line)',
           position: 'relative',
           overflow: 'hidden',
+          padding: 12,
         }}
       >
         {url && !imgErr ? (
           <img
+            // Key forces re-mount on variant change so cached error state is cleared
+            key={`${f.id}-${variant}`}
             src={url}
             alt={f.caption ?? f.figure_number ?? 'Figure'}
             onError={() => setImgErr(true)}
@@ -177,11 +239,17 @@ function FigureCard({ figure: f }: { figure: Figure }) {
           >
             <Icon name="image" size={28} />
             <div style={{ marginTop: 6 }}>
-              {imgErr ? 'Image unavailable' : 'No original'}
+              {imgErr
+                ? 'Image unavailable'
+                : variant === 'regen'
+                  ? 'No regenerated image'
+                  : 'No original'}
             </div>
           </div>
         )}
-        {f.has_regen && (
+        {/* If both exist but toggle is hidden (no toggle shown for single-variant figures),
+            still show a small badge for the regen-only case. */}
+        {f.has_regen && !f.has_original && (
           <span
             className="badge regen"
             style={{ position: 'absolute', top: 8, right: 8, fontSize: 10 }}
@@ -190,23 +258,59 @@ function FigureCard({ figure: f }: { figure: Figure }) {
           </span>
         )}
       </div>
-      <div style={{ padding: '12px 14px' }}>
+      <div style={{ padding: '14px 16px' }}>
+        {/* Figure label — bold heading row */}
         <div
           style={{
-            fontSize: 13.5,
-            fontWeight: 700,
-            color: 'var(--ink-900)',
-            marginBottom: 4,
+            display: 'flex',
+            alignItems: 'baseline',
+            gap: 8,
+            marginBottom: 6,
+            flexWrap: 'wrap',
           }}
         >
-          {f.figure_number ?? `Figure ${f.normalized_label ?? ''}`}
+          <div
+            style={{
+              fontSize: 15,
+              fontWeight: 800,
+              color: 'var(--ink-900)',
+              letterSpacing: '-0.01em',
+            }}
+          >
+            {f.figure_number ?? (f.normalized_label ? `Figure ${f.normalized_label}` : 'Figure')}
+          </div>
+          {/* Where the figure is embedded — theory or question */}
+          {f.context_hint && (
+            <span
+              className="kbd"
+              style={{
+                fontSize: 10,
+                padding: '2px 8px',
+                background:
+                  f.context_hint === 'question'
+                    ? 'var(--red-50)'
+                    : 'var(--indigo-50)',
+                color:
+                  f.context_hint === 'question'
+                    ? 'var(--red-700)'
+                    : 'var(--indigo-700)',
+                fontWeight: 700,
+                letterSpacing: '0.05em',
+                textTransform: 'uppercase',
+              }}
+            >
+              {f.context_hint}
+            </span>
+          )}
         </div>
+        {/* Caption / figure name */}
         {f.caption && (
           <div
             style={{
-              fontSize: 12.5,
+              fontSize: 13,
               color: 'var(--ink-700)',
               lineHeight: 1.5,
+              marginBottom: 4,
             }}
           >
             {f.caption}

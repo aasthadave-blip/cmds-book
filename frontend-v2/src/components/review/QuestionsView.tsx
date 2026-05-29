@@ -2,6 +2,7 @@
 // selected section.
 
 import { Icon } from '../Icon';
+import { API_BASE } from '../../api/client';
 import type {
   ExtractedQuestion,
   SectionQuestions,
@@ -226,6 +227,86 @@ function QuestionCard({ q }: { q: ExtractedQuestion }) {
       >
         {q.raw_text}
       </div>
+      {/* Embedded figures — render at the BOTTOM of the question text
+          (closest the UI can get without doing char-offset splicing).
+          Each figure shows its label, image, and caption. */}
+      {(q.embedded_figures ?? []).length > 0 && (
+        <div
+          style={{
+            marginTop: 14,
+            display: 'flex',
+            flexDirection: 'column',
+            gap: 12,
+          }}
+        >
+          {(q.embedded_figures ?? []).map((ef) => (
+            <div
+              key={ef.ref_id}
+              style={{
+                border: '1px solid var(--line)',
+                borderRadius: 10,
+                overflow: 'hidden',
+                background: 'var(--surface)',
+              }}
+            >
+              <div
+                style={{
+                  padding: '6px 12px',
+                  fontSize: 11,
+                  fontWeight: 700,
+                  letterSpacing: '0.06em',
+                  color: 'var(--ink-700)',
+                  background: 'var(--surface-2)',
+                  borderBottom: '1px solid var(--line)',
+                  display: 'flex',
+                  alignItems: 'center',
+                  gap: 6,
+                }}
+              >
+                {ef.label || 'Figure'}
+                {ef.variant === 'regen' && (
+                  <span
+                    style={{
+                      fontSize: 10,
+                      color: 'var(--indigo-700)',
+                      fontWeight: 700,
+                    }}
+                  >
+                    ✨ regen
+                  </span>
+                )}
+              </div>
+              <img
+                src={
+                  ef.image_url.startsWith('http')
+                    ? ef.image_url
+                    : `${API_BASE}${ef.image_url}`
+                }
+                alt={ef.caption || ef.label || 'Figure'}
+                style={{
+                  width: '100%',
+                  maxHeight: 360,
+                  objectFit: 'contain',
+                  background: 'var(--surface-2)',
+                  display: 'block',
+                }}
+              />
+              {ef.caption && (
+                <div
+                  style={{
+                    padding: '8px 12px',
+                    fontSize: 12.5,
+                    color: 'var(--ink-700)',
+                    lineHeight: 1.5,
+                  }}
+                >
+                  {ef.caption}
+                </div>
+              )}
+            </div>
+          ))}
+        </div>
+      )}
       {q.has_solution && q.solution_text && (
         <details
           style={{

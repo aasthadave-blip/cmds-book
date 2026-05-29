@@ -25,8 +25,21 @@ import { useNavigate, useParams } from 'react-router-dom';
 import { API_BASE, ApiError, req } from '../api/client';
 import { useBook } from '../api/books';
 import { useSections, type Section } from '../api/sections';
-import { useBookQuestions, type QuestionBankDetail } from '../api/questions';
-import { useBookFigures, type BookFigures } from '../api/figures';
+import {
+  useBookQuestions,
+  type QuestionBankDetail,
+  type RegenQuestionsResponse,
+  listQuestionRegenerations,
+  getRegenQuestions,
+  retryRegenSection,
+  saveQuestionRegeneration,
+  hideQuestion,
+} from '../api/questions';
+import {
+  useBookFigures,
+  type BookFigures,
+  regenerateSectionFigures,
+} from '../api/figures';
 import { useLatestRegeneration } from '../api/regenerations';
 
 import { Icon } from '../components/Icon';
@@ -55,6 +68,37 @@ export default function RegenReviewPage() {
   const figuresState = useBookFigures(bookId);
   const regenState = useLatestRegeneration(bookId);
 
+  // ── Question regeneration state ────────────────────────────────
+  // Fetch latest question regeneration + its grouped questions so the
+  // Questions tab can show regenerated content (and we can per-section
+  // re-run with custom instructions).
+  const [questionRegen, setQuestionRegen] =
+    useState<RegenQuestionsResponse | null>(null);
+  const [questionRegenLoading, setQuestionRegenLoading] = useState(false);
+  const loadQuestionRegen = useCallback(async () => {
+    if (!bookId) return;
+    setQuestionRegenLoading(true);
+    try {
+      const regens = await listQuestionRegenerations(bookId);
+      const latest = regens
+        .filter((r) => r.status === 'ready' || r.status === 'saved' || r.status === 'partial')
+        .sort((a, b) => (b.created_at > a.created_at ? 1 : -1))[0];
+      if (!latest) {
+        setQuestionRegen(null);
+        return;
+      }
+      const detail = await getRegenQuestions(latest.id);
+      setQuestionRegen(detail);
+    } catch (_e) {
+      setQuestionRegen(null);
+    } finally {
+      setQuestionRegenLoading(false);
+    }
+  }, [bookId]);
+  useEffect(() => {
+    void loadQuestionRegen();
+  }, [loadQuestionRegen]);
+
   const [topTab, setTopTab] = useState<TopTab>('theory');
   const [subTab, setSubTab] = useState<SubTab>('regenerated');
   const [activeSectionId, setActiveSectionId] = useState<string | null>(null);
@@ -71,11 +115,13 @@ export default function RegenReviewPage() {
   const [error, setError] = useState<string | null>(null);
 
   // ── Schema walk for ordering + Cat A/B ─────────────────────────
-  const { schemaOrder, catBIds, catAIds } = useMemo(() => {
+  const { schemaOrder, catBIds, catAIds, excludedQs } = useMemo(() => {
     const order: Record<string, number> = {};
     const catB = new Set<string>();
     const catA = new Set<string>();
-    if (bookState.kind !== 'ready') return { schemaOrder: order, catBIds: catB, catAIds: catA };
+    const excluded: Array<{ section_id: string; title: string }> = [];
+    if (bookState.kind !== 'ready')
+      return { schemaOrder: order, catBIds: catB, catAIds: catA, excludedQs: excluded };
     let idx = 0;
     const walk = (nodes: SchemaNode[] | undefined) => {
       if (!nodes) return;
@@ -84,15 +130,30 @@ export default function RegenReviewPage() {
         if (n.id && !(n.id in order)) {
           order[n.id] = idx++;
           const ct = (n.content_types ?? []).map((c) => String(c).toLowerCase().trim());
-          if (ct.includes('questions')) catA.add(n.id);
+          // PURE Cat A = questions only. Mixed sections (theory + questions)
+          // are PRIMARILY theory-bearing and belong in the Theory tab; their
+          // Cat A nested items appear individually in the Questions tab.
+          const isPureCatA = ct.includes('questions') && !ct.includes('theory');
+          if (isPureCatA) catA.add(n.id);
           else catB.add(n.id);
         }
         walk(n.subsections);
       }
     };
-    const schema = bookState.data.raw.schema_ as { sections?: SchemaNode[] } | null;
+    const schema = bookState.data.raw.schema_ as
+      | { sections?: SchemaNode[]; excluded_sections?: Array<{ id?: string; title?: string }> }
+      | null;
     walk(schema?.sections);
-    return { schemaOrder: order, catBIds: catB, catAIds: catA };
+    // Collect end-of-chapter excluded sections (CLASSROOM WING / Unit Exercise / etc.).
+    for (const ex of schema?.excluded_sections ?? []) {
+      const title = (ex.title ?? '').trim();
+      if (!title) continue;
+      excluded.push({
+        section_id: (ex.id ?? title).trim(),
+        title,
+      });
+    }
+    return { schemaOrder: order, catBIds: catB, catAIds: catA, excludedQs: excluded };
   }, [bookState]);
 
   const allSections = sectionsState.kind === 'ready' ? sectionsState.sections : [];
@@ -117,7 +178,43 @@ export default function RegenReviewPage() {
         .sort(sortBySchema);
     }
     if (topTab === 'questions') {
-      return allSections.filter((s) => catAIds.has(s.section_id)).sort(sortBySchema);
+      const realCatA = allSections
+        .filter((s) => catAIds.has(s.section_id))
+        .sort(sortBySchema);
+
+      // ONLY add end-of-chapter excluded BANKS (CLASSROOM WING, COMPETITION
+      // WING, JEE SPECIAL WING, Unit Exercise, MCQ Bank, etc.) — NOT every
+      // theory section that happens to have an entry in the bank.
+      // Source: schema.excluded_sections (collected as excludedQs in the
+      // earlier schema walk). Match on either:
+      //   (a) the excluded title appearing as a bank section_ref, OR
+      //   (b) the excluded section_id appearing as a bank section_ref.
+      const knownIds = new Set(realCatA.map((s) => s.section_id));
+      const bankRefSet = new Set(
+        (banksDetail?.sections ?? []).map((s) => s.section_ref),
+      );
+      const syntheticExcluded: Section[] = excludedQs
+        .filter((eq) => {
+          if (knownIds.has(eq.section_id)) return false;
+          return bankRefSet.has(eq.section_id) || bankRefSet.has(eq.title);
+        })
+        .map((eq) => {
+          // Bank uses title as section_ref if id isn't keyed.
+          const refUsedInBank = bankRefSet.has(eq.section_id)
+            ? eq.section_id
+            : eq.title;
+          return {
+            id: `syn-${refUsedInBank}`,
+            book_id: bookId,
+            section_id: refUsedInBank,
+            title: eq.title,
+            blocks: [],
+            attempts: 0,
+            status: 'passed' as const,
+            level: 2,
+          } as unknown as Section;
+        });
+      return [...realCatA, ...syntheticExcluded];
     }
     // figures
     if (!figuresData) return [];
@@ -454,6 +551,28 @@ export default function RegenReviewPage() {
             Approve &amp; Save
           </button>
         )}
+        {questionRegen?.regen?.id && (
+          <button
+            className="btn btn-soft btn-sm"
+            onClick={async () => {
+              try {
+                await saveQuestionRegeneration(questionRegen.regen.id);
+                setError('✓ Question regeneration saved.');
+                setTimeout(() => setError(null), 2500);
+                await loadQuestionRegen();
+              } catch (e) {
+                setError(
+                  e instanceof Error
+                    ? e.message
+                    : 'Failed to save question regen',
+                );
+              }
+            }}
+            title="Approve & save the question regeneration as the final question bank"
+          >
+            <Icon name="check" size={13} /> Save Questions Regen
+          </button>
+        )}
       </div>
 
       {error && (
@@ -656,7 +775,35 @@ export default function RegenReviewPage() {
               subTab={subTab}
               regenBlocks={regenBlocksBySection[section.section_id]}
               banksDetail={banksDetail}
+              questionRegen={questionRegen}
+              onSectionRetry={async (sectionRef, instruction) => {
+                if (!questionRegen?.regen?.id) {
+                  setError(
+                    'No question regeneration to retry. Run a question regen first.',
+                  );
+                  return;
+                }
+                try {
+                  await retryRegenSection(questionRegen.regen.id, {
+                    section_ref: sectionRef,
+                    custom_instructions: instruction || null,
+                  });
+                  setError('✓ Question section retry queued.');
+                  setTimeout(() => setError(null), 2500);
+                  // Refetch after a short delay so the worker has time
+                  await new Promise((r) => setTimeout(r, 1500));
+                  await loadQuestionRegen();
+                } catch (e) {
+                  setError(
+                    e instanceof Error
+                      ? e.message
+                      : 'Question retry failed',
+                  );
+                }
+              }}
               figuresData={figuresData}
+              bookId={bookId}
+              onFiguresRefetch={() => figuresState.refetch?.()}
               refSetter={(el) => {
                 if (el) sectionRefs.current.set(section.section_id, el);
                 else sectionRefs.current.delete(section.section_id);
@@ -678,7 +825,9 @@ export default function RegenReviewPage() {
       {reseedModal?.open && (
         <ReseedModal
           sectionTitle={reseedModal.sectionTitle}
-          onSubmit={(instruction) => void submitReseed(instruction)}
+          // Return the promise so the modal can await it and keep its
+          // spinner visible while Gemini regenerates (20-60s).
+          onSubmit={(instruction) => submitReseed(instruction)}
           onClose={() => setReseedModal(null)}
         />
       )}
@@ -706,7 +855,11 @@ function SectionBlock({
   subTab,
   regenBlocks,
   banksDetail,
+  questionRegen,
+  onSectionRetry,
   figuresData,
+  bookId,
+  onFiguresRefetch,
   refSetter,
   onReseed,
   onPreview,
@@ -716,7 +869,11 @@ function SectionBlock({
   subTab: SubTab;
   regenBlocks: Array<{ t: string; [k: string]: unknown }> | undefined;
   banksDetail: QuestionBankDetail | null;
+  questionRegen: RegenQuestionsResponse | null;
+  onSectionRetry: (sectionRef: string, instruction: string) => void | Promise<void>;
   figuresData: BookFigures | null;
+  bookId: string | undefined;
+  onFiguresRefetch: () => void;
   refSetter: (el: HTMLDivElement | null) => void;
   onReseed: () => void;
   onPreview: () => void;
@@ -845,12 +1002,17 @@ function SectionBlock({
           <QuestionsBody
             section={section}
             banksDetail={banksDetail}
+            subTab={subTab}
+            questionRegen={questionRegen}
+            onSectionRetry={onSectionRetry}
           />
         )}
         {topTab === 'figures' && (
           <FiguresBody
             section={section}
             figuresData={figuresData}
+            bookId={bookId}
+            onFiguresRefetch={onFiguresRefetch}
           />
         )}
       </div>
@@ -892,24 +1054,35 @@ function TheoryBody({
     );
   }
 
-  // compare
+  // compare — side-by-side with subtle column tint + divider + compact text
   return (
     <div
+      className="regen-compare"
       style={{
         display: 'grid',
-        gridTemplateColumns: '1fr 1fr',
-        gap: 18,
+        gridTemplateColumns: '1fr 1px 1fr',
+        gap: 14,
+        fontSize: 13,
       }}
     >
-      <div>
+      <div
+        style={{
+          background: 'var(--surface)',
+          border: '1px solid var(--line)',
+          borderRadius: 10,
+          padding: '14px 16px',
+        }}
+      >
         <div
           style={{
             fontSize: 10,
             fontWeight: 700,
-            letterSpacing: '0.08em',
+            letterSpacing: '0.1em',
             textTransform: 'uppercase',
             color: 'var(--ink-500)',
-            marginBottom: 8,
+            marginBottom: 10,
+            paddingBottom: 8,
+            borderBottom: '1px solid var(--line)',
           }}
         >
           Original
@@ -921,15 +1094,31 @@ function TheoryBody({
           flat
         />
       </div>
-      <div>
+      {/* vertical divider */}
+      <div
+        style={{
+          background: 'var(--line)',
+          margin: '0',
+        }}
+      />
+      <div
+        style={{
+          background: 'var(--indigo-50)',
+          border: '1px solid var(--indigo-100)',
+          borderRadius: 10,
+          padding: '14px 16px',
+        }}
+      >
         <div
           style={{
             fontSize: 10,
             fontWeight: 700,
-            letterSpacing: '0.08em',
+            letterSpacing: '0.1em',
             textTransform: 'uppercase',
             color: 'var(--indigo-700)',
-            marginBottom: 8,
+            marginBottom: 10,
+            paddingBottom: 8,
+            borderBottom: '1px solid var(--indigo-100)',
           }}
         >
           ✨ Regenerated
@@ -948,34 +1137,538 @@ function TheoryBody({
 function QuestionsBody({
   section,
   banksDetail,
+  subTab,
+  questionRegen,
+  onSectionRetry,
 }: {
   section: Section;
   banksDetail: QuestionBankDetail | null;
+  subTab: SubTab;
+  questionRegen: RegenQuestionsResponse | null;
+  onSectionRetry: (sectionRef: string, instruction: string) => void | Promise<void>;
 }) {
-  const sectionQuestions =
+  const originalQs =
     banksDetail?.sections.find((s) => s.section_ref === section.section_id) ?? null;
+  const regenQs =
+    questionRegen?.sections.find((s) => s.section_ref === section.section_id) ?? null;
+
+  // Pick which data to display based on subTab.
+  // Regenerated (default): show regen data if present, else fall back to original.
+  // Original: show original bank.
+  // Compare: side-by-side.
+  const sectionQuestions =
+    subTab === 'original'
+      ? originalQs
+      : regenQs ?? originalQs;
+
+  // Reseed button + dialog state for this section.
+  const [retryModalOpen, setRetryModalOpen] = useState(false);
+  const [retryInstruction, setRetryInstruction] = useState('');
+  const [retryBusy, setRetryBusy] = useState(false);
+
+  // Per-section retry button (always available when there's a regen)
+  const retryButton = questionRegen?.regen?.id ? (
+    <div style={{ padding: '12px 24px 0 24px' }}>
+      <button
+        className="btn btn-ghost btn-sm"
+        onClick={() => setRetryModalOpen(true)}
+        title="Regenerate this section's questions with a custom instruction"
+        style={{ padding: '6px 12px', fontSize: 12 }}
+      >
+        <Icon name="regen" size={12} /> Reseed this section
+      </button>
+    </div>
+  ) : null;
+
+  // Reseed dialog (inline)
+  const retryDialog = retryModalOpen ? (
+    <div
+      role="dialog"
+      aria-modal="true"
+      style={{
+        position: 'fixed', inset: 0, background: 'rgba(15,23,42,0.45)',
+        zIndex: 60, display: 'grid', placeItems: 'center', padding: 24,
+      }}
+      onClick={() => setRetryModalOpen(false)}
+    >
+      <div
+        onClick={(e) => e.stopPropagation()}
+        style={{
+          background: 'var(--surface)', borderRadius: 12, padding: 24,
+          maxWidth: 560, width: '100%', boxShadow: '0 20px 60px rgba(0,0,0,0.3)',
+        }}
+      >
+        <div style={{ fontSize: 16, fontWeight: 700, marginBottom: 6 }}>
+          <Icon name="regen" size={16} /> Reseed this section (questions)
+        </div>
+        <div style={{ fontSize: 13, color: 'var(--ink-600)', marginBottom: 4 }}>
+          Section: <strong>{section.title || section.section_id}</strong>
+        </div>
+        <div style={{ fontSize: 13, color: 'var(--ink-500)', marginBottom: 14 }}>
+          Add a custom instruction for this section's question regeneration.
+          The current global params still apply; this is layered on top.
+        </div>
+        <textarea
+          value={retryInstruction}
+          onChange={(e) => setRetryInstruction(e.target.value)}
+          rows={5}
+          style={{
+            width: '100%', padding: 10, border: '1px solid var(--line)',
+            borderRadius: 8, fontSize: 13, fontFamily: 'inherit', resize: 'vertical',
+          }}
+          placeholder="e.g. add more numerical problems, or rephrase in simpler English"
+          autoFocus
+        />
+        <div style={{ display: 'flex', justifyContent: 'flex-end', gap: 8, marginTop: 14 }}>
+          <button
+            className="btn btn-ghost btn-sm"
+            onClick={() => setRetryModalOpen(false)}
+            disabled={retryBusy}
+          >
+            Cancel
+          </button>
+          <button
+            className="btn btn-primary btn-sm"
+            disabled={retryBusy}
+            onClick={async () => {
+              setRetryBusy(true);
+              try {
+                await onSectionRetry(section.section_id, retryInstruction);
+                setRetryInstruction('');
+                setRetryModalOpen(false);
+              } finally {
+                setRetryBusy(false);
+              }
+            }}
+          >
+            {retryBusy ? (
+              <>
+                <span className="spinner" /> Regenerating… (this can take 30-60s)
+              </>
+            ) : (
+              <>
+                <Icon name="regen" size={12} /> Regenerate this section
+              </>
+            )}
+          </button>
+        </div>
+      </div>
+    </div>
+  ) : null;
+
+  // Compare mode — per-QUESTION pairing: each original question shown
+  // alongside its regen variants. Sections that have multiple questions
+  // (Exercise / CLASSROOM WING etc.) render one pair per question for
+  // clear visibility. Much better than the section-level "all-orig on
+  // left, all-regen on right" stacking.
+  if (subTab === 'compare') {
+    const origList = originalQs?.questions ?? [];
+    const regenList = regenQs?.questions ?? [];
+    // Build {original_id → [regen variants]} map.
+    const variantsByOriginal = new Map<string, typeof regenList>();
+    for (const rq of regenList) {
+      const srcId = (rq as { source_question_id?: string }).source_question_id;
+      if (srcId) {
+        const arr = variantsByOriginal.get(srcId) ?? [];
+        arr.push(rq);
+        variantsByOriginal.set(srcId, arr);
+      }
+    }
+    return (
+      <>
+        {retryButton}
+        <div
+          style={{
+            padding: '16px 20px 56px',
+            display: 'flex',
+            flexDirection: 'column',
+            gap: 16,
+            background: 'var(--bg)',
+          }}
+        >
+          {origList.length === 0 && (
+            <div
+              style={{
+                padding: 32,
+                textAlign: 'center',
+                color: 'var(--ink-500)',
+                fontSize: 13,
+              }}
+            >
+              No original questions for this section.
+            </div>
+          )}
+          {origList.map((oq, idx) => {
+            const variants = variantsByOriginal.get(oq.id) ?? [];
+            return (
+              <div
+                key={oq.id}
+                className="card"
+                style={{
+                  padding: 0,
+                  overflow: 'hidden',
+                }}
+              >
+                {/* Compact header for the question pair */}
+                <div
+                  style={{
+                    padding: '8px 14px',
+                    background: 'var(--surface-2)',
+                    borderBottom: '1px solid var(--line)',
+                    fontSize: 11,
+                    fontWeight: 700,
+                    color: 'var(--ink-700)',
+                    letterSpacing: '0.04em',
+                    display: 'flex',
+                    alignItems: 'center',
+                    gap: 8,
+                  }}
+                >
+                  <span>Q{idx + 1}</span>
+                  {oq.question_number && (
+                    <span style={{ color: 'var(--ink-500)' }}>· #{oq.question_number}</span>
+                  )}
+                  {oq.page_start && (
+                    <span style={{ color: 'var(--ink-500)' }}>· p.{oq.page_start}</span>
+                  )}
+                  <span style={{ marginLeft: 'auto', color: 'var(--indigo-700)' }}>
+                    {variants.length} variant{variants.length === 1 ? '' : 's'}
+                  </span>
+                </div>
+                <div
+                  style={{
+                    display: 'grid',
+                    gridTemplateColumns: '1fr 1fr',
+                    gap: 0,
+                  }}
+                >
+                  {/* Original side */}
+                  <div style={{ padding: '12px 16px', borderRight: '1px solid var(--line)' }}>
+                    <div
+                      style={{
+                        fontSize: 10,
+                        fontWeight: 700,
+                        letterSpacing: '0.1em',
+                        textTransform: 'uppercase',
+                        color: 'var(--ink-500)',
+                        marginBottom: 6,
+                        display: 'flex',
+                        alignItems: 'center',
+                        gap: 6,
+                      }}
+                    >
+                      <span>Original</span>
+                      <button
+                        title="Hide this question"
+                        onClick={async () => {
+                          try {
+                            await hideQuestion(oq.id);
+                          } catch (_e) {
+                            // ignored — UI shows hidden state on refetch
+                          }
+                        }}
+                        style={{
+                          marginLeft: 'auto',
+                          border: 'none',
+                          background: 'transparent',
+                          color: 'var(--ink-400)',
+                          fontSize: 14,
+                          cursor: 'pointer',
+                          padding: 2,
+                        }}
+                      >
+                        ✕
+                      </button>
+                    </div>
+                    <QuestionContent question={oq} />
+                  </div>
+                  {/* Regenerated variants */}
+                  <div style={{ padding: '12px 16px', background: 'var(--indigo-50)' }}>
+                    <div
+                      style={{
+                        fontSize: 10,
+                        fontWeight: 700,
+                        letterSpacing: '0.1em',
+                        textTransform: 'uppercase',
+                        color: 'var(--indigo-700)',
+                        marginBottom: 6,
+                      }}
+                    >
+                      ✨ Regenerated
+                    </div>
+                    {variants.length === 0 ? (
+                      <div style={{ fontSize: 12, color: 'var(--ink-500)', fontStyle: 'italic' }}>
+                        No regenerated variant yet.
+                      </div>
+                    ) : (
+                      <div style={{ display: 'flex', flexDirection: 'column', gap: 10 }}>
+                        {variants.map((rq, vidx) => (
+                          <div
+                            key={rq.id}
+                            style={{
+                              paddingTop: vidx === 0 ? 0 : 8,
+                              borderTop: vidx === 0 ? 'none' : '1px dashed var(--line)',
+                            }}
+                          >
+                            <div style={{ display: 'flex', alignItems: 'center', gap: 6, marginBottom: 4 }}>
+                              {variants.length > 1 && (
+                                <span
+                                  style={{
+                                    fontSize: 10,
+                                    fontWeight: 700,
+                                    color: 'var(--indigo-700)',
+                                  }}
+                                >
+                                  Variant {vidx + 1}
+                                </span>
+                              )}
+                              <button
+                                title="Hide this variant"
+                                onClick={async () => {
+                                  try {
+                                    await hideQuestion(rq.id);
+                                  } catch (_e) {/* ignored */}
+                                }}
+                                style={{
+                                  marginLeft: 'auto',
+                                  border: 'none',
+                                  background: 'transparent',
+                                  color: 'var(--ink-400)',
+                                  fontSize: 14,
+                                  cursor: 'pointer',
+                                  padding: 2,
+                                }}
+                              >
+                                ✕
+                              </button>
+                            </div>
+                            <QuestionContent question={rq} />
+                          </div>
+                        ))}
+                      </div>
+                    )}
+                  </div>
+                </div>
+              </div>
+            );
+          })}
+        </div>
+        {retryDialog}
+      </>
+    );
+  }
+
+  // Regenerated (default) and Original tabs — single view.
   return (
-    <QuestionsView
-      sectionRef={section.section_id}
-      sectionQuestions={sectionQuestions}
-    />
+    <>
+      {retryButton}
+      <QuestionsView
+        sectionRef={section.section_id}
+        sectionQuestions={sectionQuestions}
+      />
+      {retryDialog}
+    </>
+  );
+}
+
+// Per-question content renderer — question text + collapsible SOLUTION
+// (matches the look of QuestionsView.QuestionCard so the compare view is
+// consistent with the regular single-tab view).
+function QuestionContent({
+  question,
+}: {
+  question: {
+    raw_text?: string;
+    has_solution?: boolean;
+    solution_text?: string | null;
+  };
+}) {
+  return (
+    <>
+      <div
+        style={{
+          fontSize: 13.5,
+          lineHeight: 1.55,
+          color: 'var(--ink-900)',
+          whiteSpace: 'pre-wrap',
+        }}
+      >
+        {question.raw_text || (
+          <em style={{ color: 'var(--ink-400)' }}>(no text)</em>
+        )}
+      </div>
+      {question.has_solution && question.solution_text && (
+        <details
+          style={{
+            marginTop: 10,
+            paddingTop: 8,
+            borderTop: '1px dashed var(--line)',
+          }}
+        >
+          <summary
+            style={{
+              cursor: 'pointer',
+              fontSize: 11,
+              fontWeight: 700,
+              letterSpacing: '0.08em',
+              textTransform: 'uppercase',
+              color: 'var(--ink-500)',
+              userSelect: 'none',
+              display: 'flex',
+              alignItems: 'center',
+              gap: 6,
+            }}
+          >
+            <Icon name="check" size={11} /> Solution
+          </summary>
+          <div
+            style={{
+              marginTop: 6,
+              padding: '10px 12px',
+              background: 'var(--surface-2)',
+              borderRadius: 6,
+              fontSize: 12.5,
+              lineHeight: 1.6,
+              color: 'var(--ink-800)',
+              whiteSpace: 'pre-wrap',
+              fontFamily: 'var(--font-mono)',
+            }}
+          >
+            {question.solution_text}
+          </div>
+        </details>
+      )}
+    </>
   );
 }
 
 function FiguresBody({
   section,
   figuresData,
+  bookId,
+  onFiguresRefetch,
 }: {
   section: Section;
   figuresData: BookFigures | null;
+  bookId: string | undefined;
+  onFiguresRefetch: () => void;
 }) {
   const sectionFigures =
     figuresData?.sections.find((s) => s.section_ref === section.section_id) ?? null;
+  const [regenModalOpen, setRegenModalOpen] = useState(false);
+  const [regenInstruction, setRegenInstruction] = useState('');
+  const [regenStatus, setRegenStatus] = useState<string | null>(null);
+  const [regenBusy, setRegenBusy] = useState(false);
+
+  const triggerRegen = async () => {
+    if (!bookId) return;
+    setRegenBusy(true);
+    setRegenStatus('Queueing…');
+    try {
+      await regenerateSectionFigures(bookId, section.section_id, {
+        custom_instructions: regenInstruction || null,
+      });
+      setRegenStatus('✓ Figure regeneration queued — refreshing soon');
+      setRegenModalOpen(false);
+      setRegenInstruction('');
+      setTimeout(() => {
+        onFiguresRefetch();
+        setRegenStatus(null);
+      }, 2000);
+    } catch (e) {
+      setRegenStatus(e instanceof Error ? e.message : 'Failed to start figure regen');
+    } finally {
+      setRegenBusy(false);
+    }
+  };
+
   return (
-    <FiguresView
-      sectionRef={section.section_id}
-      sectionFigures={sectionFigures}
-    />
+    <>
+      <div style={{ padding: '12px 24px 0 24px', display: 'flex', gap: 8, alignItems: 'center' }}>
+        <button
+          className="btn btn-ghost btn-sm"
+          onClick={() => setRegenModalOpen(true)}
+          title="Regenerate this section's figures with a custom instruction"
+          style={{ padding: '6px 12px', fontSize: 12 }}
+        >
+          <Icon name="regen" size={12} /> Reseed figures for this section
+        </button>
+        {regenStatus && (
+          <div style={{ fontSize: 12, color: 'var(--ink-600)' }}>{regenStatus}</div>
+        )}
+      </div>
+
+      <FiguresView
+        sectionRef={section.section_id}
+        sectionFigures={sectionFigures}
+      />
+
+      {regenModalOpen && (
+        <div
+          role="dialog"
+          aria-modal="true"
+          style={{
+            position: 'fixed', inset: 0, background: 'rgba(15,23,42,0.45)',
+            zIndex: 60, display: 'grid', placeItems: 'center', padding: 24,
+          }}
+          onClick={() => setRegenModalOpen(false)}
+        >
+          <div
+            onClick={(e) => e.stopPropagation()}
+            style={{
+              background: 'var(--surface)', borderRadius: 12, padding: 24,
+              maxWidth: 560, width: '100%', boxShadow: '0 20px 60px rgba(0,0,0,0.3)',
+            }}
+          >
+            <div style={{ fontSize: 16, fontWeight: 700, marginBottom: 6 }}>
+              <Icon name="regen" size={16} /> Reseed figures for this section
+            </div>
+            <div style={{ fontSize: 13, color: 'var(--ink-600)', marginBottom: 4 }}>
+              Section: <strong>{section.title || section.section_id}</strong>
+            </div>
+            <div style={{ fontSize: 13, color: 'var(--ink-500)', marginBottom: 14 }}>
+              Optional: add a custom instruction for how to regenerate the figures
+              (e.g. cleaner labels, different style).
+            </div>
+            <textarea
+              value={regenInstruction}
+              onChange={(e) => setRegenInstruction(e.target.value)}
+              rows={5}
+              style={{
+                width: '100%', padding: 10, border: '1px solid var(--line)',
+                borderRadius: 8, fontSize: 13, fontFamily: 'inherit', resize: 'vertical',
+              }}
+              placeholder="e.g. simpler line drawings, label all axes clearly, remove watermark"
+              autoFocus
+            />
+            <div style={{ display: 'flex', justifyContent: 'flex-end', gap: 8, marginTop: 14 }}>
+              <button
+                className="btn btn-ghost btn-sm"
+                onClick={() => setRegenModalOpen(false)}
+                disabled={regenBusy}
+              >
+                Cancel
+              </button>
+              <button
+                className="btn btn-primary btn-sm"
+                onClick={() => void triggerRegen()}
+                disabled={regenBusy}
+              >
+                {regenBusy ? (
+                  <>
+                    <span className="spinner" /> Starting…
+                  </>
+                ) : (
+                  <>
+                    <Icon name="regen" size={12} /> Regenerate figures
+                  </>
+                )}
+              </button>
+            </div>
+          </div>
+        </div>
+      )}
+    </>
   );
 }
 
@@ -1017,7 +1710,7 @@ function ReseedModal({
   onClose,
 }: {
   sectionTitle: string;
-  onSubmit: (instruction: string) => void;
+  onSubmit: (instruction: string) => Promise<void> | void;
   onClose: () => void;
 }) {
   const [text, setText] = useState('');
@@ -1026,8 +1719,14 @@ function ReseedModal({
   const submit = async () => {
     if (!text.trim() || busy) return;
     setBusy(true);
-    onSubmit(text.trim());
-    setBusy(false);
+    try {
+      // AWAIT — keeps the dialog showing the spinner while Gemini runs
+      // (can take 20-60s). Without await the spinner flashed off
+      // immediately and the user thought the click did nothing.
+      await onSubmit(text.trim());
+    } finally {
+      setBusy(false);
+    }
   };
 
   return (
@@ -1101,7 +1800,7 @@ function ReseedModal({
             disabled={!text.trim() || busy}
           >
             {busy ? <span className="spinner" /> : <Icon name="regen" size={14} />}
-            Regenerate this section
+            {busy ? 'Regenerating… (this can take 20-60s)' : 'Regenerate this section'}
           </button>
         </div>
       </div>
@@ -1189,6 +1888,8 @@ function PreviewModal({
           section={section}
           blocksOverride={(blocks ?? null) as Array<{ t: string; [k: string]: unknown }> | null}
           banner={blocks ? { label: 'Regenerated', tone: 'regen' } : { label: 'Original', tone: 'original' }}
+          hideHeader
+          flat
         />
       </div>
     </>

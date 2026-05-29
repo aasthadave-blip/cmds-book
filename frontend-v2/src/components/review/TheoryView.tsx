@@ -144,10 +144,53 @@ export function TheoryView({
   }
 
   // Render raw backend output — same blocks the existing frontend's
-  // BlockRenderer sees. No client-side filter; trust the worker.
+  // BlockRenderer sees.
   // If a regen variant is being viewed, blocksOverride supplies the
   // regenerated blocks instead of the original Section.blocks.
-  const blocks = (blocksOverride ?? (section.blocks ?? [])) as Block[];
+  const rawBlocks = (blocksOverride ?? (section.blocks ?? [])) as Block[];
+
+  // Dedupe linker duplicates: when the example linker emits BOTH an
+  // `example_ref` (from the theory OCR pass) AND a `question_ref` (from
+  // the downstream linker that connects to the actual extracted question)
+  // for the same label, we want to render only the `question_ref` — it's
+  // the linked, clickable chip. Drop any `example_ref` whose label also
+  // appears as a `question_ref` (or as a sibling `exercise_ref`).
+  const linkedLabels = new Set<string>();
+  for (const b of rawBlocks) {
+    if (b.t === 'question_ref' || b.t === 'exercise_ref') {
+      const label = (b as { label?: string }).label?.trim();
+      if (label) linkedLabels.add(label);
+    }
+  }
+  let blocks = rawBlocks.filter((b) => {
+    if (b.t !== 'example_ref') return true;
+    const label = (b as { label?: string }).label?.trim();
+    // If a sibling question_ref/exercise_ref exists with the same label
+    // → drop this example_ref (duplicate chip).
+    return !(label && linkedLabels.has(label));
+  });
+
+  // Dedupe duplicate heading: when the FIRST block is a heading whose text
+  // matches the section title (case/punctuation-insensitive), drop it. The
+  // section title is already shown above (by SectionHeader or by the parent
+  // page header). The same applies to a leading `h3` block — common when the
+  // extractor emits an h3 with the section name at the top of the section.
+  const normHeading = (s: string) =>
+    s
+      .toLowerCase()
+      .replace(/[^a-z0-9]+/g, ' ')
+      .trim();
+  if (blocks.length > 0) {
+    const first = blocks[0] as { t: string; c?: string };
+    if (
+      (first.t === 'heading' || first.t === 'h3' || first.t === 'h2') &&
+      typeof first.c === 'string' &&
+      section.title &&
+      normHeading(first.c) === normHeading(section.title)
+    ) {
+      blocks = blocks.slice(1);
+    }
+  }
 
   // Build a {normalized label → Figure} map for inline image rendering.
   const figureByLabel = new Map<string, Figure>();

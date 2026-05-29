@@ -836,8 +836,16 @@ export function useExtractionPipeline(): UseExtractionPipeline {
                 const ct = (n.content_types ?? []).map((c) =>
                   String(c).toLowerCase().trim(),
                 );
-                const isCatA = ct.includes('questions');
-                if (n.id && !isCatA) catBSlugs.add(n.id);
+                // A section counts toward theory if it has theory content.
+                // Pure questions-only sections (Cat A: Example, Exercise) are
+                // excluded — they're handled by the question pipeline as
+                // placeholders. After the "remove Mixed" change, content_types
+                // is either ["theory"] or ["questions"]; legacy Mixed
+                // ["theory","questions"] is normalised to ["theory"] in the
+                // backend postpass — so this filter is now unambiguous.
+                const isPureCatA =
+                  ct.includes('questions') && !ct.includes('theory');
+                if (n.id && !isPureCatA) catBSlugs.add(n.id);
                 if (n.subsections?.length) walk(n.subsections);
               }
             };
@@ -1084,13 +1092,21 @@ export function useExtractionPipeline(): UseExtractionPipeline {
           figures: { ...prev.figures, status: 'queued', message: 'waiting for theory' },
         }));
       } else if (book.status === 'ready' || book.status === 'extracted') {
-        // Theory already finished. Mark theory done. Tick will see this
-        // and fire kickRestParallel for Q + figures.
+        // Book is already extracted. Make /extract page READ-ONLY for this
+        // book — show everything as done and DO NOT start polling (which
+        // would otherwise auto-kick questions + figures jobs every visit).
+        // To explicitly re-extract, the user should hit the "Re-extract"
+        // CTA in the UI which fires kickThreeParallel with forceFresh.
         apply((prev) => ({
-          phase: 'extracting',
-          schema: { ...prev.schema, status: 'done', progress: 100 },
-          theory: { ...prev.theory, status: 'done', progress: 100 },
+          phase: 'done',
+          bookStatus: book.status,
+          schema:    { ...prev.schema,    status: 'done', progress: 100 },
+          theory:    { ...prev.theory,    status: 'done', progress: 100 },
+          questions: { ...prev.questions, status: 'done', progress: 100 },
+          figures:   { ...prev.figures,   status: 'done', progress: 100 },
         }));
+        // Read-only state — do NOT call startPolling below; return early.
+        return;
       } else if (book.status === 'failed') {
         apply(() => ({
           phase: 'error',

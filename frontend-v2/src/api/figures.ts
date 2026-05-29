@@ -45,6 +45,18 @@ export const getBookFigures = (bookId: string) =>
 export const figureImageUrl = (figureId: string, regen = false) =>
   `${API_BASE}/api/figures/${figureId}/image${regen ? '?variant=regen' : ''}`;
 
+// Per-section figure regen — POSTs to backend with optional custom instructions.
+// Backend dispatches an async worker. Caller should refetch figures after.
+export const regenerateSectionFigures = (
+  bookId: string,
+  sectionRef: string,
+  body: { style?: string; custom_instructions?: string | null } = {},
+) =>
+  req(
+    `/api/books/${bookId}/sections/${encodeURIComponent(sectionRef)}/regenerate-figures`,
+    { method: 'POST', body: JSON.stringify(body) },
+  );
+
 // ─── Hook ─────────────────────────────────────────────────────────
 type State =
   | { kind: 'loading' }

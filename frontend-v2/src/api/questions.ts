@@ -15,6 +15,20 @@ export type QuestionBank = {
   last_error?: string | null;
 };
 
+// Embedded figure on a question — backend joins figure_references → figures
+// for this question and returns the data the UI needs to render the image
+// inline at `placement_char_offset` inside `raw_text`.
+export type QuestionEmbeddedFigure = {
+  ref_id: string;
+  figure_id: string;
+  label: string;
+  caption: string;
+  variant: 'original' | 'regen';
+  image_url: string;
+  placement_kind?: string;
+  placement_char_offset?: number | null;
+};
+
 export type ExtractedQuestion = {
   id: string;
   section_ref: string;
@@ -31,6 +45,9 @@ export type ExtractedQuestion = {
   has_solution: boolean;
   kind?: string | null; // 'example' | 'question' | etc.
   is_hidden?: boolean;
+  // Figures referenced inline within this question's text. Empty if the
+  // figure_embedder didn't find any "Fig. X.Y" reference in raw_text.
+  embedded_figures?: QuestionEmbeddedFigure[];
 };
 
 export type SectionQuestions = {
@@ -58,6 +75,49 @@ export const listBanks = (bookId: string) =>
 
 export const getBankQuestions = (bankId: string) =>
   req<QuestionBankDetail>(`/api/question-banks/${bankId}/questions`);
+
+// ─── Question REGEN HTTP (for RegenReviewPage Questions tab) ──────
+export type QuestionRegeneration = {
+  id: string;
+  book_id: string;
+  bank_id: string;
+  status: string;
+  custom_instructions: string | null;
+  created_at: string;
+};
+
+export type RegenQuestionsResponse = {
+  regen: QuestionRegeneration;
+  sections: SectionQuestions[];
+};
+
+export const listQuestionRegenerations = (bookId: string) =>
+  req<QuestionRegeneration[]>(`/api/books/${bookId}/question-regenerations`);
+
+export const getRegenQuestions = (regenId: string) =>
+  req<RegenQuestionsResponse>(
+    `/api/question-regenerations/${regenId}/questions`,
+  );
+
+export const retryRegenSection = (
+  regenId: string,
+  body: { section_ref: string; custom_instructions?: string | null },
+) =>
+  req(`/api/question-regenerations/${regenId}/retry-section`, {
+    method: 'POST',
+    body: JSON.stringify(body),
+  });
+
+export const saveQuestionRegeneration = (regenId: string) =>
+  req(`/api/question-regenerations/${regenId}/save`, { method: 'POST' });
+
+// Hide / unhide a single question (used in the reviewer UI to drop a
+// generated question the user doesn't want without re-running regen).
+export const hideQuestion = (questionId: string) =>
+  req(`/api/question-banks/questions/${questionId}/hide`, { method: 'PATCH' });
+
+export const unhideQuestion = (questionId: string) =>
+  req(`/api/question-banks/questions/${questionId}/unhide`, { method: 'PATCH' });
 
 // ─── Hook ─────────────────────────────────────────────────────────
 type State =
