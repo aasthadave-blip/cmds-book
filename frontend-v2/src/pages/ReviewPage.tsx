@@ -118,23 +118,34 @@ export default function ReviewPage() {
       expected_question_count?: number;
       subsections?: Node[];
     };
-    // Mirror the backend's questions_v3 Category A/B split EXACTLY
-    // (see app/workers/questions_v3.py):
+    // Category split after the "remove Mixed" change:
     //
-    //   Category A = "questions" in content_types         → Questions tab
-    //   Category B = NO "questions" in content_types       → Theory tab
+    //   Category A (PURE questions)  = content_types is exactly ["questions"]
+    //     → Questions tab only
+    //     → Hidden from Theory tab sidebar
     //
-    // Mixed sections (theory + questions) belong to CATEGORY A — the
-    // questions worker processes them. The theory tab should NOT show
-    // them, matching backend's split exactly.
+    //   Category B (theory-bearing)  = content_types includes "theory"
+    //     → Theory tab (and shown in sidebar)
+    //
+    // Mixed legacy sections (["theory","questions"]) are normalised by the
+    // backend's _sanitize_schema postpass to ["theory"], but we apply the
+    // same defensive filter here so the UI is correct even if a stored
+    // schema slips through.
     const hasQuestionContent = (n: Node) => {
       const ct = (n.content_types ?? []).map((s) =>
         String(s).toLowerCase().trim(),
       );
       return ct.includes('questions');
     };
-    // Cat A IDs collected during walk for filtering out of Theory tab.
-    const isCategoryA = hasQuestionContent;
+    const isCategoryA = (n: Node) => {
+      const ct = (n.content_types ?? []).map((s) =>
+        String(s).toLowerCase().trim(),
+      );
+      // Pure Cat A only — Mixed sections (which have theory content) are
+      // shown in the Theory tab, with their Cat A nested items rendered
+      // as chips inside the parent's blocks.
+      return ct.includes('questions') && !ct.includes('theory');
+    };
     const walk = (nodes: Node[] | undefined) => {
       if (!nodes) return;
       for (const n of nodes) {
