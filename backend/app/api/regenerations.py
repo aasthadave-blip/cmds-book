@@ -20,6 +20,31 @@ from app.schemas.regen import RegenerationOut, RegenParams
 router = APIRouter(tags=["regenerations"])
 
 
+@router.get("/api/recap-rules")
+async def list_recap_rules() -> list[dict[str, Any]]:
+    """Return the catalog of theory-regen recap rules.
+
+    Frontend renders these as opt-in checkboxes in the Theory regen
+    config. Activating any rule requires THEORY_REGEN_PROMPT_VERSION=v3
+    on the backend; with v1 the recap_rule_ids field is accepted but
+    ignored (v1 prompt has no recap placeholders, and worker pre-loop
+    is gated on is_recap_enabled()).
+    """
+    from app.services.recap_config import RECAP_RULES
+
+    return [
+        {
+            "id": r["id"],
+            "label": r["label"],
+            "kind": r["kind"],
+            "source_labels": r.get("source_labels", []),
+            "source_section_patterns": r.get("source_section_patterns", []),
+            "description": r["description"],
+        }
+        for r in RECAP_RULES
+    ]
+
+
 @router.post("/api/books/{book_id}/regenerate", response_model=BookUploadResponse)
 async def regenerate_book(
     book_id: UUID,

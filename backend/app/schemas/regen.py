@@ -19,6 +19,9 @@ class RegenParams(BaseModel):
     language: str = "en"
     target_audience: str | None = None
     custom_instructions: str | None = None
+    # v3 recap rules (opt-in). Empty = no recap behavior.
+    # Only consumed when THEORY_REGEN_PROMPT_VERSION=v3.
+    recap_rule_ids: list[str] = Field(default_factory=list)
 
 
 INTENSITY_MAP: dict[str, str] = {
@@ -99,7 +102,10 @@ LANGUAGE_MAP: dict[str, str] = {
 }
 
 
-def param_descriptors(params: RegenParams) -> dict[str, str]:
+def param_descriptors(
+    params: RegenParams,
+    assigned_keypoints: list[str] | None = None,
+) -> dict[str, str]:
     lang_name = LANGUAGE_MAP.get(params.language, params.language)
     audience_line = (
         f"TARGET AUDIENCE: Write specifically for {params.target_audience}. "
@@ -113,6 +119,15 @@ def param_descriptors(params: RegenParams) -> dict[str, str]:
         else ""
     )
     extra = "\n\n".join(filter(None, [audience_line, custom_line]))
+
+    # Recap directives (v3 prompt only — v1 ignores these via _SafeDict).
+    from app.services.recap_config import (
+        render_active_ids,
+        render_keypoints_directive,
+        render_renames_directive,
+    )
+
+    recap_ids = list(params.recap_rule_ids or [])
     return {
         "intensity_description": INTENSITY_MAP[params.intensity],
         "tone_description": TONE_MAP[params.tone],
@@ -122,6 +137,12 @@ def param_descriptors(params: RegenParams) -> dict[str, str]:
         "structure": STRUCTURE_MAP[params.structure],
         "language": f"{lang_name} — write ALL output text in {lang_name} only",
         "extra_instructions": extra,
+        "recap_active_ids": render_active_ids(recap_ids),
+        "recap_renames_directive": render_renames_directive(recap_ids),
+        "recap_keypoints_directive": render_keypoints_directive(
+            assigned_keypoints or [],
+            label="Key Points",
+        ),
     }
 
 
