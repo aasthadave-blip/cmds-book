@@ -9,6 +9,7 @@ that drifted.
 from __future__ import annotations
 
 import logging
+import os
 
 from app.core.gemini_client import extract_text, messages_create
 from app.schemas.regen import PostRegenQCResult, RegenParams, param_descriptors
@@ -18,6 +19,22 @@ from app.services.invariant_splitter import (
     split_blocks,
 )
 from app.services.prompt_loader import render
+
+
+def _regen_prompt_name() -> str:
+    """Pick which regenerator prompt file to load.
+
+    Default = "regenerator" (v1, production). Set
+    THEORY_REGEN_PROMPT_VERSION=v3 to use regenerator_v3.txt which has
+    RECAP DIRECTIVES support (rename + key-points subsections).
+    """
+    version = (os.getenv("THEORY_REGEN_PROMPT_VERSION") or "v1").strip().lower()
+    return "regenerator_v3" if version == "v3" else "regenerator"
+
+
+def is_recap_enabled() -> bool:
+    """Whether the prompt + worker pre-loop should apply recap logic."""
+    return _regen_prompt_name() == "regenerator_v3"
 from app.services.qc.helpers import blocks_to_plain_text, extract_numbers
 from app.utils.json_parse import parse_json
 
@@ -63,8 +80,20 @@ def free_blocks_to_text(free_blocks: list[dict]) -> str:
     return "\n\n".join(p for p in parts if p.strip())
 
 
-def build_regen_system_prompt(params: RegenParams) -> str:
-    return render("regenerator", **param_descriptors(params))
+def build_regen_system_prompt(
+    params: RegenParams,
+    assigned_keypoints: list[str] | None = None,
+) -> str:
+    """Build the system prompt for one section's regen call.
+
+    `assigned_keypoints` is the list of chapter-end PTR bullets the worker
+    pre-assigned to THIS section. When non-empty (and v3 prompt active),
+    the prompt renders a KEY POINTS directive.
+    """
+    return render(
+        _regen_prompt_name(),
+        **param_descriptors(params, assigned_keypoints=assigned_keypoints or []),
+    )
 
 
 def build_user_message(section_id: str, section_title: str, free_text: str) -> str:
@@ -103,15 +132,21 @@ async def regenerate_section(
     section_title: str,
     blocks: list[dict],
     params: RegenParams,
+    assigned_keypoints: list[str] | None = None,
 ) -> list[dict]:
-    """Regenerate one section with invariant split. Returns merged block list."""
+    """Regenerate one section with invariant split. Returns merged block list.
+
+    assigned_keypoints: optional list of chapter-end PTR bullets that the
+    worker pre-assigned to THIS section via the redistribute mechanism.
+    Only consulted when the v3 prompt is active (env-var gated).
+    """
     invariant_blocks, free_blocks = split_blocks(blocks)
 
     if not free_blocks:
         # Nothing to rewrite — return originals untouched
         return [dict(b) for b in blocks]
 
-    system = build_regen_system_prompt(params)
+    system = build_regen_system_prompt(params, assigned_keypoints=assigned_keypoints)
     free_text = free_blocks_to_text(free_blocks)
     user_msg = build_user_message(section_id, section_title, free_text)
 

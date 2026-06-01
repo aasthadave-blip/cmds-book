@@ -840,6 +840,56 @@ def regenerate_book_task(
 
         blocks_by_section: dict[str, list[dict]] = {}
         qc_drift: dict[str, dict] = {}
+
+        # ─── RECAP pre-loop (v3 only, opt-in) ─────────────────────────
+        # Detect chapter-end Points-to-Remember / Summary / Key Takeaways
+        # sections, extract their bullets, assign each bullet to its best
+        # matching topic via deterministic Jaccard match (no extra LLM
+        # call, no double-assignment), then SKIP those source sections
+        # from the per-section regen output. Orphan bullets get appended
+        # at chapter end as a fallback "Key Points" subsection.
+        per_section_keypoints: dict[str, list[str]] = {}
+        orphan_keypoints: list[str] = []
+        ptr_source_section_ids: set[str] = set()
+        try:
+            from app.services.recap_config import (
+                active_redistribute_rules,
+                assign_bullets_to_sections,
+                detect_redistribute_source_sections,
+            )
+            from app.services.regenerator import is_recap_enabled
+
+            if is_recap_enabled() and rp.recap_rule_ids:
+                section_tuples = [
+                    (s.section_id, s.title or "", list(s.blocks or []))
+                    for s in sections
+                ]
+                src_ids, bullets = detect_redistribute_source_sections(
+                    section_tuples, rp.recap_rule_ids
+                )
+                ptr_source_section_ids = set(src_ids)
+                if bullets:
+                    # Only match against sections that are NOT the source.
+                    target_pool = [
+                        (sid, title, blocks)
+                        for sid, title, blocks in section_tuples
+                        if sid not in ptr_source_section_ids
+                    ]
+                    per_section_keypoints, orphan_keypoints = (
+                        assign_bullets_to_sections(bullets, target_pool)
+                    )
+                    logger.info(
+                        "recap redistribute: %d bullets from %d source sections; "
+                        "assigned to %d sections, %d orphans",
+                        len(bullets),
+                        len(src_ids),
+                        sum(1 for v in per_section_keypoints.values() if v),
+                        len(orphan_keypoints),
+                    )
+        except Exception as e:
+            # Recap is best-effort — never block the regen if config fails.
+            logger.warning("recap pre-loop skipped: %s", e)
+
         total = len(sections)
 
         try:
@@ -851,6 +901,14 @@ def regenerate_book_task(
                     message=f"Regenerating {sec.section_id} ({i}/{total})",
                     progress=progress,
                 )
+                # Skip PTR source sections — their content has been
+                # redistributed into other sections via per_section_keypoints.
+                if sec.section_id in ptr_source_section_ids:
+                    logger.info(
+                        "recap: skipping PTR source section %s (bullets redistributed)",
+                        sec.section_id,
+                    )
+                    continue
                 original = list(sec.blocks or [])
                 if not original:
                     blocks_by_section[sec.section_id] = []
@@ -863,6 +921,9 @@ def regenerate_book_task(
                             section_title=sec.title,
                             blocks=original,
                             params=rp,
+                            assigned_keypoints=per_section_keypoints.get(
+                                sec.section_id, []
+                            ),
                         )
                     )
                 except Exception as e:
@@ -879,6 +940,27 @@ def regenerate_book_task(
                     "drifted": qc.drifted_values,
                     "original_number_count": qc.original_number_count,
                 }
+
+            # ─── RECAP post-loop: orphan bullet fallback ──────────
+            # If any chapter-end bullets did not match any section above
+            # the threshold, append them as a synthetic chapter-end
+            # "Key Points" section so nothing is silently dropped.
+            if orphan_keypoints:
+                fallback_blocks = [
+                    {"t": "h3", "c": "Key Points"},
+                    {"t": "list", "items": list(orphan_keypoints)},
+                ]
+                # Use a stable synthetic id that sorts to the very end.
+                blocks_by_section["zzz-key-points-orphan-fallback"] = fallback_blocks
+                qc_drift["zzz-key-points-orphan-fallback"] = {
+                    "pass": True,
+                    "drifted": [],
+                    "note": "synthetic orphan-fallback from recap redistribute",
+                }
+                logger.info(
+                    "recap: appended %d orphan bullets under fallback Key Points section",
+                    len(orphan_keypoints),
+                )
 
             if regen_row is not None:
                 # MERGE (don't replace) — the regen row was seeded by the

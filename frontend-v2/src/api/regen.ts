@@ -32,7 +32,22 @@ export type TheoryRegenParams = {
   language?: string;
   target_audience?: string | null;
   custom_instructions?: string | null;
+  // v3 recap rules (opt-in). Empty / omitted = no recap behavior.
+  // Backend ignores when THEORY_REGEN_PROMPT_VERSION != "v3".
+  recap_rule_ids?: string[];
 };
+
+// ─── Recap rules catalog (v3 only) ───────────────────────────────────
+export type RecapRule = {
+  id: string;
+  label: string;
+  kind: 'rename' | 'redistribute';
+  source_labels: string[];
+  source_section_patterns: string[];
+  description: string;
+};
+
+export const getRecapRules = () => req<RecapRule[]>(`/api/recap-rules`);
 
 // Defaults tuned so regen produces VISIBLY different output while
 // keeping block order stable. Earlier defaults (intensity=moderate,
@@ -58,6 +73,7 @@ export const defaultTheoryParams: TheoryRegenParams = {
   language: 'en',
   target_audience: null,
   custom_instructions: null,
+  recap_rule_ids: [],
 };
 
 export type TheoryRegenResponse = {
