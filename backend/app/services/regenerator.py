@@ -9,6 +9,7 @@ that drifted.
 from __future__ import annotations
 
 import logging
+import os
 
 from app.core.gemini_client import extract_text, messages_create
 from app.schemas.regen import PostRegenQCResult, RegenParams, param_descriptors
@@ -18,6 +19,17 @@ from app.services.invariant_splitter import (
     split_blocks,
 )
 from app.services.prompt_loader import render
+
+
+def _regen_prompt_name() -> str:
+    """Pick which regenerator prompt file to load.
+
+    Default = "regenerator" (v1, current production). Set
+    THEORY_REGEN_PROMPT_VERSION=v3 to swap in regenerator_v3.txt.
+    Fully reversible: unset the env var (or set it to "v1") to go back.
+    """
+    version = (os.getenv("THEORY_REGEN_PROMPT_VERSION") or "v1").strip().lower()
+    return "regenerator_v3" if version == "v3" else "regenerator"
 from app.services.qc.helpers import blocks_to_plain_text, extract_numbers
 from app.utils.json_parse import parse_json
 
@@ -64,7 +76,7 @@ def free_blocks_to_text(free_blocks: list[dict]) -> str:
 
 
 def build_regen_system_prompt(params: RegenParams) -> str:
-    return render("regenerator", **param_descriptors(params))
+    return render(_regen_prompt_name(), **param_descriptors(params))
 
 
 def build_user_message(section_id: str, section_title: str, free_text: str) -> str:
