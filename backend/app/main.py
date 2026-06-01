@@ -177,6 +177,27 @@ async def recover_orphaned_jobs() -> None:
 
     Each job is recovered independently — one failure never blocks the others.
     """
+    # Allow skipping orphan recovery via env var. Useful when a poisoned
+    # orphan job keeps OOM-killing the container in a restart loop —
+    # set SKIP_ORPHAN_RECOVERY=1 to let the backend stay up so the
+    # orphan can be cleared manually via /api/jobs/cancel-all.
+    if _os.environ.get("SKIP_ORPHAN_RECOVERY", "").strip().lower() in ("1", "true", "yes"):
+        logger.info("Orphan recovery SKIPPED via SKIP_ORPHAN_RECOVERY env var")
+        return
+
+    # Wrap the whole recovery in a try/except so a failure here NEVER
+    # crashes the container on startup. A failed orphan recovery just
+    # means jobs stay stuck, not that the API dies.
+    try:
+        await _do_recover_orphaned_jobs()
+    except BaseException as exc:
+        logger.error("Orphan recovery crashed (continuing startup): %s", exc, exc_info=True)
+
+
+async def _do_recover_orphaned_jobs() -> None:
+    """The actual orphan-recovery logic — separated so it can be wrapped
+    in a try/except by the on_event handler above."""
+    import os as _os  # noqa
     from sqlalchemy import create_engine, select
     from sqlalchemy.orm import Session, sessionmaker
 
