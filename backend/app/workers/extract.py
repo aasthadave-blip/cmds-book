@@ -906,13 +906,23 @@ def regenerate_book_task(
                     message=f"Regenerating {sec.section_id} ({i}/{total})",
                     progress=progress,
                 )
-                # Skip PTR source sections — their content has been
+                # Suppress PTR source sections — their content has been
                 # redistributed into other sections via per_section_keypoints.
+                # Write [] as the SENTINEL so the final-merge layer skips
+                # this section entirely instead of falling back to the
+                # original Section.blocks (without sentinel the merger
+                # would see "no regen for this sid" and serve original).
                 if sec.section_id in ptr_source_section_ids:
                     logger.info(
-                        "recap: skipping PTR source section %s (bullets redistributed)",
+                        "recap: suppressing PTR source section %s (bullets redistributed)",
                         sec.section_id,
                     )
+                    blocks_by_section[sec.section_id] = []
+                    qc_drift[sec.section_id] = {
+                        "pass": True,
+                        "drifted": [],
+                        "note": "section bullets redistributed via recap",
+                    }
                     continue
                 original = list(sec.blocks or [])
                 if not original:
@@ -1027,10 +1037,20 @@ def regenerate_book_task(
                             target_sid,
                         )
 
-                # Remove promoted source sections from this run's output
+                # SUPPRESS (not delete) promoted source sections.
+                # Writing [] as sentinel — the final-merge layer treats
+                # "key present with empty list" as intentionally suppressed
+                # and skips the section entirely (no fall-back to
+                # Section.blocks original). Without this sentinel,
+                # Composer/Preview/DOCX export would still show the source
+                # section by falling back to the original extraction.
                 for sid in promote_skip_ids:
-                    blocks_by_section.pop(sid, None)
-                    qc_drift.pop(sid, None)
+                    blocks_by_section[sid] = []
+                    qc_drift[sid] = {
+                        "pass": True,
+                        "drifted": [],
+                        "note": "section promoted into preceding topic",
+                    }
             except Exception as e:
                 logger.warning("recap promote post-loop skipped: %s", e)
 
@@ -1064,23 +1084,23 @@ def regenerate_book_task(
                 # dict mutated in place and skips the UPDATE.
                 from sqlalchemy.orm.attributes import flag_modified
                 existing_blocks = dict(regen_row.blocks_by_section or {})
-                # PTR REDISTRIBUTE + RENAME PROMOTE FIX: drop any source
-                # sections that were carried forward by the API seed (or
-                # saved by a prior regen) before merging this run's
-                # results. Without this, the redistributed PTR section OR
-                # promoted Konnect/Note/Info-Edge/Info-Bytes sections
-                # would still appear in the final output because the seed
-                # retained their prior copies.
-                drop_ids = set(ptr_source_section_ids) | set(promote_skip_ids)
-                for sid in drop_ids:
-                    existing_blocks.pop(sid, None)
+                # PTR REDISTRIBUTE + RENAME PROMOTE FIX: when a source
+                # section is suppressed in THIS run, also suppress its
+                # carried-forward copy from a prior regen. Write [] as
+                # the sentinel (same shape as the worker's in-run write)
+                # so the final-merge layer can detect explicit
+                # suppression and not fall back to Section.blocks
+                # originals.
+                suppress_ids = set(ptr_source_section_ids) | set(promote_skip_ids)
+                # blocks_by_section already contains [] sentinels for these
+                # ids from the worker's pre/post-loop. The .update() below
+                # will overwrite any prior carried-forward content with
+                # those sentinels.
                 existing_blocks.update(blocks_by_section)
                 regen_row.blocks_by_section = existing_blocks
                 flag_modified(regen_row, "blocks_by_section")
 
                 existing_qc = dict(regen_row.qc_drift or {})
-                for sid in drop_ids:
-                    existing_qc.pop(sid, None)
                 existing_qc.update(qc_drift)
                 regen_row.qc_drift = existing_qc
                 flag_modified(regen_row, "qc_drift")

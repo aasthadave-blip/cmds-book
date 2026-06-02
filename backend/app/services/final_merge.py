@@ -850,6 +850,19 @@ async def build_final_merge(
 
     out_sections: list[dict[str, Any]] = []
     for ss in ordered_schema_sections:
+        # SUPPRESSION SENTINEL — recap redistribute/promote writes [] for
+        # sections whose content has been moved into other sections (PTR
+        # bullets redistributed, Konnect/Note/Info-Edge section folded
+        # into preceding topic). When the regen row carries an explicit
+        # empty list for a section, skip the section entirely from the
+        # final draft — do NOT fall back to Section.blocks original.
+        if (
+            prefer_regen
+            and ss.id in theory_regen_blocks
+            and len(theory_regen_blocks[ss.id]) == 0
+        ):
+            continue
+
         sec_row = section_by_id.get(ss.id)
         # Prefer regen blocks if available; fall back to original blocks
         regen_blocks = theory_regen_blocks.get(ss.id) if prefer_regen else None
