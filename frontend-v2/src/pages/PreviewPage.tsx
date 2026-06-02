@@ -481,6 +481,11 @@ function BlockRow({ block }: { block: Block }) {
     //   • Already-delimited content ($...$ or $$...$$) → render verbatim
     const looksLikeProse = (() => {
       if (c.includes('$')) return false;            // already delimited → trust it
+      // LaTeX-command override: any of these means the content is math
+      // even if there are many letter-words around it (e.g.
+      // "Percentage Decrease = \frac{Greater - Smaller}{Greater} \times 100%").
+      if (/\\(frac|times|cdot|sum|int|sqrt|sin|cos|tan|log|ln|alpha|beta|gamma|delta|theta|lambda|mu|pi|sigma|phi|omega|to|Rightarrow|leftarrow|rightarrow|leq|geq|neq|approx|infty|partial|nabla)\b/.test(c)) return false;
+      if (/[\^_]\{/.test(c)) return false;           // ^{ or _{ → super/subscript math
       const wordTokens = c.match(/\b[a-zA-Z]{3,}\b/g) || [];
       if (wordTokens.length >= 3) return true;       // 3+ word-like tokens → prose
       if (/[a-z],\s+[a-z]/i.test(c)) return true;    // "x, y" inline comma + word → prose
@@ -506,7 +511,7 @@ function BlockRow({ block }: { block: Block }) {
   if (t === 'list') {
     const items = ((block as { items?: string[] }).items ?? []);
     return <ol style={{ marginBottom: 12, paddingLeft: 22 }}>
-      {items.map((it, k) => <li key={k} style={{ marginBottom: 4, lineHeight: 1.55, fontSize: 14 }}>{it}</li>)}
+      {items.map((it, k) => <li key={k} style={{ marginBottom: 4, lineHeight: 1.55, fontSize: 14 }}><MathMarkdown inline>{it}</MathMarkdown></li>)}
     </ol>;
   }
   if (t === 'fig') {

@@ -382,6 +382,9 @@ function BlockRender({
     // Same prose-vs-math heuristic as PreviewPage / ComposerPage.
     const looksLikeProse = (() => {
       if (c.includes('$')) return false;
+      // LaTeX-command override — force math when these appear.
+      if (/\\(frac|times|cdot|sum|int|sqrt|sin|cos|tan|log|ln|alpha|beta|gamma|delta|theta|lambda|mu|pi|sigma|phi|omega|to|Rightarrow|leftarrow|rightarrow|leq|geq|neq|approx|infty|partial|nabla)\b/.test(c)) return false;
+      if (/[\^_]\{/.test(c)) return false;
       const wordTokens = c.match(/\b[a-zA-Z]{3,}\b/g) || [];
       if (wordTokens.length >= 3) return true;
       if (/[a-z],\s+[a-z]/i.test(c)) return true;
@@ -575,7 +578,7 @@ function BlockRender({
       >
         {items.map((it, i) => (
           <li key={i} style={{ marginBottom: 6 }}>
-            {strip(it)}
+            <MathMarkdown inline>{strip(it)}</MathMarkdown>
           </li>
         ))}
       </Tag>
