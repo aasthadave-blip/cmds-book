@@ -13,6 +13,7 @@ import type { Section } from '../../api/sections';
 import type { Figure } from '../../api/figures';
 import { figureImageUrl } from '../../api/figures';
 import { Icon } from '../Icon';
+import { MathMarkdown } from '../MathMarkdown';
 
 type Block =
   | { t: 'p'; c: string }
@@ -563,7 +564,7 @@ function BlockRender({
       >
         {items.map((it, i) => (
           <li key={i} style={{ marginBottom: 6 }}>
-            {strip(it)}
+            <MathMarkdown inline>{strip(it)}</MathMarkdown>
           </li>
         ))}
       </Tag>

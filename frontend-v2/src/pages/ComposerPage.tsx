@@ -43,6 +43,7 @@ import { CSS } from '@dnd-kit/utilities';
 import { API_BASE, ApiError, req } from '../api/client';
 import { useBook } from '../api/books';
 import { Icon } from '../components/Icon';
+import { MathMarkdown } from '../components/MathMarkdown';
 
 type Block = { t: string; [k: string]: unknown };
 
@@ -719,7 +720,7 @@ function BlockRender({ block }: { block: Block }) {
   if (t === 'list') {
     const items = ((block as { items?: string[] }).items ?? []);
     return <ol style={{ paddingLeft: 18, fontSize: 13, lineHeight: 1.55, margin: 0 }}>
-      {items.map((it, i) => <li key={i}>{it}</li>)}
+      {items.map((it, i) => <li key={i}><MathMarkdown inline>{it}</MathMarkdown></li>)}
     </ol>;
   }
   if (t === 'example_ref' || t === 'exercise_ref' || t === 'question_ref') {
