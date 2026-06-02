@@ -493,7 +493,7 @@ function BlockRow({ block }: { block: Block }) {
   if (t === 'list') {
     const items = ((block as { items?: string[] }).items ?? []);
     return <ol style={{ marginBottom: 12, paddingLeft: 22 }}>
-      {items.map((it, k) => <li key={k} style={{ marginBottom: 4, lineHeight: 1.55, fontSize: 14 }}><MathMarkdown inline>{it}</MathMarkdown></li>)}
+      {items.map((it, k) => <li key={k} style={{ marginBottom: 4, lineHeight: 1.55, fontSize: 14 }}>{it}</li>)}
     </ol>;
   }
   if (t === 'fig') {
