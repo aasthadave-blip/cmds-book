@@ -473,12 +473,14 @@ function BlockRow({ block }: { block: Block }) {
     </div>
   );
   if (t === 'eq') return (
-    <div style={{ background: 'var(--bg-tint)', padding: '10px 14px', borderRadius: 6, marginBottom: 12, fontSize: 14, color: 'var(--indigo-700)', textAlign: 'center' }}>
-      {/* Wrap in $$ if the content doesn't already have math delimiters
-          — equations from extraction are often bare LaTeX like "x = 5". */}
-      <MathMarkdown>
-        {c.includes('$') ? c : `$$${c}$$`}
-      </MathMarkdown>
+    <div style={{ background: 'var(--bg-tint)', padding: '10px 14px', borderRadius: 6, marginBottom: 12, fontSize: 14, color: 'var(--indigo-700)', textAlign: 'center', fontFamily: 'var(--font-mono)' }}>
+      {/* Render the content directly through MathMarkdown — math wrapped
+          in $...$/$$...$$ renders as KaTeX, plain text stays as text.
+          Earlier this auto-wrapped bare content in $$...$$ which broke
+          prose that the LLM mistakenly put into eq blocks (it rendered
+          as italic math with eaten spaces). Matches TheoryView /
+          ComposerPage which never auto-wrap. */}
+      <MathMarkdown>{c}</MathMarkdown>
     </div>
   );
   if (t === 'def') {
