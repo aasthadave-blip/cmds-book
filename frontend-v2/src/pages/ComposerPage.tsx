@@ -713,22 +713,10 @@ function BlockRender({ block }: { block: Block }) {
     </div>
   );
   if (t === 'eq') {
-    // Same prose-vs-math heuristic as PreviewPage — see comments there.
-    const looksLikeProse = (() => {
-      if (c.includes('$')) return false;
-      // LaTeX-command override — force math when these appear.
-      if (/\\(frac|times|cdot|sum|int|sqrt|sin|cos|tan|log|ln|alpha|beta|gamma|delta|theta|lambda|mu|pi|sigma|phi|omega|to|Rightarrow|leftarrow|rightarrow|leq|geq|neq|approx|infty|partial|nabla)\b/.test(c)) return false;
-      if (/[\^_]\{/.test(c)) return false;
-      const wordTokens = c.match(/\b[a-zA-Z]{3,}\b/g) || [];
-      if (wordTokens.length >= 3) return true;
-      if (/[a-z],\s+[a-z]/i.test(c)) return true;
-      if (/\.\s+[A-Z]/.test(c)) return true;
-      return false;
-    })();
-    const rendered = looksLikeProse ? c : (c.includes('$') ? c : `$$${c}$$`);
+    // RAW OCR rendering — see PreviewPage comments.
     return (
-      <div style={{ background: 'var(--bg-tint)', padding: '8px 10px', borderRadius: 6, fontSize: 13, color: 'var(--indigo-700)', fontFamily: looksLikeProse ? 'inherit' : 'var(--font-mono)' }}>
-        <MathMarkdown>{rendered}</MathMarkdown>
+      <div style={{ background: 'var(--bg-tint)', padding: '8px 10px', borderRadius: 6, fontSize: 13, color: 'var(--indigo-700)', fontFamily: 'var(--font-mono)', whiteSpace: 'pre-wrap' }}>
+        {c}
       </div>
     );
   }
@@ -739,7 +727,7 @@ function BlockRender({ block }: { block: Block }) {
   if (t === 'list') {
     const items = ((block as { items?: string[] }).items ?? []);
     return <ol style={{ paddingLeft: 18, fontSize: 13, lineHeight: 1.55, margin: 0 }}>
-      {items.map((it, i) => <li key={i}><MathMarkdown inline>{it}</MathMarkdown></li>)}
+      {items.map((it, i) => <li key={i} style={{ whiteSpace: 'pre-wrap' }}>{it}</li>)}
     </ol>;
   }
   if (t === 'example_ref' || t === 'exercise_ref' || t === 'question_ref') {
