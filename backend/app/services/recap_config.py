@@ -247,8 +247,23 @@ def detect_redistribute_source_sections(
 
     Scans every section's title against every active redistribute rule's
     source_section_patterns. Matched sections are returned so the worker
-    can skip them in regen output. Their bullets are flattened into one
-    list ready for assignment.
+    can skip them in regen output. Their content is flattened into a
+    list of bullets ready for Jaccard assignment.
+
+    Block handling:
+      • list → each item becomes its own bullet
+      • kp/p → emitted as a new bullet
+      • eq   → MERGED into the most recent bullet with " " separator
+               (this preserves equations that visually trail a bullet
+               like "Cost of Living Index =" + an eq block carrying the
+               actual formula — without merging, only the bare label
+               makes it into the Key Takeaways subsection)
+      • If an eq appears before any bullet exists in the section, it
+        becomes its own bullet.
+
+    Multiple consecutive eq blocks (a derivation chain) get concatenated
+    onto the same bullet so the related lines stay together when the
+    Jaccard matcher assigns them to a topic.
     """
     rules = active_redistribute_rules(active_ids)
     if not rules:
@@ -264,15 +279,25 @@ def detect_redistribute_source_sections(
         if not any(p in t for p in patterns):
             continue
         matched_ids.append(sid)
-        # Extract bullets: list_items + standalone kp/p blocks
         for b in blocks or []:
             bt = b.get("t")
             if bt == "list":
                 for item in (b.get("items") or []):
-                    if item and str(item).strip():
-                        bullets.append(str(item).strip())
+                    s = str(item or "").strip()
+                    if s:
+                        bullets.append(s)
             elif bt in ("kp", "p"):
-                c = (b.get("c") or "").strip()
+                c = str(b.get("c") or "").strip()
                 if c:
+                    bullets.append(c)
+            elif bt == "eq":
+                c = str(b.get("c") or "").strip()
+                if not c:
+                    continue
+                if bullets:
+                    # Glue equation to the preceding bullet so labels
+                    # like "Cost of Living Index =" carry their formula.
+                    bullets[-1] = f"{bullets[-1]} {c}"
+                else:
                     bullets.append(c)
     return matched_ids, bullets
