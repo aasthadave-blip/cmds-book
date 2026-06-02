@@ -946,6 +946,94 @@ def regenerate_book_task(
                     "original_number_count": qc.original_number_count,
                 }
 
+            # ─── RECAP post-loop: standalone-section RENAME promotion ──
+            # Some textbooks extract Konnect / Note / Info Edge / Info Bytes
+            # as SIBLING SECTIONS instead of inline callouts. For these,
+            # take the regenerated section's content, fold it as a renamed
+            # subsection (Fun Fact / Remember / Food for Thought / …) at
+            # the END of the preceding topic, and drop the source section.
+            # Pure post-processing — no extra LLM call, no prompt directive.
+            promote_skip_ids: list[str] = []
+            try:
+                from app.services.recap_config import active_rename_rules
+
+                active_renames = active_rename_rules(rp.recap_rule_ids or [])
+                if active_renames:
+                    # Build a lowercase source-label → target-label map.
+                    label_to_target: dict[str, str] = {}
+                    for r in active_renames:
+                        for src in r["source_labels"]:
+                            label_to_target[src.lower()] = r["label"]
+
+                    # Document-order sid list + title lookup
+                    section_order = [s.section_id for s in sections]
+                    sid_to_title = {
+                        s.section_id: (s.title or "").strip() for s in sections
+                    }
+
+                    for idx, sid in enumerate(section_order):
+                        title = sid_to_title.get(sid, "")
+                        target_label = label_to_target.get(title.lower())
+                        if not target_label:
+                            continue
+                        # Find preceding "real" topic — skip other promote
+                        # candidates and PTR sources.
+                        prev_idx = idx - 1
+                        while prev_idx >= 0:
+                            prev_sid = section_order[prev_idx]
+                            prev_title = sid_to_title.get(prev_sid, "")
+                            is_rename_source = (
+                                prev_title.lower() in label_to_target
+                            )
+                            is_ptr_source = prev_sid in ptr_source_section_ids
+                            if not is_rename_source and not is_ptr_source:
+                                break
+                            prev_idx -= 1
+                        if prev_idx < 0:
+                            # No preceding topic — leave as-is (rare; first
+                            # section being a Konnect would be unusual).
+                            continue
+                        target_sid = section_order[prev_idx]
+
+                        # Extract bullets from THIS section's regenerated
+                        # blocks. Lists → items; p/kp → bullets verbatim.
+                        src_blocks = blocks_by_section.get(sid, []) or []
+                        bullets: list[str] = []
+                        for b in src_blocks:
+                            bt = b.get("t")
+                            if bt == "list":
+                                for item in (b.get("items") or []):
+                                    if item and str(item).strip():
+                                        bullets.append(str(item).strip())
+                            elif bt in ("p", "kp"):
+                                c = (b.get("c") or "").strip()
+                                if c:
+                                    bullets.append(c)
+                        if not bullets:
+                            continue
+
+                        # Append renamed subsection to target topic's blocks
+                        target_blocks = list(blocks_by_section.get(target_sid, []) or [])
+                        target_blocks.append({"t": "h3", "c": target_label})
+                        target_blocks.append({"t": "list", "items": bullets})
+                        blocks_by_section[target_sid] = target_blocks
+
+                        # Mark source for removal
+                        promote_skip_ids.append(sid)
+                        logger.info(
+                            "recap: promoted standalone %s → %s subsection in %s",
+                            sid,
+                            target_label,
+                            target_sid,
+                        )
+
+                # Remove promoted source sections from this run's output
+                for sid in promote_skip_ids:
+                    blocks_by_section.pop(sid, None)
+                    qc_drift.pop(sid, None)
+            except Exception as e:
+                logger.warning("recap promote post-loop skipped: %s", e)
+
             # ─── RECAP post-loop: orphan bullet fallback ──────────
             # If any chapter-end bullets did not match any section above
             # the threshold, append them as a synthetic chapter-end
@@ -976,19 +1064,22 @@ def regenerate_book_task(
                 # dict mutated in place and skips the UPDATE.
                 from sqlalchemy.orm.attributes import flag_modified
                 existing_blocks = dict(regen_row.blocks_by_section or {})
-                # PTR REDISTRIBUTE FIX: drop any PTR source sections that
-                # were carried forward by the API seed (or saved by a prior
-                # regen) before merging this run's results. Without this,
-                # the redistributed PTR section would still appear in the
-                # final output because the seed retained its prior copy.
-                for sid in ptr_source_section_ids:
+                # PTR REDISTRIBUTE + RENAME PROMOTE FIX: drop any source
+                # sections that were carried forward by the API seed (or
+                # saved by a prior regen) before merging this run's
+                # results. Without this, the redistributed PTR section OR
+                # promoted Konnect/Note/Info-Edge/Info-Bytes sections
+                # would still appear in the final output because the seed
+                # retained their prior copies.
+                drop_ids = set(ptr_source_section_ids) | set(promote_skip_ids)
+                for sid in drop_ids:
                     existing_blocks.pop(sid, None)
                 existing_blocks.update(blocks_by_section)
                 regen_row.blocks_by_section = existing_blocks
                 flag_modified(regen_row, "blocks_by_section")
 
                 existing_qc = dict(regen_row.qc_drift or {})
-                for sid in ptr_source_section_ids:
+                for sid in drop_ids:
                     existing_qc.pop(sid, None)
                 existing_qc.update(qc_drift)
                 regen_row.qc_drift = existing_qc
