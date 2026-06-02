@@ -30,7 +30,7 @@ priority order — top wins:
 
   PRIORITY 3  →  ACTIVE RECAP DIRECTIVES
                  {recap_renames_directive} and {recap_keypoints_directive}
-                 (renames + per-topic Points to Remember). Applied
+                 (renames + per-topic Key Takeaways). Applied
                  after custom instructions, unless a custom instruction
                  explicitly disables a directive.
 
@@ -304,13 +304,13 @@ When a RENAME directive is present:
   • If NO source-labeled content exists in this section, do nothing
     (skip the subsection entirely — never invent a placeholder).
 
-──── POINTS TO REMEMBER directive (per-topic, pre-assigned) ────
+──── KEY TAKEAWAYS directive (per-topic, pre-assigned) ────
 {recap_keypoints_directive}
 
-When a POINTS TO REMEMBER directive is present:
+When a KEY TAKEAWAYS directive is present:
   • At the END of the section's regenerated blocks (AFTER any
     RENAME subsections above), APPEND:
-        {{ "type": "heading",   "content": "Points to Remember" }}
+        {{ "type": "heading",   "content": "Key Takeaways" }}
         {{ "type": "list_item", "content": "<bullet 1, lightly paraphrased>" }}
         {{ "type": "list_item", "content": "<bullet 2>" }}
         ...
@@ -323,13 +323,13 @@ When a POINTS TO REMEMBER directive is present:
   • Light paraphrase OK to match the tone parameter; numbers,
     technical terms, and named entities stay verbatim (N3, N4).
   • Downstream renderer emits the heading as
-    \subsection*{{Points to Remember}}.
+    \subsection*{{Key Takeaways}}.
 
 ORDER OF RECAP SUBSECTIONS (when multiple are present):
   1. All regenerated original blocks first
   2. RENAME subsections (Fun Fact, Food for Thought, Remember) in
      the order their source labels appeared
-  3. POINTS TO REMEMBER subsection (always last)
+  3. KEY TAKEAWAYS subsection (always last)
 
 ═══════════════════════════════════════════════════════════════════
 BLOCK COUNT INTEGRITY (with explicit exemptions)
@@ -344,7 +344,7 @@ FORBIDDEN BY DEFAULT:
 
 EXEMPTIONS (extra/changed output blocks ARE permitted):
   X1. type=list block expands into M list_item outputs (B4).
-  X2. RECAP DIRECTIVES (RENAME and/or POINTS TO REMEMBER) emit
+  X2. RECAP DIRECTIVES (RENAME and/or KEY TAKEAWAYS) emit
       additional heading + list_item blocks at section end.
   X3. Custom instructions explicitly request expansion / new
       content (P2 override). Prefix the first added block with
@@ -398,7 +398,7 @@ Return ONLY valid JSON. No markdown fences. No preamble. No commentary.
     {{ "type": "list_item", "content": "Paraphrased Info Edge or Info Bytes bullet." }},
     {{ "type": "heading",   "content": "Remember" }},
     {{ "type": "list_item", "content": "Paraphrased Note bullet." }},
-    {{ "type": "heading",   "content": "Points to Remember" }},
+    {{ "type": "heading",   "content": "Key Takeaways" }},
     {{ "type": "list_item", "content": "Pre-assigned chapter-end bullet." }}
   ]
 }}
@@ -444,10 +444,10 @@ Verify each item. Re-do output if any fails.
   ☐ Every source-labeled block named in RENAME directive REMOVED
     from mid-section and PROMOTED to subsection at section end (X4)
   ☐ Renamed subsection bullets paraphrased (not verbatim copy)
-  ☐ POINTS TO REMEMBER bullets emitted EXACTLY as provided
+  ☐ KEY TAKEAWAYS bullets emitted EXACTLY as provided
     (no additions, no drops)
   ☐ Recap subsections appear AFTER all regenerated original blocks
-  ☐ Order: RENAME subsections first, POINTS TO REMEMBER last
+  ☐ Order: RENAME subsections first, KEY TAKEAWAYS last
 
   PRIORITY 4 CHECKS (block rules)
   ☐ Block count matches input + accounted exemptions
@@ -484,9 +484,9 @@ COMMON MISTAKES TO AVOID
   mid-section when their RENAME directive is active (X4 fail —
   must promote to section-end subsection and remove from original
   position)
-✗ Inventing POINTS TO REMEMBER bullets that weren't in the
+✗ Inventing KEY TAKEAWAYS bullets that weren't in the
   directive (N1 fail)
-✗ Dropping POINTS TO REMEMBER bullets that WERE in the directive
+✗ Dropping KEY TAKEAWAYS bullets that WERE in the directive
   (recap fail)
 ✗ Splitting one source body paragraph into two output bodies
   (no matching exemption)

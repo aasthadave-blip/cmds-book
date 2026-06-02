@@ -14,7 +14,7 @@ Two distinct mechanisms:
        sections get DETECTED and their bullets extracted.
      - Each bullet is assigned to ONE section via deterministic Jaccard
        keyword overlap (no LLM call, no double-assignment).
-     - The receiving section gets the bullet rendered as a "Key Points"
+     - The receiving section gets the bullet rendered as a "Key Takeaways"
        subsection (heading + list) at section end.
      - Orphan bullets (no good section match) get appended at chapter end.
      - The source chapter-end section is removed from regen output.
@@ -72,7 +72,7 @@ RECAP_RULES: list[dict[str, Any]] = [
     },
     {
         "id": "points_to_remember",
-        "label": "Points to Remember",
+        "label": "Key Takeaways",
         "kind": "redistribute",
         # Section TITLE patterns that flag the source chapter-end section
         # to extract bullets from. Matched case-insensitively, substring.
@@ -83,14 +83,13 @@ RECAP_RULES: list[dict[str, Any]] = [
             "Chapter Summary",
         ],
         # Heading text for the orphan fallback at chapter end
-        "orphan_fallback_heading": "Points to Remember",
+        "orphan_fallback_heading": "Key Takeaways",
         "description": (
             "Take chapter-end Points to Remember / Summary / Key Takeaways "
             "bullets, assign each to its best-matching topic via keyword "
-            "overlap (no double-assignment), and embed as a 'Points to "
-            "Remember' subsection at the receiving section's end. Source "
-            "chapter-end section is removed. Orphan bullets appended at "
-            "chapter end."
+            "overlap (no double-assignment), and embed as a 'Key Takeaways' "
+            "subsection at the receiving section's end. Source chapter-end "
+            "section is removed. Orphan bullets appended at chapter end."
         ),
     },
 ]
@@ -129,7 +128,7 @@ def render_renames_directive(active_ids: list[str]) -> str:
     return "\n".join(lines)
 
 
-def render_keypoints_directive(assigned_bullets: list[str], label: str = "Points to Remember") -> str:
+def render_keypoints_directive(assigned_bullets: list[str], label: str = "Key Takeaways") -> str:
     """Render the {recap_keypoints_directive} substitution for THIS section.
 
     Only populated when the worker pre-assigned bullets to this section.
