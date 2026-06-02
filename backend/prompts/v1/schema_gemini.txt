@@ -76,7 +76,7 @@ Examples, Exercises, Illustrations, Activities, etc. that appear INSIDE a theory
 |---|---|---|---|---|---|
 | **A — Questions** | EXAMPLE, Worked Example, Solved Example, Exercise N.M, Problem, Practice Problem, Practice, In-text Question, Drill, Workout | `type="subsection"` | `["questions"]` | yes | question pipeline |
 | **B — Theory aid** | Illustration, Progress Check, Activity, Try It, Quick Check, Test Yourself, Self-Check, Check Your Understanding | `type="subsection"` | `["theory"]` | no | theory pipeline (as body) |
-| **C — Inline callout** | Note, Remember, DO YOU KNOW, Thinking Corner, Key Point, Recall, Errata, Note to Teacher, Scientific Cryptic, Konnect | **NO schema entry** | n/a | n/a | theory pipeline (as `key_point` inside parent's body) |
+| **C — Inline callout** | Note, Remember, DO YOU KNOW, Thinking Corner, Key Point, Recall, Errata, Note to Teacher, Scientific Cryptic, Konnect, Info Edge, Info Bytes | **NO schema entry** | n/a | n/a | theory pipeline (as `key_point` inside parent's body) |
 
 If a label doesn't match anything above:
 - Asks reader to do/solve/answer → default to (A)
