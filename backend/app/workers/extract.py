@@ -857,9 +857,14 @@ def regenerate_book_task(
                 assign_bullets_to_sections,
                 detect_redistribute_source_sections,
             )
-            from app.services.regenerator import is_recap_enabled
-
-            if is_recap_enabled() and rp.recap_rule_ids:
+            # Worker recap pre-loop fires whenever the request opts in via
+            # recap_rule_ids. We no longer gate on the prompt-version env
+            # var: the live regenerator.txt is the source of truth (the
+            # operator can swap it for v3 content to enable recap-aware
+            # LLM behavior). If the live prompt happens to be v1, recap
+            # rule ids will still be processed by the worker but the LLM
+            # will not honor them — harmless, just no recap blocks emitted.
+            if rp.recap_rule_ids:
                 section_tuples = [
                     (s.section_id, s.title or "", list(s.blocks or []))
                     for s in sections
