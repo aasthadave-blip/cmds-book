@@ -644,8 +644,13 @@ async def build_final_merge(
             for sid, blocks in bbs.items():
                 if sid in theory_regen_blocks:
                     continue  # already covered by newer regen
-                if not isinstance(blocks, list) or not blocks:
+                if not isinstance(blocks, list):
                     continue
+                # Note: empty list `[]` IS allowed in — it's the
+                # suppression sentinel written by the recap worker for
+                # PTR-redistributed and rename-promoted source sections.
+                # The main loop later detects sid present with empty list
+                # and skips the section entirely (no fallback to original).
                 theory_regen_blocks[sid] = blocks
                 theory_regen_meta[sid] = {
                     "regen_id": str(r.id),
@@ -965,6 +970,34 @@ async def build_final_merge(
             "regen_meta": None,
             "embedded_figures": [],
             "questions": question_dicts,
+        })
+
+    # SYNTHETIC RECAP SECTIONS: when the recap worker writes orphan-
+    # fallback section(s) into blocks_by_section (e.g.
+    # zzz-key-takeaways-orphan-fallback), they aren't part of the
+    # original schema → the main loop above didn't emit them. Append
+    # them at the end of the document so orphan PTR bullets surface.
+    emitted_sids = {s["section_id"] for s in out_sections}
+    for sid, blocks in theory_regen_blocks.items():
+        if sid in emitted_sids:
+            continue
+        if not blocks:
+            continue  # suppression sentinel — never emit
+        # Derive a heading from the first h3 block, else from the sid.
+        heading_title = sid
+        for b in blocks:
+            if b.get("t") == "h3" and b.get("c"):
+                heading_title = b["c"]
+                break
+        out_sections.append({
+            "section_id": sid,
+            "section_title": heading_title,
+            "level": 1,
+            "blocks": blocks,
+            "block_source": "regen",
+            "regen_meta": theory_regen_meta.get(sid),
+            "embedded_figures": [],
+            "questions": [],
         })
 
     # Final pass: within each section, match chip placeholders with their
