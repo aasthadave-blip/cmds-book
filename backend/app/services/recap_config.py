@@ -50,11 +50,13 @@ RECAP_RULES: list[dict[str, Any]] = [
         "id": "food_for_thought",
         "label": "Food for Thought",
         "kind": "rename",
-        "source_labels": ["Info Edge"],
+        # Both source labels map to the same target — the prompt's RENAME
+        # directive merges their bullets under one heading.
+        "source_labels": ["Info Edge", "Info Bytes"],
         "description": (
-            "Find blocks labeled/styled as 'Info Edge' inside a section, "
-            "remove them, and emit a 'Food for Thought' subsection at "
-            "section end. If absent, skip."
+            "Find blocks labeled/styled as 'Info Edge' or 'Info Bytes' "
+            "inside a section, remove them, and emit a 'Food for "
+            "Thought' subsection at section end. If absent, skip."
         ),
     },
     {
@@ -69,8 +71,8 @@ RECAP_RULES: list[dict[str, Any]] = [
         ),
     },
     {
-        "id": "key_points",
-        "label": "Key Points",
+        "id": "points_to_remember",
+        "label": "Points to Remember",
         "kind": "redistribute",
         # Section TITLE patterns that flag the source chapter-end section
         # to extract bullets from. Matched case-insensitively, substring.
@@ -81,13 +83,14 @@ RECAP_RULES: list[dict[str, Any]] = [
             "Chapter Summary",
         ],
         # Heading text for the orphan fallback at chapter end
-        "orphan_fallback_heading": "Key Points",
+        "orphan_fallback_heading": "Points to Remember",
         "description": (
             "Take chapter-end Points to Remember / Summary / Key Takeaways "
             "bullets, assign each to its best-matching topic via keyword "
-            "overlap (no double-assignment), and embed as a 'Key Points' "
-            "subsection at the receiving section's end. Source chapter-end "
-            "section is removed. Orphan bullets appended at chapter end."
+            "overlap (no double-assignment), and embed as a 'Points to "
+            "Remember' subsection at the receiving section's end. Source "
+            "chapter-end section is removed. Orphan bullets appended at "
+            "chapter end."
         ),
     },
 ]
@@ -126,7 +129,7 @@ def render_renames_directive(active_ids: list[str]) -> str:
     return "\n".join(lines)
 
 
-def render_keypoints_directive(assigned_bullets: list[str], label: str = "Key Points") -> str:
+def render_keypoints_directive(assigned_bullets: list[str], label: str = "Points to Remember") -> str:
     """Render the {recap_keypoints_directive} substitution for THIS section.
 
     Only populated when the worker pre-assigned bullets to this section.

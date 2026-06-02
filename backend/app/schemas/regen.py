@@ -26,9 +26,10 @@ class RegenParams(BaseModel):
 
 INTENSITY_MAP: dict[str, str] = {
     "light": (
-        "LIGHT — 20-30% change. Swap synonyms and tweak sentence openings only. "
-        "Most sentences must look nearly identical to the original. "
-        "Do NOT restructure paragraphs or change the overall flow."
+        "LIGHT — 30-40% change (floor: never less than 30% surface change). "
+        "Swap synonyms, vary sentence openings, restructure about 1 in 3 "
+        "sentences. Even at 'light', honor the Original Rephrasing Mandate's "
+        "30% minimum — no near-verbatim output."
     ),
     "moderate": (
         "MODERATE — 40-60% change. Restructure sentences, vary vocabulary significantly, "
@@ -76,7 +77,13 @@ ANALOGY_MAP: dict[str, str] = {
 }
 
 STRUCTURE_MAP: dict[str, str] = {
-    "identical": "IDENTICAL — headers and order must exactly match the original",
+    "identical": (
+        "IDENTICAL — preserve heading hierarchy and section ordering. "
+        "EXCEPT for the B2 mandated renames (source 'Examples' / "
+        "'Worked Examples' / 'Sample Problems' / 'Solved Examples' → "
+        "'Let's Solve'; source 'Concepts' → 'Concepts'). All other "
+        "headings stay verbatim."
+    ),
     "reorganize": "minor reorganization allowed for better pedagogical flow",
 }
 
@@ -141,7 +148,7 @@ def param_descriptors(
         "recap_renames_directive": render_renames_directive(recap_ids),
         "recap_keypoints_directive": render_keypoints_directive(
             assigned_keypoints or [],
-            label="Key Points",
+            label="Points to Remember",
         ),
     }
 
