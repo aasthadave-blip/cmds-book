@@ -976,11 +976,20 @@ def regenerate_book_task(
                 # dict mutated in place and skips the UPDATE.
                 from sqlalchemy.orm.attributes import flag_modified
                 existing_blocks = dict(regen_row.blocks_by_section or {})
+                # PTR REDISTRIBUTE FIX: drop any PTR source sections that
+                # were carried forward by the API seed (or saved by a prior
+                # regen) before merging this run's results. Without this,
+                # the redistributed PTR section would still appear in the
+                # final output because the seed retained its prior copy.
+                for sid in ptr_source_section_ids:
+                    existing_blocks.pop(sid, None)
                 existing_blocks.update(blocks_by_section)
                 regen_row.blocks_by_section = existing_blocks
                 flag_modified(regen_row, "blocks_by_section")
 
                 existing_qc = dict(regen_row.qc_drift or {})
+                for sid in ptr_source_section_ids:
+                    existing_qc.pop(sid, None)
                 existing_qc.update(qc_drift)
                 regen_row.qc_drift = existing_qc
                 flag_modified(regen_row, "qc_drift")
