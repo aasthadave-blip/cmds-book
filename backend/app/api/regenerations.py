@@ -170,7 +170,20 @@ async def rerun_section(
     body: dict[str, Any] = Body(default={}),
     session: AsyncSession = Depends(get_session),
 ) -> dict:
-    """Re-run regeneration for a single section with optional custom instructions."""
+    """Re-run regeneration for a single section with optional custom instructions.
+
+    Recap-aware: if the regen's recap_rule_ids opted into points_to_remember
+    or any rename rule, this endpoint MUST mirror what the worker pre-loop
+    would have done for this section:
+
+      - PTR/Summary/Key-Takeaways source section  → write [] sentinel
+        (no Gemini call), bullets stay redistributed in their target topics
+      - Konnect/Note/Info-Edge/Info-Bytes source  → write [] sentinel
+      - Regular topic that received Jaccard-assigned PTR bullets →
+        recompute assignment + pass assigned_keypoints to regenerate_section
+        so the LLM keeps the "Key Takeaways" subsection in this section's
+        output (otherwise a per-section rerun silently drops it)
+    """
     regen = await session.get(Regeneration, regen_id)
     if regen is None:
         raise HTTPException(404, detail="Regeneration not found")
@@ -191,14 +204,104 @@ async def rerun_section(
     custom = body.get("custom_instructions", "")
     if custom:
         base_params["custom_instructions"] = custom
+    # recap_rule_ids might leak through base_params; that's fine — keep them
     params = RegenParams(**base_params)
+    recap_ids = list(params.recap_rule_ids or [])
 
+    # ─── Recap-aware pre-checks ──────────────────────────────────────
+    assigned_keypoints: list[str] = []
+    if recap_ids:
+        from app.services.recap_config import (
+            active_redistribute_rules,
+            active_rename_rules,
+            assign_bullets_to_sections,
+            detect_redistribute_source_sections,
+        )
+
+        # Load ALL sections for the book to mirror worker pre-loop scope.
+        all_secs_result = await session.execute(
+            select(Section).where(Section.book_id == regen.book_id).order_by(Section.section_id)
+        )
+        all_secs = list(all_secs_result.scalars().all())
+        section_tuples = [
+            (s.section_id, s.title or "", list(s.blocks or []))
+            for s in all_secs
+        ]
+
+        # 1. Is THIS section a PTR/Summary/Key-Takeaways source?
+        if active_redistribute_rules(recap_ids):
+            src_ids, _bullets = detect_redistribute_source_sections(section_tuples, recap_ids)
+            if sec.section_id in src_ids:
+                updated = dict(regen.blocks_by_section or {})
+                updated[sec.section_id] = []
+                regen.blocks_by_section = updated
+                regen_qc = dict(regen.qc_drift or {})
+                regen_qc[sec.section_id] = {
+                    "pass": True,
+                    "drifted": [],
+                    "note": "section bullets redistributed via recap (rerun)",
+                }
+                regen.qc_drift = regen_qc
+                from sqlalchemy.orm.attributes import flag_modified
+                flag_modified(regen, "blocks_by_section")
+                flag_modified(regen, "qc_drift")
+                await session.flush()
+                return {
+                    "section_id": section_id,
+                    "blocks": [],
+                    "suppressed": True,
+                    "reason": "ptr_source_redistributed",
+                }
+
+        # 2. Is THIS section a rename source (Konnect/Note/Info-Edge/Info-Bytes)?
+        label_to_target: dict[str, str] = {}
+        for r in active_rename_rules(recap_ids):
+            for src in r["source_labels"]:
+                label_to_target[src.lower()] = r["label"]
+        if label_to_target.get((sec.title or "").strip().lower()):
+            updated = dict(regen.blocks_by_section or {})
+            updated[sec.section_id] = []
+            regen.blocks_by_section = updated
+            regen_qc = dict(regen.qc_drift or {})
+            regen_qc[sec.section_id] = {
+                "pass": True,
+                "drifted": [],
+                "note": "section promoted into preceding topic (rerun)",
+            }
+            regen.qc_drift = regen_qc
+            from sqlalchemy.orm.attributes import flag_modified
+            flag_modified(regen, "blocks_by_section")
+            flag_modified(regen, "qc_drift")
+            await session.flush()
+            return {
+                "section_id": section_id,
+                "blocks": [],
+                "suppressed": True,
+                "reason": "rename_source_promoted",
+            }
+
+        # 3. Regular topic — recompute Jaccard assignment so the LLM gets
+        #    the "Key Takeaways" directive for any bullets that belong
+        #    to THIS topic.
+        if active_redistribute_rules(recap_ids):
+            src_ids, bullets = detect_redistribute_source_sections(section_tuples, recap_ids)
+            if bullets:
+                target_pool = [
+                    (sid, title, blocks)
+                    for sid, title, blocks in section_tuples
+                    if sid not in src_ids
+                ]
+                per_section, _orphans = assign_bullets_to_sections(bullets, target_pool)
+                assigned_keypoints = per_section.get(sec.section_id, [])
+
+    # ─── Normal regen with optional assigned_keypoints ───────────────
     from app.services.regenerator import regenerate_section
     new_blocks = await regenerate_section(
         section_id=sec.section_id,
         section_title=sec.title,
         blocks=list(sec.blocks or []),
         params=params,
+        assigned_keypoints=assigned_keypoints or None,
     )
 
     # Patch blocks_by_section in-place
