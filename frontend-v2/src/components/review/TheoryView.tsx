@@ -13,6 +13,7 @@ import type { Section } from '../../api/sections';
 import type { Figure } from '../../api/figures';
 import { figureImageUrl } from '../../api/figures';
 import { Icon } from '../Icon';
+import { MathMarkdown } from '../MathMarkdown';
 
 type Block =
   | { t: 'p'; c: string }
@@ -377,6 +378,17 @@ function BlockRender({
     );
   }
   if (t === 'eq') {
+    const c = (block as { c?: string }).c ?? '';
+    // Same prose-vs-math heuristic as PreviewPage / ComposerPage.
+    const looksLikeProse = (() => {
+      if (c.includes('$')) return false;
+      const wordTokens = c.match(/\b[a-zA-Z]{3,}\b/g) || [];
+      if (wordTokens.length >= 3) return true;
+      if (/[a-z],\s+[a-z]/i.test(c)) return true;
+      if (/\.\s+[A-Z]/.test(c)) return true;
+      return false;
+    })();
+    const rendered = looksLikeProse ? c : (c.includes('$') ? c : `$$${c}$$`);
     return (
       <div
         style={{
@@ -384,13 +396,13 @@ function BlockRender({
           background: 'var(--indigo-50)',
           border: '1px solid var(--indigo-100)',
           borderRadius: 10,
-          fontFamily: 'var(--font-mono)',
+          fontFamily: looksLikeProse ? 'inherit' : 'var(--font-mono)',
           fontSize: 14,
           color: 'var(--indigo-700)',
           margin: '10px 0 14px',
         }}
       >
-        {(block as { c?: string }).c}
+        <MathMarkdown>{rendered}</MathMarkdown>
       </div>
     );
   }
