@@ -379,19 +379,7 @@ function BlockRender({
   }
   if (t === 'eq') {
     const c = (block as { c?: string }).c ?? '';
-    // Same prose-vs-math heuristic as PreviewPage / ComposerPage.
-    const looksLikeProse = (() => {
-      if (c.includes('$')) return false;
-      // LaTeX-command override — force math when these appear.
-      if (/\\(frac|times|cdot|sum|int|sqrt|sin|cos|tan|log|ln|alpha|beta|gamma|delta|theta|lambda|mu|pi|sigma|phi|omega|to|Rightarrow|leftarrow|rightarrow|leq|geq|neq|approx|infty|partial|nabla)\b/.test(c)) return false;
-      if (/[\^_]\{/.test(c)) return false;
-      const wordTokens = c.match(/\b[a-zA-Z]{3,}\b/g) || [];
-      if (wordTokens.length >= 3) return true;
-      if (/[a-z],\s+[a-z]/i.test(c)) return true;
-      if (/\.\s+[A-Z]/.test(c)) return true;
-      return false;
-    })();
-    const rendered = looksLikeProse ? c : (c.includes('$') ? c : `$$${c}$$`);
+    // RAW OCR rendering — display exactly what was extracted.
     return (
       <div
         style={{
@@ -399,13 +387,14 @@ function BlockRender({
           background: 'var(--indigo-50)',
           border: '1px solid var(--indigo-100)',
           borderRadius: 10,
-          fontFamily: looksLikeProse ? 'inherit' : 'var(--font-mono)',
+          fontFamily: 'var(--font-mono)',
           fontSize: 14,
           color: 'var(--indigo-700)',
           margin: '10px 0 14px',
+          whiteSpace: 'pre-wrap',
         }}
       >
-        <MathMarkdown>{rendered}</MathMarkdown>
+        {c}
       </div>
     );
   }
@@ -577,8 +566,8 @@ function BlockRender({
         }}
       >
         {items.map((it, i) => (
-          <li key={i} style={{ marginBottom: 6 }}>
-            <MathMarkdown inline>{strip(it)}</MathMarkdown>
+          <li key={i} style={{ marginBottom: 6, whiteSpace: 'pre-wrap' }}>
+            {strip(it)}
           </li>
         ))}
       </Tag>
