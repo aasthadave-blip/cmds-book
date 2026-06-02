@@ -847,7 +847,7 @@ def regenerate_book_task(
         # matching topic via deterministic Jaccard match (no extra LLM
         # call, no double-assignment), then SKIP those source sections
         # from the per-section regen output. Orphan bullets get appended
-        # at chapter end as a fallback "Points to Remember" subsection.
+        # at chapter end as a fallback "Key Takeaways" subsection.
         per_section_keypoints: dict[str, list[str]] = {}
         orphan_keypoints: list[str] = []
         ptr_source_section_ids: set[str] = set()
@@ -949,21 +949,21 @@ def regenerate_book_task(
             # ─── RECAP post-loop: orphan bullet fallback ──────────
             # If any chapter-end bullets did not match any section above
             # the threshold, append them as a synthetic chapter-end
-            # "Points to Remember" section so nothing is silently dropped.
+            # "Key Takeaways" section so nothing is silently dropped.
             if orphan_keypoints:
                 fallback_blocks = [
-                    {"t": "h3", "c": "Points to Remember"},
+                    {"t": "h3", "c": "Key Takeaways"},
                     {"t": "list", "items": list(orphan_keypoints)},
                 ]
                 # Use a stable synthetic id that sorts to the very end.
-                blocks_by_section["zzz-points-to-remember-orphan-fallback"] = fallback_blocks
-                qc_drift["zzz-points-to-remember-orphan-fallback"] = {
+                blocks_by_section["zzz-key-takeaways-orphan-fallback"] = fallback_blocks
+                qc_drift["zzz-key-takeaways-orphan-fallback"] = {
                     "pass": True,
                     "drifted": [],
                     "note": "synthetic orphan-fallback from recap redistribute",
                 }
                 logger.info(
-                    "recap: appended %d orphan bullets under fallback Points to Remember section",
+                    "recap: appended %d orphan bullets under fallback Key Takeaways section",
                     len(orphan_keypoints),
                 )
 

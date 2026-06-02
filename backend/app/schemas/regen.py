@@ -148,7 +148,7 @@ def param_descriptors(
         "recap_renames_directive": render_renames_directive(recap_ids),
         "recap_keypoints_directive": render_keypoints_directive(
             assigned_keypoints or [],
-            label="Points to Remember",
+            label="Key Takeaways",
         ),
     }
 
