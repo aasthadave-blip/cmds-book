@@ -43,6 +43,7 @@ import { CSS } from '@dnd-kit/utilities';
 import { API_BASE, ApiError, req } from '../api/client';
 import { useBook } from '../api/books';
 import { Icon } from '../components/Icon';
+import { MathMarkdown } from '../components/MathMarkdown';
 
 type Block = { t: string; [k: string]: unknown };
 
@@ -711,7 +712,23 @@ function BlockRender({ block }: { block: Block }) {
       <div style={{ fontSize: 13 }}>{c}</div>
     </div>
   );
-  if (t === 'eq') return <div style={{ background: 'var(--bg-tint)', padding: '8px 10px', borderRadius: 6, fontFamily: 'var(--font-mono)', fontSize: 13, color: 'var(--indigo-700)' }}>{c}</div>;
+  if (t === 'eq') {
+    // Same prose-vs-math heuristic as PreviewPage — see comments there.
+    const looksLikeProse = (() => {
+      if (c.includes('$')) return false;
+      const wordTokens = c.match(/\b[a-zA-Z]{3,}\b/g) || [];
+      if (wordTokens.length >= 3) return true;
+      if (/[a-z],\s+[a-z]/i.test(c)) return true;
+      if (/\.\s+[A-Z]/.test(c)) return true;
+      return false;
+    })();
+    const rendered = looksLikeProse ? c : (c.includes('$') ? c : `$$${c}$$`);
+    return (
+      <div style={{ background: 'var(--bg-tint)', padding: '8px 10px', borderRadius: 6, fontSize: 13, color: 'var(--indigo-700)', fontFamily: looksLikeProse ? 'inherit' : 'var(--font-mono)' }}>
+        <MathMarkdown>{rendered}</MathMarkdown>
+      </div>
+    );
+  }
   if (t === 'def') {
     const term = String((block as { term?: string }).term ?? '');
     return <div><strong>{term}: </strong>{c}</div>;

@@ -472,17 +472,28 @@ function BlockRow({ block }: { block: Block }) {
       </div>
     </div>
   );
-  if (t === 'eq') return (
-    <div style={{ background: 'var(--bg-tint)', padding: '10px 14px', borderRadius: 6, marginBottom: 12, fontSize: 14, color: 'var(--indigo-700)', textAlign: 'center', fontFamily: 'var(--font-mono)' }}>
-      {/* Render the content directly through MathMarkdown — math wrapped
-          in $...$/$$...$$ renders as KaTeX, plain text stays as text.
-          Earlier this auto-wrapped bare content in $$...$$ which broke
-          prose that the LLM mistakenly put into eq blocks (it rendered
-          as italic math with eaten spaces). Matches TheoryView /
-          ComposerPage which never auto-wrap. */}
-      <MathMarkdown>{c}</MathMarkdown>
-    </div>
-  );
+  if (t === 'eq') {
+    // Smart wrap: detect whether the eq block content is REAL math
+    // (short, operator-heavy, few words) vs. PROSE that the LLM
+    // mistakenly emitted into an eq block (sentences, many words).
+    //   • Real math  → wrap in $$...$$  → renders as typeset KaTeX
+    //   • Prose      → render plain text → readable, no broken italic
+    //   • Already-delimited content ($...$ or $$...$$) → render verbatim
+    const looksLikeProse = (() => {
+      if (c.includes('$')) return false;            // already delimited → trust it
+      const wordTokens = c.match(/\b[a-zA-Z]{3,}\b/g) || [];
+      if (wordTokens.length >= 3) return true;       // 3+ word-like tokens → prose
+      if (/[a-z],\s+[a-z]/i.test(c)) return true;    // "x, y" inline comma + word → prose
+      if (/\.\s+[A-Z]/.test(c)) return true;         // ". A" sentence break → prose
+      return false;
+    })();
+    const rendered = looksLikeProse ? c : (c.includes('$') ? c : `$$${c}$$`);
+    return (
+      <div style={{ background: 'var(--bg-tint)', padding: '10px 14px', borderRadius: 6, marginBottom: 12, fontSize: 14, color: 'var(--indigo-700)', textAlign: 'center', fontFamily: looksLikeProse ? 'inherit' : undefined }}>
+        <MathMarkdown>{rendered}</MathMarkdown>
+      </div>
+    );
+  }
   if (t === 'def') {
     const term = String((block as { term?: string }).term ?? '');
     return (
