@@ -24,6 +24,29 @@ Both numbered and unnumbered headings are equally important.
   - `content_types: ["theory"]`, `type: "subsection"`
   - DO NOT use this rule for inline bullet/list items inside a paragraph — only when the lettered/numbered line is visually distinct (own line, larger font, or introduces a sub-topic followed by explanatory prose).
 
+  **DO NOT promote a numbered/lettered line to a subsection** in these cases (the patterns below are common over-promotion failure modes — guard against them):
+
+  1. **It's an MCQ question stem.** Signals:
+     - The line is followed by `(A)`, `(B)`, `(C)`, `(D)` answer choices (or `(1)`, `(2)`, `(3)`, `(4)`) on the same page or adjacent column. These are answer options, NOT theory sub-headings.
+     - The line ends with `?` (a question).
+     - The line is one of MANY similarly-numbered items (1, 2, 3, … usually ≥4 in a row) under a section whose title is a question-bank style heading like `Classical Thinking`, `Critical Thinking`, `MCQ`, `Practice Problems`, `Exercise`, `Questions`, `Problems`, `Drill`, `Practice`, `Workout`.
+     → These numbered lines are individual questions that belong to the PARENT's question pool. The parent itself is ONE Cat A subsection with `expected_question_count = N` (count of questions inside). Do NOT emit one subsection per question. NEVER use an id like `<parent>-question-1`, `<parent>-question-2` for individual MCQs.
+
+  2. **It's a TOC bullet inside a "Chapter Outline" / "Contents" / "Table of Contents" section.** Signals:
+     - The numbered line appears under a heading titled `Chapter Outline`, `Outline`, `Contents`, `Table of Contents`, or similar TOC-style label.
+     - The numbered line is a heading-like phrase with NO explanatory prose body between it and the next numbered line (it's a flat bullet list of upcoming topics).
+     - The same topic numbers (e.g. `4.1`, `4.2`, `4.3`) appear elsewhere in the chapter under real section headings that introduce actual content (Quick Review, Classical Thinking, etc.).
+     → The Chapter Outline section itself stays as a single Cat B section with `expected_question_count = 0` and `subsections: []`. The numbered lines inside it are bullet items of a list block, NOT separate subsections. NEVER emit `4.1-theory`, `4.2-theory`, `4.3-theory` style phantoms from a TOC outline.
+
+  3. **It's a styled chapter intro callout box.** Signals:
+     - First content immediately after the chapter heading.
+     - Has a bold/styled title (e.g. `Calculating Curve Lengths: The Power of Definite Integration`).
+     - Followed by a single paragraph of introductory prose tying the chapter together.
+     - No further numbered/lettered structure beneath it; ends and the next real section begins.
+     → This is chapter-level introductory text. Capture as theory content directly under the chapter root. Do NOT emit it as its own subsection.
+
+  The positive rule at the top still applies — if a lettered/numbered line clearly introduces a sub-concept with real explanatory prose underneath, promote it to a subsection as usual. The guards above only block the specific over-promotion failure modes.
+
 Commonly missed (look for them): unnumbered intro before Section 1; biographical sidebars; chapter-end summaries; mid-chapter callouts that introduce a new topic; lettered sub-points `(A) (B) (C)` between examples.
 
 Wrapped titles: a heading that spans two printed lines is ONE heading — capture the full title.
