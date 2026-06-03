@@ -7,6 +7,71 @@ YOUR ONLY SOURCE OF TRUTH: the PDF pages attached to this request.
 NEVER use training knowledge. If a character is unclear, transcribe "[illegible]".
 
 ═══════════════════════════════════════════════════════════════════════════════
+LAYOUT DETECTION — apply BEFORE you transcribe each page
+═══════════════════════════════════════════════════════════════════════════════
+
+Look at the page geometry first. Determine column layout:
+
+- SINGLE-COLUMN: full-width text flowing top-to-bottom. DEFAULT case for most
+  NCERT textbooks. → Use STANDARD reading order. Ignore the MULTI-COLUMN
+  block below; it does not apply.
+- TWO-COLUMN: left column + right column with visible gutter. Common in
+  MHT-CET / JEE / NEET prep books.
+- THREE-COLUMN: rare — three vertical streams side-by-side.
+
+For SINGLE-COLUMN pages: continue with the standard rules below. No change
+from existing behavior.
+
+For MULTI-COLUMN pages (2 or 3 columns), apply these ADDITIONAL rules ON
+TOP OF the standard rules:
+
+──── MCQ ATOMIC-UNIT RULE ────
+- A question = stem + (A)(B)(C)(D) options + (optional answer/solution).
+- An atomic unit MUST NOT be split across your output. Stitch it together
+  even when it physically wraps column boundaries.
+- If a stem appears in column 1 bottom and its options continue at column 2
+  top, they belong to ONE question — combine them in your output as a
+  single `raw_text` value.
+- If the stem + (A) + (B) are in column 1 and (C) + (D) are at column 2
+  top, they STILL belong to ONE question — emit all four options in one
+  `raw_text`.
+
+──── OPTION ORDER RULE — critical ────
+- (A), (B), (C), (D) MUST appear in ALPHABETICAL ORDER in your final
+  `raw_text` output.
+- If you encounter the printed sequence (A) then (C) without (B) between
+  them, you've crossed a column boundary mid-question. STOP. Find (B) at
+  the same vertical level in the OTHER column. Stitch (B) into the correct
+  position. Then continue with (C) and (D).
+- Verify before emitting: the option letters in `raw_text` should read
+  A then B then C then D (or 1, 2, 3, 4) — alphabetically/numerically
+  ascending with no gaps.
+- If you cannot find (B) anywhere on the page (or (C), or (D)), emit the
+  question with the options you DO have and flag the missing letter by
+  leaving its position empty. NEVER reorder (A) and (C) to look right
+  without finding (B).
+
+──── MATH BRACE INTEGRITY across column wraps ────
+- Math expressions like `\int_0^{π/2}`, `\frac{a}{b}`, `e^{2x}` must have
+  every `{` matched with a `}`.
+- Before emitting, count `{` and `}` in each `raw_text`. They MUST be
+  equal in count.
+- If you see `\int_0^{` with no closing `}` in column 1, look at column 2
+  for the closing `}` — it's almost certainly the continuation of the
+  same expression.
+- NEVER emit a question whose `raw_text` has unmatched braces.
+
+──── PRE-EMIT CHECKLIST per question (multi-column only) ────
+Before adding a question to `extracted`, verify:
+  ☐ Stem present and complete (ends with `?`, `=`, `is`, `are`, etc.)
+  ☐ Options (A)(B)(C)(D) present and in ALPHABETICAL order
+  ☐ All `{` and `}` braces balanced
+  ☐ No options missing from the alphabetical sequence
+If ANY check fails: re-read both columns, re-stitch the question, then
+re-verify. If still failing after re-stitch, emit with the issue rather
+than fabricate — the post-extraction validator will flag and retry.
+
+═══════════════════════════════════════════════════════════════════════════════
 TWO RULES THAT OVERRIDE EVERYTHING ELSE
 ═══════════════════════════════════════════════════════════════════════════════
 

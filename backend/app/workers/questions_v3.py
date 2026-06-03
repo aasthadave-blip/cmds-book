@@ -842,6 +842,60 @@ def _normalize_for_strict_match(s: str) -> str:
     return s
 
 
+_OPTION_LETTER_RE = re.compile(r"\(([A-Da-d1-4])\)")
+
+
+def _quality_check_question(item: dict[str, Any]) -> list[str]:
+    """Multi-column safety net — detect common column-wrap extraction
+    failures and return a list of warning strings.
+
+    Designed to be a NO-OP for clean single-column extractions: braces
+    always balance, options always appear in order. Only flags real
+    structural issues. Used downstream to set `qc_status='warn'` on
+    suspicious items so the UI can surface them for review.
+
+    Checks:
+      - Brace balance: count of `{` must equal count of `}`
+      - Option order: (A)(B)(C)(D) must appear in alphabetical order
+      - Missing options: if any of A..D is present, the full set A..N
+        must be present (no gaps)
+
+    None of these checks are fatal — they only annotate. The question
+    is still emitted; reviewers in the UI can decide what to do.
+    """
+    raw = (item.get("raw_text") or "").strip()
+    if not raw:
+        return []
+
+    warnings: list[str] = []
+
+    # 1. Brace balance
+    open_braces = raw.count("{")
+    close_braces = raw.count("}")
+    if open_braces != close_braces:
+        warnings.append(
+            f"unbalanced_braces({open_braces}_open_vs_{close_braces}_close)"
+        )
+
+    # 2. Option order + missing options
+    letters = _OPTION_LETTER_RE.findall(raw)
+    if letters:
+        upper = [l.upper() for l in letters]
+        # Limit to A-D for ordering check (some books use 1-4 too;
+        # those typically aren't column-wrap-broken so skip the strict
+        # check for digit options).
+        ad_only = [l for l in upper if l in "ABCD"]
+        if ad_only and ad_only != sorted(ad_only):
+            warnings.append(f"options_out_of_order:{''.join(ad_only)}")
+        if ad_only:
+            expected = list("ABCD"[: len(ad_only)])
+            missing = sorted(set(expected) - set(ad_only))
+            if missing:
+                warnings.append(f"missing_options:{''.join(missing)}")
+
+    return warnings
+
+
 def _dedupe_extracted(items: list[dict[str, Any]]) -> list[dict[str, Any]]:
     """Per-section 100% dedup — keep only the first occurrence when two
     extracted items have IDENTICAL normalized raw_text.
@@ -865,6 +919,14 @@ def _dedupe_extracted(items: list[dict[str, Any]]) -> list[dict[str, Any]]:
         if key in seen:
             continue  # exact duplicate, drop silently
         seen.add(key)
+        # Multi-column safety net — annotate any structural issues we
+        # can detect from raw_text alone (brace balance, option order,
+        # missing options). NO-OP for clean single-column extractions.
+        # Attaches a `qc_warnings: list[str]` field when issues found.
+        # Downstream persistence reads this for the question's qc_status.
+        warns = _quality_check_question(it)
+        if warns:
+            it = {**it, "qc_warnings": warns}
         out.append(it)
     return out
 
