@@ -923,20 +923,17 @@ def _render_block_item(b: _DocBuilder, block: dict[str, Any],
             b.paragraph(body, left_indent_cm=0.4)
         return
     if t in ("example_ref", "exercise_ref", "question_ref"):
-        # In a final-merged doc these should usually have been dropped by
-        # the chip↔question dedup. If one slips through, render as a small
-        # italic pointer so the user can spot it and remove via Composer.
-        kind = {
-            "example_ref": "Worked example",
-            "exercise_ref": "Exercise",
-            "question_ref": "Question",
-        }[t]
-        label = block.get("label") or block.get("number") or ""
-        p = b.doc.add_paragraph()
-        r = p.add_run(f"→ {kind}: {label}")
-        r.italic = True
-        r.font.size = Pt(9)
-        r.font.color.rgb = MUTED
+        # A3 fix — SUPPRESS unmatched chips in the final DOCX. Matched chips
+        # have already been removed from the blocks list by
+        # `_merge_chips_with_questions` (their target question gets inlined
+        # at the chip's position). Any chip surviving to this point is
+        # either orphan (no matching question anywhere) or garbage bled
+        # into a non-question section by theory over-extraction. Emitting
+        # "→ Exercise: N" placeholders for those clutters the document
+        # (e.g. Shortcuts polluted with 74 empty chips). The reader can
+        # always inspect the source PDF if a question is genuinely
+        # missing. To restore the old "spot me" rendering, look up
+        # commit 58c5e1e in git history.
         return
     # Delegate to the existing theory renderer for the standard types
     _render_theory_block(b, block, title_key, last_sub)
