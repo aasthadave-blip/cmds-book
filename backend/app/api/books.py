@@ -279,6 +279,25 @@ async def patch_schema(
         validated = BookSchema(**schema)
     except Exception as e:
         raise HTTPException(400, detail=f"Invalid schema: {e}") from e
+
+    # Lock previously-extracted section_ids — schema edits must NEVER
+    # mint a new ID for a section that already has DB content. The
+    # alignment helper matches each node by (title + page range) against
+    # existing DB Section rows and rewrites the node.id back to the
+    # extraction-time id. Drift is impossible by construction after
+    # this step; figure_references + questions joins stay valid.
+    from app.services.schema_alignment import (
+        align_schema_ids_to_existing_sections,
+    )
+    existing = (
+        await session.execute(
+            select(Section).where(Section.book_id == book.id)
+        )
+    ).scalars().all()
+    validated, _remap = align_schema_ids_to_existing_sections(
+        validated, existing
+    )
+
     book.schema = validated.model_dump()
     book.title = validated.document_title or book.title
     book.subject = validated.subject or book.subject
