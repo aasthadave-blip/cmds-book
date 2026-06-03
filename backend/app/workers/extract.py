@@ -471,9 +471,18 @@ def extract_book_task(self, book_id: str, job_id: str) -> dict:
                     sec.blocks = result.blocks
                     sec.qc_local = result.qc.to_dict()
                     sec.attempts = result.attempts
-                    if not result.qc.pass_ and is_container and not result.blocks:
-                        sec.status = "skipped"
-                        outcome = "skipped"
+                    # Container parents (sections with non-excluded children)
+                    # legitimately return empty blocks when the parent-vs-leaf
+                    # rule (f0a574a) finds no content between the parent
+                    # heading and the first child — children carry it all.
+                    # Mark these as "passed" with empty blocks so the heading
+                    # stays visible in the sidebar + Preview / Composer /
+                    # DOCX with a blank body, preserving the schema
+                    # hierarchy. Previously these were "skipped" and hidden,
+                    # making the chapter look like sections were missing.
+                    if is_container and not result.blocks:
+                        sec.status = "passed"
+                        outcome = "passed"
                     else:
                         sec.status = "passed" if result.qc.pass_ else "failed"
                         outcome = "passed" if result.qc.pass_ else "failed"

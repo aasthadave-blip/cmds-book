@@ -951,9 +951,19 @@ async def build_final_merge(
                         )
                     added_sids.add(sib_sid)
 
-        # Skip purely empty sections (no theory, no figures, no own questions
-        # AND no descendant questions whose chip might land here).
-        if not blocks and not section_figures and not question_dicts:
+        # Skip purely empty sections, EXCEPT container parents — those keep
+        # their heading visible even with blank body so the schema hierarchy
+        # is complete in Preview / Composer / DOCX. A section is a container
+        # if the schema gave it non-excluded subsections; those children
+        # render as their own out_sections entries and carry the actual
+        # content. Dropping the parent would visually orphan the children.
+        has_descendants = bool(desc_by_section.get(ss.id, set()))
+        if (
+            not blocks
+            and not section_figures
+            and not question_dicts
+            and not has_descendants
+        ):
             continue
 
         out_sections.append({
