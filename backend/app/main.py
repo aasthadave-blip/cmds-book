@@ -323,6 +323,28 @@ async def _do_recover_orphaned_jobs() -> None:
                     # recovery and let the user retry from the UI.
                     job.status = "failed"
                     job.error = "Interrupted by server restart — click Re-extract to retry"
+                    # Reconcile the QuestionBank status so it doesn't stay
+                    # stuck at 'extracting'. A bank stuck at 'extracting' is
+                    # invisible to build_final_merge (which filters to
+                    # status='ready'), so questions + chip-merge + figure
+                    # embedding all silently fail in Composer / Preview.
+                    # Strategy: if questions were already written to the DB
+                    # before the crash, downgrade bank to 'partial' so the
+                    # merge picks it up; if no questions yet, mark 'failed'.
+                    from app.models.question import Question
+                    from app.models.question_bank import QuestionBank
+                    stuck_banks = session.execute(
+                        select(QuestionBank)
+                        .where(QuestionBank.book_id == book.id)
+                        .where(QuestionBank.status == "extracting")
+                    ).scalars().all()
+                    for bank in stuck_banks:
+                        q_count = session.execute(
+                            select(Question)
+                            .where(Question.bank_id == bank.id)
+                            .where(Question.regen_id.is_(None))
+                        ).scalars().first()
+                        bank.status = "partial" if q_count is not None else "failed"
                     session.commit()
                     skipped += 1
                     continue

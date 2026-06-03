@@ -157,12 +157,19 @@ function SectionHeader({
   );
 }
 
+// Wing taxonomy regex — extracts the sub-type (e.g. "Essay Type Questions",
+// "Level 1: Apply your Concepts") from a "PRACTICE QUESTIONS - X WING - Y"
+// section_ref so it can render as a chip on the card.
+const WING_SUBTYPE_RE = /^PRACTICE QUESTIONS - .+? WING - (.+)$/i;
+
 function QuestionCard({ q }: { q: ExtractedQuestion }) {
   const isExample = q.kind === 'example';
   const accent = isExample ? 'var(--indigo-700)' : 'var(--red-600)';
   const label = isExample
     ? `Example ${q.question_number ?? ''}`.trim()
     : `Q${q.question_number ?? ''}`.trim();
+  const subtypeMatch = q.section_ref?.match(WING_SUBTYPE_RE);
+  const wingSubtype = subtypeMatch ? subtypeMatch[1] : null;
 
   return (
     <div
@@ -193,6 +200,19 @@ function QuestionCard({ q }: { q: ExtractedQuestion }) {
         </span>
         {q.question_type && (
           <span className="badge">{q.question_type}</span>
+        )}
+        {wingSubtype && (
+          <span
+            className="badge"
+            title="Source category within the wing"
+            style={{
+              background: 'var(--indigo-50)',
+              color: 'var(--indigo-700)',
+              borderColor: 'var(--indigo-200)',
+            }}
+          >
+            {wingSubtype}
+          </span>
         )}
         {q.status === 'failed' && (
           <span className="badge regen">

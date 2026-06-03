@@ -43,6 +43,25 @@ import { SubTabs } from '../components/review/SubTabs';
 /** Sub-tab inside a Theory view: which version to show. */
 type ViewVariant = 'regen' | 'original' | 'compare';
 
+/** Numeric-aware tokeniser for question_number sorting. Roman numerals
+ * (i…x) become 1..10 so "Q1(ii)" sorts after "Q1(i)" and before "Q2". */
+function parseNum(raw: string | null | undefined): number[] {
+  if (!raw) return [Number.MAX_SAFE_INTEGER];
+  const roman: Record<string, number> = {
+    i: 1, ii: 2, iii: 3, iv: 4, v: 5,
+    vi: 6, vii: 7, viii: 8, ix: 9, x: 10,
+  };
+  const parts: number[] = [];
+  for (const tok of String(raw).split(/[^\w]+/)) {
+    const t = tok.trim().toLowerCase();
+    if (!t) continue;
+    if (/^\d+$/.test(t)) parts.push(Number(t));
+    else if (t in roman) parts.push(roman[t]);
+    else parts.push(t.charCodeAt(0) + 1000);
+  }
+  return parts.length ? parts : [Number.MAX_SAFE_INTEGER];
+}
+
 export default function ReviewPage() {
   const { bookId } = useParams();
   const navigate = useNavigate();
@@ -268,11 +287,40 @@ export default function ReviewPage() {
     // depth) using the same `schemaOrder` map — its keys are exactly
     // the schema node ids walked in tree order.
     const inSchemaSet = new Set<string>(Object.keys(schemaOrder));
+
+    // Wing-grouping for "PRACTICE QUESTIONS - <X> WING - <subtype>"
+    // entries: collapse all sub-types of the same wing into ONE sidebar
+    // entry (the wing). Sub-type still surfaces on each question card
+    // via q.section_ref. Without this, the sidebar shows 8+ near-
+    // identical "PRACTICE QUESTIONS - …" rows that look duplicated.
+    // Books that use other taxonomy keep one row per section_ref as before.
+    const WING_RE = /^(PRACTICE QUESTIONS - .+? WING)(?: - (.+))?$/i;
     const orphansFromBank: Section[] = [];
+    const wingTotals = new Map<string, number>();
+    const wingTitles = new Map<string, string>();
+    const wingSubrefs = new Map<string, string[]>();
+
     if (banksDetail?.sections) {
       for (const bs of banksDetail.sections) {
         const ref = bs.section_ref;
         if (!ref || inSchemaSet.has(ref) || existingIds.has(ref)) continue;
+
+        const wingMatch = ref.match(WING_RE);
+        if (wingMatch) {
+          // section_ref is wing-shaped: collapse under wing prefix.
+          const wingId = wingMatch[1];
+          wingTotals.set(
+            wingId,
+            (wingTotals.get(wingId) ?? 0) + bs.questions.length,
+          );
+          wingTitles.set(wingId, wingId);
+          const subs = wingSubrefs.get(wingId) ?? [];
+          subs.push(ref);
+          wingSubrefs.set(wingId, subs);
+          continue;
+        }
+
+        // Non-wing bank orphan — keep as-is.
         orphansFromBank.push({
           id: `bank-orphan:${ref}`,
           book_id:
@@ -280,14 +328,9 @@ export default function ReviewPage() {
           section_id: ref,
           title: bs.section_title ?? ref,
           level: null,
-          // Synthetic block list — store a placeholder so getStatusDot's
-          // hasContent check returns true (showing amber, not red) when
-          // questions were actually extracted from this orphan.
           blocks: bs.questions.length > 0 ? [{ t: 'placeholder' }] : [],
           qc_local: null,
           qc_llm: null,
-          // 'passed' when questions exist, 'failed' when zero extracted —
-          // matches the dot semantics of regular sections.
           status: bs.questions.length > 0 ? 'passed' : 'failed',
           attempts: 0,
           embedded_figures: [],
@@ -295,9 +338,30 @@ export default function ReviewPage() {
       }
     }
 
-    return [...fromSchema, ...synthetic, ...orphansFromBank].sort(
-      sortBySchema,
-    );
+    // Emit one synthetic Section per detected wing.
+    const wingSections: Section[] = [];
+    for (const [wingId, total] of wingTotals.entries()) {
+      wingSections.push({
+        id: `wing:${wingId}`,
+        book_id: bookState.kind === 'ready' ? bookState.data.book.id : '',
+        section_id: wingId,
+        title: `${wingTitles.get(wingId) ?? wingId} (${total})`,
+        level: null,
+        blocks: total > 0 ? [{ t: 'placeholder' }] : [],
+        qc_local: null,
+        qc_llm: null,
+        status: total > 0 ? 'passed' : 'failed',
+        attempts: 0,
+        embedded_figures: [],
+      } as Section);
+    }
+
+    return [
+      ...fromSchema,
+      ...synthetic,
+      ...orphansFromBank,
+      ...wingSections,
+    ].sort(sortBySchema);
   }, [
     allSections,
     categoryAIds,
@@ -307,6 +371,50 @@ export default function ReviewPage() {
     schemaOrder,
     banksDetail,
   ]);
+
+  // ─── Wing-aggregated questions ─────────────────────────────────────
+  // When a wing-collapsed sidebar entry is selected, merge questions
+  // from every sub-type into one SectionQuestions view. Sub-type stays
+  // visible on each card via q.section_ref. Returns null when no wing
+  // is selected.
+  const wingAggregator = useMemo(() => {
+    if (!banksDetail?.sections) return new Map<string, any>();
+    const WING_RE2 = /^(PRACTICE QUESTIONS - .+? WING)(?: - (.+))?$/i;
+    const byWing = new Map<string, any>();
+    for (const bs of banksDetail.sections) {
+      const m = bs.section_ref?.match(WING_RE2);
+      if (!m) continue;
+      const wingId = m[1];
+      const acc = byWing.get(wingId) ?? {
+        section_ref: wingId,
+        section_title: wingId,
+        questions: [] as any[],
+        extracted: 0,
+        identified: 0,
+        missed: 0,
+      };
+      acc.questions.push(...bs.questions);
+      acc.extracted += bs.extracted;
+      acc.identified += bs.identified;
+      acc.missed += bs.missed;
+      byWing.set(wingId, acc);
+    }
+    // Sort each wing's questions by question_number (numeric-aware) so
+    // cards render Q1, Q2, …, Q10 instead of by sub-type bucket order.
+    for (const acc of byWing.values()) {
+      acc.questions.sort((a: any, b: any) => {
+        const ka = parseNum(a.question_number);
+        const kb = parseNum(b.question_number);
+        for (let i = 0; i < Math.max(ka.length, kb.length); i++) {
+          const va = ka[i] ?? Number.POSITIVE_INFINITY;
+          const vb = kb[i] ?? Number.POSITIVE_INFINITY;
+          if (va !== vb) return va - vb;
+        }
+        return 0;
+      });
+    }
+    return byWing;
+  }, [banksDetail]);
 
   const figureSections = useMemo<Section[]>(() => {
     if (!figuresData) return [];
@@ -423,6 +531,12 @@ export default function ReviewPage() {
   const selectedQuestions = (() => {
     if (!selected || !banksDetail) return null;
     if (selectedIsExcluded) return null;
+    // Wing-collapsed entry — return the aggregated SectionQuestions
+    // covering all sub-types under this wing, with questions already
+    // sorted by question_number.
+    if (selected.id.startsWith('wing:')) {
+      return wingAggregator.get(selected.section_id) ?? null;
+    }
     return (
       banksDetail.sections.find(
         (s) => s.section_ref === selected.section_id,

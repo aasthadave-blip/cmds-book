@@ -706,11 +706,17 @@ async def build_final_merge(
     # 4. Bulk-load questions. Prefer the latest "saved" question
     # regeneration's variant questions over originals when prefer_regen is
     # on; questions are scoped per section_ref where the regen applied.
+    # Accept both "ready" (clean finish, counts['failed']==0) and "partial"
+    # (some sections failed but questions are still in the DB) so that a
+    # crashed-and-recovered bank still surfaces its questions in Composer /
+    # Preview. The startup recovery routine downgrades stuck-at-'extracting'
+    # banks to 'partial' when questions exist; without accepting 'partial'
+    # here, chip-merge + figure embedding would silently fail.
     latest_bank = (
         await session.execute(
             select(QuestionBank)
             .where(QuestionBank.book_id == book_id)
-            .where(QuestionBank.status == "ready")
+            .where(QuestionBank.status.in_(["ready", "partial"]))
             .order_by(QuestionBank.created_at.desc())
             .limit(1)
         )
