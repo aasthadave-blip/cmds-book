@@ -237,13 +237,11 @@ def _block_to_md(block: dict[str, Any]) -> str:
         label = block.get("label") or ""
         return f"*{label}* {c}".strip()
     if t in ("example_ref", "exercise_ref", "question_ref"):
-        # Chips at export time = link descriptors only.
-        kind = {
-            "example_ref": "Worked example",
-            "exercise_ref": "Exercise",
-            "question_ref": "Question",
-        }[t]
-        return f"→ *{kind}: {block.get('label') or block.get('number') or ''}*"
+        # A3 fix — see docx_export.py: suppress unmatched chips in the
+        # exported document. Matched chips already get their question
+        # inlined upstream; orphans / over-extraction garbage clutter
+        # the output (e.g. Shortcuts polluted with 74 empty chips).
+        return ""
     return c or ""
 
 
