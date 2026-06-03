@@ -156,19 +156,29 @@ def analyse_book_task(self, book_id: str, job_id: str) -> dict:
             _update_job(session, job_uuid, message="Analysing PDF", progress=15)
             local_result = _local_analyse_pdf(pdf_bytes)
 
+            # Read the user-set multi-column flag from book.analyser (set
+            # at upload time via POST /api/books form param is_multi_column).
+            # When True, build_schema routes to the multi-column-aware prompt
+            # so dense MCQ-bank pages (MHT-CET / JEE) don't get mis-tagged
+            # as "all explanations" and silently dropped. Defaults to False
+            # so single-column books are processed exactly as before.
+            existing_analyser = book.analyser or {}
+            is_multi_column = bool(existing_analyser.get("is_multi_column", False))
+
             # Always run Gemini schema (handles digital, scanned, and image PDFs natively).
             # For digital PDFs we have local_result metadata; for scanned/image we derive
             # metadata from the schema output — no Claude P1 call needed for any type.
             pdf_type = "digital" if local_result is not None else "scanned"
-            _update_job(session, job_uuid, message=f"Running Gemini schema ({pdf_type} PDF)", progress=30)
+            layout_tag = "multi-column" if is_multi_column else pdf_type
+            _update_job(session, job_uuid, message=f"Running Gemini schema ({layout_tag} PDF)", progress=30)
             # Heartbeat keeps the watchdog from killing long Gemini schema
             # calls for scanned PDFs (5–10 min is normal for image-based pages).
             with Heartbeat(
                 job_uuid,
-                base_msg=f"Running Gemini schema ({pdf_type} PDF)",
+                base_msg=f"Running Gemini schema ({layout_tag} PDF)",
                 progress=30,
             ):
-                schema = build_schema(pdf_bytes)
+                schema = build_schema(pdf_bytes, is_multi_column=is_multi_column)
 
             # Derive AnalyserResult: use pymupdf fast-path if available, otherwise
             # build it entirely from the Gemini schema output (no Claude P1 needed).
@@ -200,7 +210,12 @@ def analyse_book_task(self, book_id: str, job_id: str) -> dict:
                    "subject": schema.subject or analyser_result.subject}
             )
 
-            book.analyser = analyser_result.model_dump()
+            # Preserve the upload-time multi-column flag on analyser
+            # overwrite so re-analyse calls keep routing to the right prompt.
+            new_analyser = analyser_result.model_dump()
+            if is_multi_column:
+                new_analyser["is_multi_column"] = True
+            book.analyser = new_analyser
 
             # Lock previously-extracted section_ids when re-analysing an
             # existing book. The freshly generated schema can carry new IDs

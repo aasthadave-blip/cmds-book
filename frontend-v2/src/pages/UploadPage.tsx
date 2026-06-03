@@ -44,6 +44,7 @@ export default function UploadPage() {
   const [folder, setFolder] = useState<string>(preselectedFolder);
   const [subject, setSubject] = useState('');
   const [derivedTitle, setDerivedTitle] = useState('');
+  const [isMultiColumn, setIsMultiColumn] = useState(false);
   const [submitting, setSubmitting] = useState(false);
   const [submitError, setSubmitError] = useState<string | null>(null);
   const [createdBookId, setCreatedBookId] = useState<string | null>(null);
@@ -108,6 +109,7 @@ export default function UploadPage() {
         folderId: folder,
         title: derivedTitle || realFileRef.current.name,
         subject: subject || undefined,
+        isMultiColumn: isMultiColumn || undefined,
       });
       setCreatedBookId(result.book_id);
       flash('File uploaded · starting extraction…');
@@ -149,6 +151,8 @@ export default function UploadPage() {
             subject={subject}
             setSubject={setSubject}
             derivedTitle={derivedTitle}
+            isMultiColumn={isMultiColumn}
+            setIsMultiColumn={setIsMultiColumn}
             onPick={onPick}
             onRemove={onRemove}
             onNext={submit}

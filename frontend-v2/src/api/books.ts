@@ -27,12 +27,14 @@ export async function uploadChapter(params: {
   folderId: string;
   title: string;
   subject?: string;
+  isMultiColumn?: boolean;
 }): Promise<CreateBookResult> {
   const fd = new FormData();
   fd.append('file', params.file, params.file.name);
   fd.append('folder_id', params.folderId);
   fd.append('title', params.title);
   if (params.subject) fd.append('subject', params.subject);
+  if (params.isMultiColumn) fd.append('is_multi_column', 'true');
 
   const res = await fetch(`${API_BASE}/api/books`, {
     method: 'POST',

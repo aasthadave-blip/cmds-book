@@ -124,13 +124,24 @@ def _run_gemini_schema(pdf_bytes: bytes, schema_prompt: str) -> dict:
     return parse_json(raw)
 
 
-def build_schema(pdf_bytes: bytes) -> BookSchema:
+def build_schema(pdf_bytes: bytes, *, is_multi_column: bool = False) -> BookSchema:
     """Generate a structural schema from PDF bytes using Gemini 2.5 Pro.
 
     SYNCHRONOUS — call directly, do NOT wrap in asyncio.run().
+
+    When ``is_multi_column`` is True (user-flagged at upload time for
+    MHT-CET / JEE / NEET prep books with dense 2-column layouts), the
+    multi-column-aware prompt is loaded. That prompt enforces per-column
+    reading order and per-heading classification so dense MCQ + brief-
+    explanation pages don't get mis-tagged as "all explanations" and
+    silently dropped into excluded_sections. Single-column books use the
+    default prompt and behave identically to before.
     """
     _ensure_event_loop()
-    schema_prompt = load_raw("schema_gemini")
+    prompt_name = (
+        "schema_gemini_multicolumn" if is_multi_column else "schema_gemini"
+    )
+    schema_prompt = load_raw(prompt_name)
 
     last_err: Exception | None = None
     for attempt in range(1, MAX_ATTEMPTS + 1):
