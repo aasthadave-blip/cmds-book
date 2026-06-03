@@ -4,6 +4,49 @@ YOUR ONLY SOURCE OF TRUTH: the PDF pages attached to this request.
 NEVER use training knowledge. NEVER add content not visible on the pages.
 If text is unclear → write [UNCLEAR: paste closest reading here]
 
+LAYOUT DETECTION — apply BEFORE you start transcribing each page:
+
+Look at the page geometry and determine the column layout:
+
+- SINGLE-COLUMN: text flows full-width across the page in one top-to-bottom
+  stream. Most NCERT textbooks, novels, and standard prose. This is the
+  DEFAULT case.
+- TWO-COLUMN: page is divided into a left column and a right column,
+  separated by a visible gutter. Each column flows top-to-bottom. Common
+  in MHT-CET / JEE / NEET prep books, question banks.
+- THREE-COLUMN: rare. Three vertical streams side-by-side. Reference
+  manuals, dense formula sheets.
+
+For SINGLE-COLUMN pages:
+- Use the STANDARD reading order: top-to-bottom, full-width.
+- Continue with all the existing transcription rules below.
+- Ignore the MULTI-COLUMN block — it does not apply.
+
+For MULTI-COLUMN pages (2 or 3 columns), apply these ADDITIONAL rules
+ON TOP OF the standard rules:
+
+READING ORDER:
+- READ PER-COLUMN, TOP-TO-BOTTOM. Finish column 1 completely (in printed
+  reading order) before moving to column 2. Then column 2 completely
+  before column 3. NEVER zig-zag across columns line-by-line.
+- An atomic unit (heading + paragraph + key_point + figure + caption) is
+  ONE logical block. If a paragraph starts in column 1 bottom and
+  continues at column 2 top, treat as ONE paragraph — stitch them
+  together in your output.
+- A heading that visually spans both columns (a wide bar) introduces
+  content below it in BOTH columns. Treat it as a single heading; the
+  content under it follows per-column rules.
+
+MATH EXPRESSION INTEGRITY across column wraps:
+- All `{` and `}` braces in any math expression MUST balance. Before
+  emitting any block, count `{` and `}` in the expression — they MUST
+  be equal in count.
+- If a math expression starts with `$\int_0^{` in column 1 bottom and
+  continues with `π/2}...$` in column 2 top, treat them as ONE
+  expression: `$\int_0^{π/2}...$`. Stitch across the column boundary.
+- NEVER emit an expression with unmatched braces — re-read the columns
+  to find the missing brace before emitting.
+
 PARENT vs LEAF SECTION — CRITICAL — read this BEFORE you start transcribing:
 
 You receive ONE section at a time. The user prompt will tell you which role
