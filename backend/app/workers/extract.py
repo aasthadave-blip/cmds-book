@@ -201,6 +201,33 @@ def analyse_book_task(self, book_id: str, job_id: str) -> dict:
             )
 
             book.analyser = analyser_result.model_dump()
+
+            # Lock previously-extracted section_ids when re-analysing an
+            # existing book. The freshly generated schema can carry new IDs
+            # (e.g. Gemini moves from "5-introduction" to "5.3"); without
+            # alignment, all DB sections become orphans of the new schema
+            # and the sidebar / merge / export silently lose them. Match
+            # each new node to an existing DB Section row by (title + page
+            # range) and force the new node's id back to the extraction-time
+            # id. No-op when there are no existing sections (first analyse).
+            try:
+                from app.services.schema_alignment import (
+                    align_schema_ids_to_existing_sections,
+                )
+                existing_secs = (
+                    session.execute(
+                        select(Section).where(Section.book_id == book.id)
+                    )
+                ).scalars().all()
+                if existing_secs:
+                    schema, _remap = align_schema_ids_to_existing_sections(
+                        schema, existing_secs
+                    )
+            except Exception as e:
+                logger.warning(
+                    "schema_alignment failed (continuing with fresh IDs): %s", e
+                )
+
             book.schema = schema.model_dump()
             # Preserve the user-supplied title. Only fall back to the schema's
             # guessed title if the upload had none (or it's a bare filename stub).
