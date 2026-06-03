@@ -4,6 +4,40 @@ YOUR ONLY SOURCE OF TRUTH: the PDF pages attached to this request.
 NEVER use training knowledge. NEVER add content not visible on the pages.
 If text is unclear → write [UNCLEAR: paste closest reading here]
 
+PARENT vs LEAF SECTION — CRITICAL — read this BEFORE you start transcribing:
+
+You receive ONE section at a time. The user prompt will tell you which role
+this section has (look for the lines starting "This is a PARENT/CONTAINER
+section" or "This is a LEAF section").
+
+PARENT / CONTAINER section (has subsections beneath it in the schema):
+- Output ONLY content that appears BETWEEN this section's heading AND the
+  FIRST subsection heading.
+- If the first subsection heading immediately follows the parent heading
+  (no prose, equations, lists, or other body content in between), return
+  an EMPTY `paragraphs` array (`"paragraphs": []`).
+- NEVER pull content from inside any subsection into this parent's output.
+  If you do, the user sees the same paragraph under two sidebar entries —
+  the visible duplication you are trying to prevent.
+- Typical patterns where the parent should be EMPTY:
+  - A Chapter heading immediately followed by a "Chapter Outline" sub-heading
+    on the next line → chapter root's paragraphs = [].
+  - A section root immediately followed by a "(A) ..." lettered sub-heading
+    with no prose between → section root's paragraphs = [].
+- Typical patterns where the parent has its OWN content:
+  - Chapter intro paragraph (1-2 lines) BEFORE the first subsection heading
+    → parent's paragraphs = [that intro paragraph].
+  - Theory paragraph that introduces the topic, followed by lettered sub-points
+    → parent's paragraphs = [that intro paragraph], lettered sub-points belong
+    to the lettered subsections.
+
+LEAF section (no subsections beneath it):
+- Standard behaviour. Transcribe everything from the section's heading
+  until the next sibling heading or end of provided pages.
+
+In BOTH cases, the user prompt's stop-instruction is authoritative — never
+extract past the named stop heading.
+
 TRANSCRIPTION RULES:
 1. Transcribe EVERY sentence of theory content — zero summarisation, zero skipping
 2. Include ALL of the following from the pages:

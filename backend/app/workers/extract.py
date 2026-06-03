@@ -408,6 +408,7 @@ def extract_book_task(self, book_id: str, job_id: str) -> dict:
                         page_start=sec_schema.page_start,
                         page_end=payload["effective_page_end"],
                         next_title=payload["next_title"],
+                        is_container=payload["is_container"],
                     )
                 except Exception as e:
                     logger.exception(
@@ -667,6 +668,7 @@ def re_extract_section_task(self, section_id: str, job_id: str) -> dict:
                     page_start=sec.page_start,
                     page_end=effective_page_end,
                     next_title=next_title,
+                    is_container=sec_is_container,
                 )
             )
 
