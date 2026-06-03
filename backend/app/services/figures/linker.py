@@ -230,6 +230,15 @@ def build_link_candidates(
 
         raw_ctx = (fig.get("context") or "").strip().lower()
         norm_label = normalize_label(fig.get("figure_label"))
+        # Positional-linking metadata for unlabelled figures. is_labelled
+        # defaults to True so historical extractions (which lack the
+        # field) keep treating themselves as labelled. anchor_text /
+        # anchor_position / question_no are non-null only when the new
+        # prompt's UNLABELLED FIGURE EXTRACTION section fired.
+        is_labelled = fig.get("is_labelled")
+        if is_labelled is None:
+            # Inferred fallback for older runs / safety net
+            is_labelled = bool(fig.get("figure_label"))
         base = {
             "figure_id_text": fig.get("id"),
             "normalized_label": norm_label,
@@ -241,12 +250,19 @@ def build_link_candidates(
             "type": fig.get("type"),
             "raw_context": raw_ctx,
             "raw_question_ref": fig.get("question_ref"),
+            # Positional fields — only meaningful when is_labelled=False
+            "is_labelled": bool(is_labelled),
+            "anchor_text": fig.get("anchor_text"),
+            "anchor_position": fig.get("anchor_position"),
+            "question_no": fig.get("question_no"),
         }
 
         # Map Gemini's context vocabulary to ours
         if raw_ctx in ("question", "solution"):
+            # Labelled path: match by question_ref. Unlabelled path: fall
+            # back to question_no when question_ref is missing.
             qid = link_to_question(
-                fig.get("question_ref"),
+                fig.get("question_ref") or fig.get("question_no"),
                 section_ref or "",
                 by_section.get(section_ref or "", []),
             )
