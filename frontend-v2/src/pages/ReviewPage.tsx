@@ -233,15 +233,8 @@ export default function ReviewPage() {
         // surface in the Questions tab instead, and inside Theory text
         // as example_ref / exercise_ref / question_ref chips.
         .filter((s) => !categoryAIds.has(s.section_id))
-        // Defensive: drop sections whose slug is not in the current schema's
-        // depth-first walk. Stale rows can survive when the schema is
-        // re-generated or heavily edited and the cleanup didn't catch them;
-        // without this filter they'd surface at the bottom of the sidebar
-        // (sortBySchema gives them Number.MAX_SAFE_INTEGER) looking like
-        // duplicates / out-of-order chapters.
-        .filter((s) => s.section_id in schemaOrder)
         .sort(sortBySchema),
-    [allSections, sortBySchema, categoryAIds, schemaOrder],
+    [allSections, sortBySchema, categoryAIds],
   );
 
   const questionSections = useMemo<Section[]>(() => {
