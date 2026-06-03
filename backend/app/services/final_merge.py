@@ -834,6 +834,23 @@ async def build_final_merge(
 
     _walk_desc(getattr(schema_obj, "sections", []) or [])
 
+    # E1 fix — Cross-section chip-question matching.
+    # Theory sections (e.g. "4.1-theory") emit exercise_ref / example_ref
+    # chips pointing to numbered questions, but the actual questions live
+    # in SIBLING sections like "4.1-classical-thinking" or
+    # "4.1-critical-thinking" — NOT in the theory section's descendants.
+    # We build a prefix-keyed sibling lookup so the theory section's
+    # question pool can be extended with sibling questions, letting
+    # `_merge_chips_with_questions` inline them at chip positions.
+    # Same prefix rule = same numeric/dotted id stem (e.g. "4.1") shared
+    # across the *-theory, *-classical-thinking, *-critical-thinking siblings.
+    _PREFIX_RE = _re.compile(r"^([0-9]+(?:\.[0-9]+)*)")
+    siblings_by_prefix: dict[str, list[str]] = {}
+    for ss_other in ordered_schema_sections:
+        m = _PREFIX_RE.match(ss_other.id or "")
+        if m:
+            siblings_by_prefix.setdefault(m.group(1), []).append(ss_other.id)
+
     def _question_to_dict(q, *, origin_section_id: str | None = None) -> dict[str, Any]:
         qd: dict[str, Any] = {
             "id": str(q.id),
@@ -843,6 +860,10 @@ async def build_final_merge(
             "page_start": q.page_start,
             "question_type": q.question_type,
             "raw_text": q.raw_text or "",
+            # E2 fix: propagate has_options so DOCX exporter renders the
+            # MCQ Options block (was being dropped because this field
+            # never made it onto the final-draft question dict).
+            "has_options": bool(getattr(q, "has_options", False)),
             "has_solution": bool(q.has_solution),
             "solution_text": q.solution_text or "",
             "kind": q.kind,
@@ -889,11 +910,40 @@ async def build_final_merge(
             _question_to_dict(q, origin_section_id=ss.id)
             for q in section_questions
         ]
+        added_sids: set[str] = {ss.id}
         for desc_sid in desc_by_section.get(ss.id, set()):
+            if desc_sid in added_sids:
+                continue
             for q in questions_by_section.get(desc_sid, []):
                 question_dicts.append(
                     _question_to_dict(q, origin_section_id=desc_sid)
                 )
+            added_sids.add(desc_sid)
+
+        # E1 fix — Sibling pool expansion for theory sections with chips.
+        # When a section's blocks contain exercise_ref / example_ref /
+        # question_ref chips that no descendant question can satisfy,
+        # pull in questions from sibling sections sharing the same
+        # numeric prefix (4.1-theory ↔ 4.1-classical-thinking ↔
+        # 4.1-critical-thinking). Limit to sections with chips so we
+        # don't over-share questions to non-chip-bearing sections.
+        has_chip_blocks = any(
+            isinstance(b, dict)
+            and b.get("t") in ("example_ref", "exercise_ref", "question_ref")
+            for b in (blocks or [])
+        )
+        if has_chip_blocks:
+            sid_m = _PREFIX_RE.match(ss.id or "")
+            if sid_m:
+                prefix = sid_m.group(1)
+                for sib_sid in siblings_by_prefix.get(prefix, []):
+                    if sib_sid in added_sids:
+                        continue
+                    for q in questions_by_section.get(sib_sid, []):
+                        question_dicts.append(
+                            _question_to_dict(q, origin_section_id=sib_sid)
+                        )
+                    added_sids.add(sib_sid)
 
         # Skip purely empty sections (no theory, no figures, no own questions
         # AND no descendant questions whose chip might land here).
@@ -955,6 +1005,8 @@ async def build_final_merge(
                 "page_start": q.page_start,
                 "question_type": q.question_type,
                 "raw_text": q.raw_text or "",
+                # E2 fix — see _question_to_dict above
+                "has_options": bool(getattr(q, "has_options", False)),
                 "has_solution": bool(q.has_solution),
                 "solution_text": q.solution_text or "",
                 "kind": q.kind,
