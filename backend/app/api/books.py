@@ -153,6 +153,14 @@ async def create_book(
     title: str | None = Form(None),
     folder_id: UUID | None = Form(None),
     subject: str | None = Form(None),
+    # User-set flag at upload time for multi-column PDFs (MHT-CET, JEE
+    # prep, dense question banks). When True, the analyse worker routes
+    # to the multi-column-aware schema prompt that enforces per-column
+    # reading order + per-heading classification so dense MCQ pages
+    # don't get mis-tagged as "all explanations" and silently dropped.
+    # Stored in book.analyser JSON (no migration needed). Default False
+    # → single-column behaviour unchanged.
+    is_multi_column: bool = Form(False),
     session: AsyncSession = Depends(get_session),
 ) -> BookUploadResponse:
     # Accept by content-type OR by .pdf extension (browsers sometimes send
@@ -180,6 +188,11 @@ async def create_book(
         status="uploaded",
         folder_id=folder_id,
         subject=subject,
+        # Stash the multi-column flag in analyser JSON so analyse_book_task
+        # can read it before generating the schema. analyser is otherwise
+        # populated by the worker with AnalyserResult fields; we pre-seed
+        # this one field, and the worker preserves it on overwrite.
+        analyser={"is_multi_column": True} if is_multi_column else None,
     )
     session.add(book)
     await session.flush()

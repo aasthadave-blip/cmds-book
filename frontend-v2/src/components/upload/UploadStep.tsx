@@ -13,6 +13,10 @@ type Props = {
   setSubject: (s: string) => void;
   /** Chapter title — derived from filename, not user-editable. */
   derivedTitle: string;
+  /** Multi-column layout flag — routes schema generation to the
+   * multi-column-aware Gemini prompt (MHT-CET, JEE prep books). */
+  isMultiColumn: boolean;
+  setIsMultiColumn: (v: boolean) => void;
   onPick: (f: { name: string; size?: number; pages?: number }) => void;
   onRemove: () => void;
   onNext: () => void;
@@ -31,6 +35,8 @@ export function UploadStep({
   subject,
   setSubject,
   derivedTitle,
+  isMultiColumn,
+  setIsMultiColumn,
   onPick,
   onRemove,
   onNext,
@@ -187,6 +193,48 @@ export function UploadStep({
               </div>
             </div>
           </div>
+
+          {/* Multi-column layout flag — routes the analyse worker to the
+              multi-column-aware schema prompt so dense MCQ-bank books
+              (MHT-CET, JEE prep, etc.) get properly classified instead
+              of being collapsed into "all explanations" excluded sections. */}
+          <label
+            style={{
+              marginTop: 14,
+              display: 'flex',
+              alignItems: 'flex-start',
+              gap: 10,
+              padding: '12px 14px',
+              background: 'var(--surface-2)',
+              border: '1px solid var(--line)',
+              borderRadius: 10,
+              cursor: 'pointer',
+              fontSize: 13,
+            }}
+          >
+            <input
+              type="checkbox"
+              checked={isMultiColumn}
+              onChange={(e) => setIsMultiColumn(e.target.checked)}
+              style={{ marginTop: 3 }}
+            />
+            <div>
+              <div style={{ color: 'var(--ink-900)', fontWeight: 600 }}>
+                Multi-column PDF (2 or 3 columns per page)
+              </div>
+              <div
+                style={{
+                  fontSize: 11,
+                  color: 'var(--ink-500)',
+                  marginTop: 2,
+                }}
+              >
+                Tick for MHT-CET, JEE/NEET prep books, dense question banks
+                where each page is split into side-by-side columns. Routes
+                the analyser to a layout-aware schema prompt.
+              </div>
+            </div>
+          </label>
         </>
       )}
 
