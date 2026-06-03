@@ -134,7 +134,35 @@ def _slice_pdf(pdf_bytes: bytes, page_start: int | None, page_end: int | None) -
         return pdf_bytes
 
 
-def _build_user_prompt(section_id: str, title: str, next_title: str | None = None) -> str:
+def _build_user_prompt(
+    section_id: str,
+    title: str,
+    next_title: str | None = None,
+    is_container: bool = False,
+) -> str:
+    # Role line — tells the LLM whether this is a PARENT or LEAF. See the
+    # PARENT vs LEAF SECTION rule at the top of extractor.txt for what each
+    # role means for the output shape. When `is_container=True`, the LLM is
+    # expected to return an empty `paragraphs` array if no prose appears
+    # between this section's heading and the first subsection heading.
+    if is_container:
+        role_line = (
+            "This is a PARENT/CONTAINER section — it has subsections beneath it.\n"
+            "Per the PARENT vs LEAF SECTION rule in the system prompt: extract ONLY "
+            "content that appears BETWEEN this section's heading"
+            + (f" \"{title}\" and the first subsection heading \"{next_title}\"" if next_title else f" \"{title}\" and the first subsection heading")
+            + ".\n"
+            "If the subsection heading immediately follows this section's heading with "
+            "NO prose / equations / lists in between, return an EMPTY paragraphs array "
+            "(`\"paragraphs\": []`).\n"
+            "NEVER duplicate content from inside any subsection into this parent's output.\n\n"
+        )
+    else:
+        role_line = (
+            "This is a LEAF section — it has no subsections beneath it. "
+            "Extract content per the standard transcription rules.\n\n"
+        )
+
     if next_title:
         stop_instruction = (
             f"\nSTOP extracting the MOMENT you reach the heading \"{next_title}\". Anything below that heading — even a single line, even a single equation — belongs to a different section and must NOT appear in your output.\n"
@@ -148,6 +176,7 @@ def _build_user_prompt(section_id: str, title: str, next_title: str | None = Non
         )
     return (
         f"Extract ALL theory content from the section titled: \"{title}\" (ID: {section_id}).\n\n"
+        f"{role_line}"
         f"START extracting from the heading \"{title}\" — include everything from that heading."
         f"{stop_instruction}\n\n"
         "These PDF pages may contain content from adjacent sections. "
@@ -207,10 +236,20 @@ async def extract_section_with_qc(
     page_start: int | None,
     page_end: int | None,
     next_title: str | None = None,
+    is_container: bool = False,
 ) -> ExtractionResult:
-    """Extract a single section via Gemini OCR; up to MAX_ATTEMPTS retries."""
+    """Extract a single section via Gemini OCR; up to MAX_ATTEMPTS retries.
+
+    ``is_container=True`` signals that this section has subsections beneath
+    it in the schema. The LLM is instructed (via the PARENT vs LEAF SECTION
+    rule in extractor.txt) to return ONLY content between this section's
+    heading and the first subsection heading — or an empty paragraphs
+    array if the subsection heading immediately follows the section
+    heading. This prevents content duplication where the parent's blocks
+    include text that also belongs to subsection blocks.
+    """
     system_prompt = load_raw("extractor")
-    user_prompt = _build_user_prompt(section_id, title, next_title)
+    user_prompt = _build_user_prompt(section_id, title, next_title, is_container)
     pdf_slice = _slice_pdf(pdf_bytes, page_start, page_end)
 
     last_paragraphs: list[dict] = []
@@ -280,6 +319,7 @@ async def re_extract_with_fix(
     page_start: int | None,
     page_end: int | None,
     next_title: str | None = None,
+    is_container: bool = False,
 ) -> ExtractionResult:
     """User-triggered re-extraction — same as extract_section_with_qc, fresh attempt."""
     return await extract_section_with_qc(
@@ -290,4 +330,5 @@ async def re_extract_with_fix(
         page_start=page_start,
         page_end=page_end,
         next_title=next_title,
+        is_container=is_container,
     )
