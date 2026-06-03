@@ -386,6 +386,124 @@ async def embed_figures_for_book(
     for fig in figures:
         counters["figures_seen"] += 1
         section_id = fig.section_id or ""
+
+        # ─── Pass 2 (NEW): positional placement for UNLABELLED figures ──
+        # Figures that came in without a "Figure X.Y" caption carry
+        # positional metadata in regen_meta (see linker.py + figures_tasks.py).
+        # Flow:
+        #   1. Resolve target section via fig.section_id (already set by
+        #      page→section linker) OR via page_number fallback.
+        #   2. If context=question + question_no exists → attach to the
+        #      matching question in that section, placed BELOW the
+        #      question body (char_offset = len(raw_text)).
+        #   3. If context=theory + anchor_text exists → fuzzy-match the
+        #      anchor against blocks in that section; anchor_position=
+        #      "above" inserts BEFORE the matched block, "below"/"beside"
+        #      inserts AFTER. Falls through to broader 30-char window
+        #      match if 60-char snippet fails.
+        #   4. Ultimate fallback: section end (trailing figure).
+        # Labelled figures (is_labelled True or missing) bypass this
+        # block entirely and run through the existing Pass 1 logic below.
+        pos_meta = fig.regen_meta if isinstance(fig.regen_meta, dict) else None
+        if pos_meta and pos_meta.get("is_labelled") is False:
+            anchor_text = (pos_meta.get("anchor_text") or "").strip()
+            anchor_position = (pos_meta.get("anchor_position") or "below").lower()
+            question_no = (pos_meta.get("question_no") or "").strip()
+            ctx = (fig.context_hint or "theory").lower()
+
+            target_sid = section_id if section_id and section_id != "_orphan" else ""
+            if (not target_sid or target_sid not in sections_by_id) and fig.page_number is not None:
+                for sid_iter, sec_iter in sections_by_id.items():
+                    ps = getattr(sec_iter, "page_start", None)
+                    pe = getattr(sec_iter, "page_end", None)
+                    if ps is not None and pe is not None and ps <= fig.page_number <= pe:
+                        target_sid = sid_iter
+                        break
+
+            placed = False
+
+            # Question path
+            if ctx == "question" and target_sid and question_no:
+                for q in questions_by_section.get(target_sid, []):
+                    if (q.question_number or "").strip() == question_no:
+                        char_end = len((q.raw_text or ""))
+                        new_refs.append(FigureReference(
+                            figure_id=fig.id, book_id=book_id,
+                            section_ref=target_sid,
+                            context="question", question_id=q.id,
+                            placeholder_text=None, link_method="auto",
+                            placement_kind="inline", placement_block_idx=None,
+                            placement_char_offset=char_end,
+                        ))
+                        counters["question_inline"] += 1
+                        placed = True
+                        break
+            if placed:
+                continue
+
+            # Theory path — anchor_text fuzzy match
+            if ctx != "question" and target_sid and anchor_text:
+                sec_row = sections_by_id.get(target_sid)
+                blocks = (sec_row.blocks if sec_row else None) or []
+                matched_idx: int | None = None
+                snippet60 = anchor_text[:60].lower()
+                if snippet60:
+                    for idx, b in enumerate(blocks):
+                        btext = (b.get("c") or "").lower() if isinstance(b, dict) else ""
+                        if snippet60 in btext:
+                            matched_idx = idx
+                            break
+                if matched_idx is None:
+                    snippet30 = anchor_text[:30].lower()
+                    if len(snippet30) >= 10:
+                        for idx, b in enumerate(blocks):
+                            btext = (b.get("c") or "").lower() if isinstance(b, dict) else ""
+                            if snippet30 in btext:
+                                matched_idx = idx
+                                break
+                if matched_idx is not None:
+                    placement_idx = matched_idx if anchor_position == "above" else matched_idx + 1
+                    new_refs.append(FigureReference(
+                        figure_id=fig.id, book_id=book_id,
+                        section_ref=target_sid,
+                        context="theory", question_id=None,
+                        placeholder_text=None, link_method="auto",
+                        placement_kind="inline",
+                        placement_block_idx=placement_idx,
+                        placement_char_offset=None,
+                    ))
+                    counters["theory_inline"] += 1
+                    placed = True
+            if placed:
+                continue
+
+            # Ultimate fallback — section end
+            if target_sid:
+                new_refs.append(FigureReference(
+                    figure_id=fig.id, book_id=book_id,
+                    section_ref=target_sid,
+                    context="theory" if ctx != "question" else "question",
+                    question_id=None,
+                    placeholder_text=None, link_method="auto",
+                    placement_kind="page_fallback",
+                    placement_block_idx=None,
+                    placement_char_offset=None,
+                ))
+                counters["theory_appended"] += 1
+                continue
+
+            # No section at all → unattached tray
+            new_refs.append(FigureReference(
+                figure_id=fig.id, book_id=book_id, section_ref=section_id,
+                context="theory", question_id=None,
+                placeholder_text=None, link_method="auto",
+                placement_kind="unattached", placement_block_idx=None,
+                placement_char_offset=None,
+            ))
+            counters["unattached"] += 1
+            continue
+
+        # ─── Pass 1: label-first placement for LABELLED figures ──
         # NOTE (figures-orphan fix): even when the extractor couldn't pin
         # this figure to a real section ("_orphan"), still try label-match
         # across all theory + question text. A figure labelled "Figure 4.7"
@@ -623,6 +741,106 @@ def embed_figures_for_book_sync(session, book_id: UUID) -> dict[str, int]:
     for fig in figures:
         counters["figures_seen"] += 1
         section_id = fig.section_id or ""
+
+        # ─── Pass 2 (NEW): positional placement for UNLABELLED figures ──
+        # Mirrors the async variant. See embed_figures_for_book() for the
+        # detailed rationale and flow comments.
+        pos_meta = fig.regen_meta if isinstance(fig.regen_meta, dict) else None
+        if pos_meta and pos_meta.get("is_labelled") is False:
+            anchor_text = (pos_meta.get("anchor_text") or "").strip()
+            anchor_position = (pos_meta.get("anchor_position") or "below").lower()
+            question_no = (pos_meta.get("question_no") or "").strip()
+            ctx = (fig.context_hint or "theory").lower()
+
+            target_sid = section_id if section_id and section_id != "_orphan" else ""
+            if (not target_sid or target_sid not in sections_by_id) and fig.page_number is not None:
+                for sid_iter, sec_iter in sections_by_id.items():
+                    ps = getattr(sec_iter, "page_start", None)
+                    pe = getattr(sec_iter, "page_end", None)
+                    if ps is not None and pe is not None and ps <= fig.page_number <= pe:
+                        target_sid = sid_iter
+                        break
+
+            placed = False
+
+            if ctx == "question" and target_sid and question_no:
+                for q in questions_by_section.get(target_sid, []):
+                    if (q.question_number or "").strip() == question_no:
+                        char_end = len((q.raw_text or ""))
+                        new_refs.append(FigureReference(
+                            figure_id=fig.id, book_id=book_id,
+                            section_ref=target_sid,
+                            context="question", question_id=q.id,
+                            placeholder_text=None, link_method="auto",
+                            placement_kind="inline", placement_block_idx=None,
+                            placement_char_offset=char_end,
+                        ))
+                        counters["question_inline"] += 1
+                        placed = True
+                        break
+            if placed:
+                continue
+
+            if ctx != "question" and target_sid and anchor_text:
+                sec_row = sections_by_id.get(target_sid)
+                blocks = (sec_row.blocks if sec_row else None) or []
+                matched_idx: int | None = None
+                snippet60 = anchor_text[:60].lower()
+                if snippet60:
+                    for idx, b in enumerate(blocks):
+                        btext = (b.get("c") or "").lower() if isinstance(b, dict) else ""
+                        if snippet60 in btext:
+                            matched_idx = idx
+                            break
+                if matched_idx is None:
+                    snippet30 = anchor_text[:30].lower()
+                    if len(snippet30) >= 10:
+                        for idx, b in enumerate(blocks):
+                            btext = (b.get("c") or "").lower() if isinstance(b, dict) else ""
+                            if snippet30 in btext:
+                                matched_idx = idx
+                                break
+                if matched_idx is not None:
+                    placement_idx = matched_idx if anchor_position == "above" else matched_idx + 1
+                    new_refs.append(FigureReference(
+                        figure_id=fig.id, book_id=book_id,
+                        section_ref=target_sid,
+                        context="theory", question_id=None,
+                        placeholder_text=None, link_method="auto",
+                        placement_kind="inline",
+                        placement_block_idx=placement_idx,
+                        placement_char_offset=None,
+                    ))
+                    counters["theory_inline"] += 1
+                    placed = True
+            if placed:
+                continue
+
+            if target_sid:
+                new_refs.append(FigureReference(
+                    figure_id=fig.id, book_id=book_id,
+                    section_ref=target_sid,
+                    context="theory" if ctx != "question" else "question",
+                    question_id=None,
+                    placeholder_text=None, link_method="auto",
+                    placement_kind="page_fallback",
+                    placement_block_idx=None,
+                    placement_char_offset=None,
+                ))
+                counters["theory_appended"] += 1
+                continue
+
+            new_refs.append(FigureReference(
+                figure_id=fig.id, book_id=book_id, section_ref=section_id,
+                context="theory", question_id=None,
+                placeholder_text=None, link_method="auto",
+                placement_kind="unattached", placement_block_idx=None,
+                placement_char_offset=None,
+            ))
+            counters["unattached"] += 1
+            continue
+
+        # ─── Pass 1: label-first placement for LABELLED figures ──
         # NOTE (figures-orphan fix): even when the extractor couldn't pin
         # this figure to a real section ("_orphan"), still try label-match
         # across all theory + question text. A figure labelled "Figure 4.7"
