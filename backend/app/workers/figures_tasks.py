@@ -250,6 +250,19 @@ def _extract_figures_v2_impl(book_id: str, job_id: str) -> dict[str, Any]:
             # Determine the figure's primary section anchor — use the first
             # candidate's section_ref (already chosen most-specific by linker).
             primary_section_ref = head.get("section_ref") or ""
+            # Positional-linking metadata is stored in regen_meta JSON so
+            # the embedder (Pass 2) can place unlabelled figures using
+            # anchor_text / anchor_position / question_no. Labelled figures
+            # ignore these fields; their embedder path uses figure_label
+            # against in-block references exactly as before.
+            positional_meta = None
+            if head.get("is_labelled") is False:
+                positional_meta = {
+                    "is_labelled": False,
+                    "anchor_text": head.get("anchor_text"),
+                    "anchor_position": head.get("anchor_position"),
+                    "question_no": head.get("question_no"),
+                }
             fig_row = Figure(
                 book_id=book_uuid,
                 section_id=primary_section_ref or "_orphan",
@@ -271,6 +284,7 @@ def _extract_figures_v2_impl(book_id: str, job_id: str) -> dict[str, Any]:
                 context_hint=", ".join(
                     sorted({c.get("context") for c in cands if c.get("context")})
                 ) or None,
+                regen_meta=positional_meta,
             )
             session.add(fig_row)
             session.flush()  # need fig_row.id for refs
