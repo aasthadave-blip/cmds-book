@@ -283,6 +283,25 @@ async def patch_schema(
     book.title = validated.document_title or book.title
     book.subject = validated.subject or book.subject
     await session.flush()
+
+    # Prune sections whose section_id no longer exists in the new schema.
+    # When a user re-generates or edits the schema (drag-drop, delete, rename),
+    # the old Section rows would otherwise survive in the DB and surface in
+    # the Review sidebar as orphan entries at the bottom of the chapter
+    # (sorted with Number.MAX_SAFE_INTEGER because their slug isn't in the
+    # current schema's depth-first walk). Delete them here so DB and schema
+    # stay in sync.
+    from app.services.chunk_builder import flatten_sections as _flatten
+    valid_ids = {ss.id for ss in _flatten(validated)}
+    if valid_ids:
+        from sqlalchemy import delete as _delete
+        await session.execute(
+            _delete(Section)
+            .where(Section.book_id == book.id)
+            .where(Section.section_id.notin_(valid_ids))
+        )
+        await session.flush()
+
     # Auto-relink theory chips so that manual schema edits (drag-drop in
     # the editor that moves an Example/Exercise to a different parent)
     # take effect on the theory page WITHOUT requiring a re-extract.

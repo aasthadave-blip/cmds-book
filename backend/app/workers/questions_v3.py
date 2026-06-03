@@ -657,7 +657,13 @@ def _flatten_sections(schema: BookSchema) -> list[_Unit]:
                 expected=ec,
             ))
 
-    units.sort(key=lambda u: (u.page_start or 0, u.page_end or 0))
+    # Preserve schema declaration order — regular Cat A sections first
+    # (depth-first walk), then excluded sections in schema-declaration order.
+    # An earlier page-range sort here was a latent bug: when excluded
+    # sections share or overlap page ranges, the stable sort produced
+    # unexpected reordering that diverged from `flatten_sections(schema)`.
+    # Downstream consumers (final_merge, extraction_stats, logs) assume
+    # schema order — keep it.
 
     for i, u in enumerate(units):
         u.next_title = units[i + 1].title if i + 1 < len(units) else None
