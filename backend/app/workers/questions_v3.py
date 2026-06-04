@@ -1699,6 +1699,16 @@ async def _run_v3(book_id: UUID, bank_id: UUID, job_id: UUID) -> dict[str, Any]:
     except Exception as e:
         logger.warning("example_linker failed (book=%s): %s", book_id, e)
 
+    # Mark the bank as ready / partial BEFORE the figure embedder runs.
+    # The embedder's question-loading filter only loads from banks in
+    # ("ready", "partial"). If we update bank status AFTER the embedder,
+    # the embedder sees status="extracting" → loads 0 questions →
+    # every question-context figure ends up "unattached", even when
+    # the questions exist in the DB. Update first, embed second.
+    bank_status = "ready" if counts["failed"] == 0 else "partial"
+    with SyncSession() as session:
+        _update_bank(session, bank_id, status=bank_status)
+
     # Auto-embed figures now that questions exist. If figures were extracted
     # before questions, this is when question-tagged figure_references finally
     # land on the right questions. No-op if no figures yet — embedder is
@@ -1715,10 +1725,8 @@ async def _run_v3(book_id: UUID, bank_id: UUID, job_id: UUID) -> dict[str, Any]:
             "figure_embedder failed post-questions (book=%s): %s", book_id, e
         )
 
-    # Final job status
+    # Final job status (bank status already set above)
     with SyncSession() as session:
-        bank_status = "ready" if counts["failed"] == 0 else "partial"
-        _update_bank(session, bank_id, status=bank_status)
         dropped = dedup_stats["dropped"] if dedup_stats else 0
         dedup_note = f" (deduped {dropped})" if dropped else ""
         msg = (
