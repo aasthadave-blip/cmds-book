@@ -428,12 +428,32 @@ def _compute_figure_placements(
             # (∠, ≤, π, etc.) — those are part of the anchor identity
             # and a real OCR-to-OCR match preserves them.
             import re as _re
-            if ctx != "question" and target_sid and anchor_text:
-                sec_row = sections_by_id.get(target_sid)
-                blocks = (sec_row.blocks if sec_row else None) or []
+            if ctx != "question" and anchor_text:
                 anchor_norm = _re.sub(r"\s+", " ", anchor_text.lower()).strip()
-                matched_idx = None
-                if anchor_norm:
+
+                # Anchor text is the PRIMARY signal for placement — page
+                # assignment is just an initial hint. The linker sometimes
+                # picks the wrong section when multiple sections share a
+                # page (e.g. "5-introduction" page 3-3 and "5-basic-
+                # concepts" page 3-6 both cover page 3; linker takes the
+                # first → fig assigned to 5-introduction but the anchor
+                # actually lives in 5-basic-concepts).
+                #
+                # Strategy: try the originally-assigned target_sid first
+                # (cheap, usually correct), then expand to ANY section
+                # whose page range contains the figure's page. First
+                # 100%-substring match wins and the figure migrates to
+                # that section. Still strict — wrong placement is worse
+                # than section-end fallback.
+                def _match_in_section(sid: str) -> int | None:
+                    """Strict full-anchor substring match against blocks
+                    of section ``sid``. Returns matched block index or None."""
+                    sec_row = sections_by_id.get(sid)
+                    if not sec_row:
+                        return None
+                    blocks = (sec_row.blocks if sec_row else None) or []
+                    if not anchor_norm:
+                        return None
                     for idx, b in enumerate(blocks):
                         if not isinstance(b, dict):
                             continue
@@ -442,13 +462,44 @@ def _compute_figure_placements(
                         if not block_norm:
                             continue
                         if anchor_norm in block_norm:
+                            return idx
+                    return None
+
+                matched_sid: str | None = None
+                matched_idx: int | None = None
+
+                # 1. Try the initially-assigned target_sid first.
+                if target_sid:
+                    idx = _match_in_section(target_sid)
+                    if idx is not None:
+                        matched_sid = target_sid
+                        matched_idx = idx
+
+                # 2. If no match in target_sid, scan other sections whose
+                # page range includes the figure's page. Anchor text is
+                # the source of truth — page assignment was just a hint.
+                if matched_idx is None and fig.page_number is not None:
+                    page = fig.page_number
+                    for sid_iter, sec_iter in sections_by_id.items():
+                        if sid_iter == target_sid:
+                            continue  # already tried
+                        ps = getattr(sec_iter, "page_start", None)
+                        pe = getattr(sec_iter, "page_end", None)
+                        if ps is None or pe is None:
+                            continue
+                        if not (ps <= page <= pe):
+                            continue
+                        idx = _match_in_section(sid_iter)
+                        if idx is not None:
+                            matched_sid = sid_iter
                             matched_idx = idx
                             break
-                if matched_idx is not None:
+
+                if matched_sid is not None and matched_idx is not None:
                     placement_idx = matched_idx if anchor_position == "above" else matched_idx + 1
                     new_refs.append(FigureReference(
                         figure_id=fig.id, book_id=book_id,
-                        section_ref=target_sid,
+                        section_ref=matched_sid,   # MIGRATE to the section where anchor was found
                         context="theory", question_id=None,
                         placeholder_text=None, link_method="auto",
                         placement_kind="inline",
