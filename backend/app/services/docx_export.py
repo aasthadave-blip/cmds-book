@@ -660,22 +660,31 @@ class _DocBuilder:
 # Questions / Regen rendering
 # ---------------------------------------------------------------------------
 
-def _render_question(b: _DocBuilder, q: dict, *, label: str | None = None) -> None:
-    """Render a single question as Question/Options/Answer/Solution."""
+def _render_question_head(
+    b: _DocBuilder, q: dict, *, label: str | None = None
+) -> None:
+    """Render the question STEM + options only.
+
+    Split out so callers can render embedded_figures BETWEEN the stem
+    and the solution (matching the PDF's original layout where the
+    diagram sits between the problem statement and the worked-out
+    steps).
+    """
     raw = q.get("raw_text") or ""
     stem = _strip_options_from_stem(raw)
     has_options = bool(q.get("has_options"))
 
-    # Question (with optional numeric label like "Question 1")
     question_label = "Question" if not label else f"Question {label}"
     b.labeled(question_label, stem)
 
-    # Options — only when raw_text contains them
     if has_options:
         opts = _parse_options(raw)
         b.options(opts)
 
-    # Answer / Solution — split if printed solution starts with "Ans."
+
+def _render_question_tail(b: _DocBuilder, q: dict) -> None:
+    """Render Answer / Solution / question gap after the stem (and after
+    any embedded_figures the caller emitted between head and tail)."""
     sol_text = q.get("solution_text") or ""
     answer, solution = _split_answer_from_solution(sol_text)
     if answer:
@@ -683,6 +692,16 @@ def _render_question(b: _DocBuilder, q: dict, *, label: str | None = None) -> No
     if solution:
         b.labeled("Solution", solution)
     b.question_gap()
+
+
+def _render_question(b: _DocBuilder, q: dict, *, label: str | None = None) -> None:
+    """Backward-compatible single-call render — stem + options + answer
+    + solution + gap. Used by the question-bank export path which has no
+    embedded_figures handling. The final-draft path uses
+    _render_question_head + figures + _render_question_tail so figures
+    sit between stem and solution."""
+    _render_question_head(b, q, label=label)
+    _render_question_tail(b, q)
 
 
 def build_questions_docx(
@@ -1012,11 +1031,14 @@ def build_final_draft_docx(
             continue
         if t == "question":
             q = dict(it.get("question") or {})
-            # Embed any question-attached figures right after the prompt
-            # so they live with the question card in the output. We do
-            # this by injecting them inline via _DocBuilder.image after
-            # _render_question runs.
-            _render_question(b, q)
+            # Layout: stem (+ options) → figures → solution.
+            # Matches the PDF's original layout where the construction
+            # diagram sits between the problem statement and the worked-
+            # out steps. Previously the figures were emitted AFTER the
+            # full question card (stem + options + solution), pushing
+            # them past the solution text — wrong position relative to
+            # the source PDF.
+            _render_question_head(b, q)
             for f in q.get("embedded_figures") or []:
                 fid = str(f.get("figure_id") or "")
                 data = figure_bytes_map.get(fid)
@@ -1024,6 +1046,7 @@ def build_final_draft_docx(
                     b.image(data, label=f.get("label") or "", caption=f.get("caption") or "")
                 else:
                     b.figure_callout(f.get("label") or "image", f.get("caption") or "")
+            _render_question_tail(b, q)
             continue
         if t == "custom_text":
             _render_custom_text(b, it.get("content") or "")
