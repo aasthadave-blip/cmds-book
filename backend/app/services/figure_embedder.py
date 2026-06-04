@@ -448,7 +448,12 @@ def _compute_figure_placements(
             # (∠, ≤, π, etc.) — those are part of the anchor identity
             # and a real OCR-to-OCR match preserves them.
             import re as _re
-            if ctx != "question" and anchor_text:
+            # Anchor-text fallback. Runs for theory figures AND for
+            # question figures whose question_no didn't resolve to a DB
+            # question above (typo, OCR drift, duplicate-question dedup).
+            # Better to surface the image at the right block in the
+            # section than to silently drop it.
+            if anchor_text:
                 # Subscript / superscript digits (and a few math letters)
                 # commonly drift between Gemini passes — the figure
                 # extractor may transcribe "l1, l2" while the theory
@@ -591,12 +596,19 @@ def _compute_figure_placements(
             if placed:
                 continue
 
-            # Ultimate fallback — section end
+            # Ultimate fallback — section end. Always emit as
+            # context="theory" page_fallback so the renderer surfaces it
+            # at the section tail. Previously a ctx="question" figure
+            # that missed its question_no match landed here with
+            # context="question" + question_id=None, which final_merge
+            # silently dropped (it requires question_id to attach a
+            # question figure). Routing through theory keeps the image
+            # visible while preserving section context.
             if target_sid:
                 new_refs.append(FigureReference(
                     figure_id=fig.id, book_id=book_id,
                     section_ref=target_sid,
-                    context="theory" if ctx != "question" else "question",
+                    context="theory",
                     question_id=None,
                     placeholder_text=None, link_method="auto",
                     placement_kind="page_fallback",
@@ -760,11 +772,15 @@ async def embed_figures_for_book(
     # Restrict to latest ready bank — older banks have stale question_ids
     # that newer extractions replace.
     from app.models.question_bank import QuestionBank
+    # Accept both "ready" and "partial" — a partial bank still has
+    # questions in the DB, and final_merge surfaces them. Restricting to
+    # "ready" only would silently drop every question-attached unlabelled
+    # figure when even one section's question worker failed.
     latest_bank = (
         await session.execute(
             select(QuestionBank)
             .where(QuestionBank.book_id == book_id)
-            .where(QuestionBank.status == "ready")
+            .where(QuestionBank.status.in_(["ready", "partial"]))
             .order_by(QuestionBank.created_at.desc())
             .limit(1)
         )
@@ -825,10 +841,14 @@ def embed_figures_for_book_sync(session, book_id: UUID) -> dict[str, int]:
     sections_by_id = {s.section_id: s for s in sections}
 
     from app.models.question_bank import QuestionBank
+    # Accept both "ready" and "partial" — mirrors final_merge (a partial
+    # bank still has live questions; restricting to "ready" silently drops
+    # every question-attached unlabelled figure on books where one
+    # section's question worker failed).
     latest_bank = session.execute(
         _select(QuestionBank)
         .where(QuestionBank.book_id == book_id)
-        .where(QuestionBank.status == "ready")
+        .where(QuestionBank.status.in_(["ready", "partial"]))
         .order_by(QuestionBank.created_at.desc())
         .limit(1)
     ).scalars().first()
