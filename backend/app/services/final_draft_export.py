@@ -34,6 +34,20 @@ from sqlalchemy.ext.asyncio import AsyncSession
 from app.models.figure import Figure
 from app.models.final_draft import FinalDraft
 
+# Figure-placeholder regex emitted by the question extractor:
+#   {{fig: <label> — <caption>}}
+# These placeholders mark inline figure positions in raw_text; the
+# actual figure renders as a separate image block via
+# embedded_figures, so the placeholder gets stripped from the visible
+# text to avoid literal "{{fig: ...}}" bleeding into the export.
+_FIG_PLACEHOLDER_RE = re.compile(r"\{\{\s*fig\s*:\s*[^}]+?\s*\}\}", re.IGNORECASE)
+
+
+def _strip_fig_placeholders(text: str | None) -> str:
+    if not text:
+        return ""
+    return _FIG_PLACEHOLDER_RE.sub("", text).rstrip()
+
 logger = logging.getLogger(__name__)
 
 _LIST_PREFIX_RE = re.compile(r"^\s*(?:\(\d+\)|\d+[.)])\s+")
@@ -267,7 +281,7 @@ def _question_to_md(q: dict[str, Any], figure_paths: dict[str, str]) -> str:
     if header_bits:
         parts.append("**" + " · ".join(header_bits) + "**")
     if q.get("raw_text"):
-        parts.append(q["raw_text"])
+        parts.append(_strip_fig_placeholders(q["raw_text"]))
     for f in q.get("embedded_figures") or []:
         fp = figure_paths.get(str(f.get("figure_id")))
         if fp:

@@ -3,6 +3,7 @@
 
 import { Icon } from '../Icon';
 import { API_BASE } from '../../api/client';
+import { stripFigPlaceholders } from '../../lib/questionText';
 import type {
   ExtractedQuestion,
   SectionQuestions,
@@ -264,7 +265,7 @@ function QuestionCard({ q }: { q: ExtractedQuestion }) {
           whiteSpace: 'pre-wrap',
         }}
       >
-        {q.raw_text}
+        {stripFigPlaceholders(q.raw_text || '')}
       </div>
       {/* Embedded figures — render at the BOTTOM of the question text
           (closest the UI can get without doing char-offset splicing).
