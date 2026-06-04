@@ -139,6 +139,76 @@ def _match_node(
     return None
 
 
+def _uniquify_ids(schema: BookSchema) -> dict[str, str]:
+    """Walk the schema and force every section.id to be UNIQUE.
+
+    When the same id appears multiple times (Gemini occasionally emits
+    duplicates, especially on multi-column pages where two sections sit
+    on the same line and the slug derivation collides), the SECOND and
+    subsequent occurrences get renamed with a numeric suffix
+    (``-2``, ``-3``, ...). The first occurrence keeps its original id.
+
+    Returns a ``{original_id : new_id}`` remap dict for any nodes that
+    were renamed (empty when the schema was already unique).
+
+    This pre-pass runs BEFORE alignment so the alignment helper sees a
+    valid unique-id schema and never produces collisions downstream.
+    Without it, a duplicate in Gemini's output silently propagated
+    through alignment and caused two section_heading rows in the final
+    draft to share the same id — the merge code then resolved BOTH
+    section_heading lookups to the same DB row, dropping the second
+    section's content from the user-visible output.
+    """
+    seen: set[str] = set()
+    remap: dict[str, str] = {}
+
+    def fresh_id(base: str) -> str:
+        n = 2
+        while True:
+            candidate = f"{base}-{n}"
+            if candidate not in seen:
+                return candidate
+            n += 1
+
+    def walk(node: SchemaSection) -> None:
+        sid = node.id or ""
+        if sid in seen:
+            new_sid = fresh_id(sid)
+            remap[sid] = new_sid
+            node.id = new_sid
+            seen.add(new_sid)
+            logger.warning(
+                "schema_alignment: duplicate section.id %r in input schema "
+                "— renamed second occurrence to %r (title=%r)",
+                sid, new_sid, node.title,
+            )
+        elif sid:
+            seen.add(sid)
+        for sub in node.subsections:
+            walk(sub)
+
+    for s in schema.sections:
+        walk(s)
+    return remap
+
+
+def _verify_unique_ids(schema: BookSchema) -> list[str]:
+    """Post-alignment sanity check. Returns a list of any ids that
+    appear more than once (empty when the schema is sound)."""
+    counts: dict[str, int] = {}
+
+    def walk(node: SchemaSection) -> None:
+        sid = node.id or ""
+        if sid:
+            counts[sid] = counts.get(sid, 0) + 1
+        for sub in node.subsections:
+            walk(sub)
+
+    for s in schema.sections:
+        walk(s)
+    return [sid for sid, n in counts.items() if n > 1]
+
+
 def align_schema_ids_to_existing_sections(
     new_schema: BookSchema,
     existing_sections: Iterable,
@@ -150,14 +220,21 @@ def align_schema_ids_to_existing_sections(
     The schema instance is mutated in place AND returned (callers can
     use either; we return for clarity at call sites).
     """
+    # Pre-pass: uniquify any duplicate section ids that Gemini may have
+    # emitted in the fresh schema. Without this the alignment loop can
+    # silently produce a schema whose two different sections share the
+    # same id, causing downstream lookups (final_merge, sections table
+    # joins, frontend sorting) to collapse both sections into one row.
+    pre_remap = _uniquify_ids(new_schema)
+
     title_pagestart, title_only, page_range = _build_existing_index(
         existing_sections
     )
     if not title_only and not page_range:
-        return new_schema, {}
+        return new_schema, dict(pre_remap)
 
     consumed: set[str] = set()
-    remap: dict[str, str] = {}
+    remap: dict[str, str] = dict(pre_remap)
 
     def walk_section(node: SchemaSection) -> None:
         match = _match_node(
@@ -165,6 +242,12 @@ def align_schema_ids_to_existing_sections(
             title_pagestart, title_only, page_range, consumed,
         )
         if match is not None and match != node.id:
+            # Defensive: if the matched DB id was already claimed by an
+            # earlier node (shouldn't happen because _match_node honours
+            # consumed_ids, but belt-and-braces), refuse to introduce a
+            # duplicate.
+            if match in consumed:
+                return
             remap[node.id] = match
             node.id = match
             consumed.add(match)
@@ -188,9 +271,22 @@ def align_schema_ids_to_existing_sections(
     for ex in new_schema.excluded_sections:
         walk_excluded(ex)
 
+    # Post-pass: final sanity check. If anything went wrong above and
+    # the schema still has duplicate ids, uniquify them now. This is
+    # the safety net — we should never persist a schema with duplicates.
+    duplicates = _verify_unique_ids(new_schema)
+    if duplicates:
+        logger.warning(
+            "schema_alignment: post-align still has %d duplicate id(s): %s — "
+            "running second uniquify pass",
+            len(duplicates), duplicates,
+        )
+        post_remap = _uniquify_ids(new_schema)
+        remap.update(post_remap)
+
     if remap:
         logger.info(
-            "schema_alignment: preserved %d section_id(s) from DB: %s",
+            "schema_alignment: %d id remap(s) applied: %s",
             len(remap),
             ", ".join(f"{k}→{v}" for k, v in list(remap.items())[:5]),
         )
