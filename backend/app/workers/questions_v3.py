@@ -498,7 +498,8 @@ class _Unit:
     """One extraction unit: a section or excluded section with page range."""
 
     __slots__ = ("kind", "id", "title", "page_start", "page_end",
-                 "expected", "next_title", "skipped")
+                 "expected", "next_title", "skipped",
+                 "section_start_heading")
 
     def __init__(
         self,
@@ -509,6 +510,7 @@ class _Unit:
         page_end: int | None,
         expected: int | None,
         skipped: bool = False,
+        section_start_heading: str | None = None,
     ) -> None:
         self.kind = kind
         self.id = ref_id
@@ -521,10 +523,32 @@ class _Unit:
         # status="skipped" but no Gemini call is made. Used for the
         # "trust the schema's eqc=0" cost optimisation.
         self.skipped = skipped
+        # Multi-column books only — verbatim printed heading text that
+        # marks where THIS section begins on its first page. Lets the
+        # extractor skip the tail of the previous section that shares
+        # the boundary page (e.g. Critical Thinking 4.1 starts mid-
+        # page 434 right after Classical Thinking 4.3 ends). None for
+        # single-column books so their prompt text is byte-identical
+        # to before this change.
+        self.section_start_heading = section_start_heading
 
 
-def _flatten_sections(schema: BookSchema) -> list[_Unit]:
+def _flatten_sections(
+    schema: BookSchema,
+    *,
+    is_multi_column: bool = False,
+) -> list[_Unit]:
     """Walk the schema depth-first and emit one extraction unit per node.
+
+    Parameters
+    ----------
+    is_multi_column: when True, each unit carries the section's printed
+        heading as ``section_start_heading``. The extractor uses that
+        to skip the tail of the previous section on the shared boundary
+        page (e.g. Critical Thinking 4.1 starts mid-page 434 after
+        Classical Thinking 4.3 ends; without the heading hint Gemini
+        captures the wrong questions). Single-column books pass False
+        so prompt text stays byte-identical to before this change.
 
     Coverage policy (changed 2026-05-05):
       - Every schema node (section AND subsection) becomes its own unit, so
@@ -597,6 +621,7 @@ def _flatten_sections(schema: BookSchema) -> list[_Unit]:
                     page_end=node.page_end,
                     expected=eqc,
                     skipped=False,
+                    section_start_heading=node.title if is_multi_column else None,
                 ))
 
         for c in children:
@@ -646,6 +671,7 @@ def _flatten_sections(schema: BookSchema) -> list[_Unit]:
                     page_start=c.page_start or ex.page_start,
                     page_end=c.page_end or ex.page_end,
                     expected=cec,
+                    section_start_heading=(c.title or ex.title) if is_multi_column else None,
                 ))
         else:
             units.append(_Unit(
@@ -655,6 +681,7 @@ def _flatten_sections(schema: BookSchema) -> list[_Unit]:
                 page_start=ex.page_start,
                 page_end=ex.page_end,
                 expected=ec,
+                section_start_heading=(ex.title or None) if is_multi_column else None,
             ))
 
     # Preserve schema declaration order — regular Cat A sections first
@@ -711,10 +738,28 @@ def _build_user_prompt(unit: _Unit) -> str:
         if unit.next_title
         else ""
     )
+    # Multi-column boundary hint — only present when the book was uploaded
+    # with the multi-column flag (set in _flatten_sections by the worker
+    # entry point). Tells Gemini the verbatim printed heading where THIS
+    # section begins so it can skip the previous section's tail on a
+    # shared boundary page. Single-column books pass None here and this
+    # branch contributes nothing — prompt text stays byte-identical to
+    # pre-fix behaviour.
+    start_anchor = ""
+    if unit.section_start_heading:
+        start_anchor = (
+            f"\nBOUNDARY: This section starts on its first page AFTER the "
+            f"printed heading \"{unit.section_start_heading}\". "
+            f"Any numbered items printed on that page BEFORE that heading "
+            f"belong to the previous section — do NOT include them, even "
+            f"if their question numbers look like \"1.\", \"2.\", etc. "
+            f"Start counting / extracting only from the first item printed "
+            f"AFTER the section's start heading."
+        )
     return (
         f"Transcribe verbatim every question-like item that is visibly printed "
         f"in the section titled: \"{unit.title}\" (ID: {unit.id}).\n"
-        f"START at the heading \"{unit.title}\".{stop}\n\n"
+        f"START at the heading \"{unit.title}\".{start_anchor}{stop}\n\n"
         "These PDF pages may contain content from adjacent sections. "
         "Extract ONLY items that belong to this section.\n\n"
         "If this section is pure theory and contains NO question-like items "
@@ -1471,7 +1516,13 @@ async def _run_v3(book_id: UUID, bank_id: UUID, job_id: UUID) -> dict[str, Any]:
             raise ValueError("Book has no approved schema — analyse first")
 
         schema = BookSchema(**book.schema)
-        units = _flatten_sections(schema)
+        # Read upload-time multi-column flag from book.analyser. When
+        # True, units carry the printed section heading as
+        # `section_start_heading` so the extractor can skip the tail of
+        # the previous section on a shared boundary page. Default False
+        # → single-column prompt path stays byte-identical.
+        is_multi_column = bool((book.analyser or {}).get("is_multi_column", False))
+        units = _flatten_sections(schema, is_multi_column=is_multi_column)
         total = len(units)
         if total == 0:
             _update_bank(session, bank_id, status="ready",
@@ -1743,7 +1794,8 @@ async def _run_section_retry(
             raise ValueError("Book or schema missing")
 
         schema = BookSchema(**book.schema)
-        units = _flatten_sections(schema)
+        is_multi_column = bool((book.analyser or {}).get("is_multi_column", False))
+        units = _flatten_sections(schema, is_multi_column=is_multi_column)
         unit = next((u for u in units if u.id == section_ref), None)
         if unit is None:
             raise ValueError(f"Section {section_ref!r} not in schema")
