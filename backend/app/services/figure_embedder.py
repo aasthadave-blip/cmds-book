@@ -422,6 +422,46 @@ def _compute_figure_placements(
                             placed = True
                             break
 
+            # NEW: section_ref pattern fallback.
+            # When question_no path didn't match by question_number (a
+            # 9-question silent-drop pattern observed in prod: the
+            # question worker created 24 example-section rows but only
+            # populated question_number on 15 of them — the 9
+            # figure-bearing examples got empty question_number even
+            # though their section_ref like "9-construction-of-triangles-6-example-9.11"
+            # encodes the number). Match figure.question_no against the
+            # section_ref's "-example-X.Y" suffix or "-X.Y" tail.
+            # Strict: question_no must be at the END of section_ref or
+            # adjacent to "-example-" — avoids accidentally matching a
+            # different section that just happens to contain "9.11"
+            # somewhere in its slug.
+            if not placed and ctx == "question" and question_no:
+                want = _norm_qno(question_no)
+                if want:
+                    for q in questions:
+                        sref = (q.section_ref or "").lower()
+                        # Match patterns like "...-example-9.11", "...-9.11"
+                        if (sref.endswith(f"-{want}")
+                                or sref.endswith(f"-example-{want}")):
+                            char_end = len((q.raw_text or ""))
+                            new_refs.append(FigureReference(
+                                figure_id=fig.id, book_id=book_id,
+                                section_ref=(q.section_ref or target_sid),
+                                context="question", question_id=q.id,
+                                placeholder_text=None, link_method="auto",
+                                placement_kind="inline",
+                                placement_block_idx=None,
+                                placement_char_offset=char_end,
+                            ))
+                            counters["question_inline"] += 1
+                            placed = True
+                            logger.info(
+                                "figure_embedder: matched figure→question via section_ref pattern "
+                                "(qno=%s, section_ref=%s)",
+                                want, q.section_ref,
+                            )
+                            break
+
             # NEW: anchor_text → question.raw_text substring match.
             # Runs when ctx="question" AND either question_no is empty
             # (example sections often emit empty question_number) OR the
