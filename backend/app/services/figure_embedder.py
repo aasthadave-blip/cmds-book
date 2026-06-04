@@ -515,6 +515,13 @@ def _compute_figure_placements(
                         for it in (b.get("items") or []):
                             if isinstance(it, str) and it:
                                 out.append(_norm_match(it))
+                    if b.get("t") == "example":
+                        # `prob` carries the problem statement — exactly
+                        # what Gemini would quote as anchor_text when a
+                        # figure sits next to a worked example.
+                        prob = b.get("prob") or ""
+                        if prob:
+                            out.append(_norm_match(prob))
                     return [s for s in out if s]
 
                 def _match_in_section(sid: str) -> int | None:
