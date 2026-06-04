@@ -13,6 +13,7 @@ import { API_BASE, ApiError, req } from '../api/client';
 import { useBook } from '../api/books';
 import { Icon } from '../components/Icon';
 import { MathMarkdown } from '../components/MathMarkdown';
+import { stripFigPlaceholders } from '../lib/questionText';
 
 type Block = { t: string; [k: string]: unknown };
 
@@ -366,7 +367,7 @@ function renderItem(item: FinalDraftItem): React.ReactElement | null {
           {q.question_number ? `Q${q.question_number}` : (q.exercise_ref || 'Question')}
         </div>
         <div style={{ fontSize: 14, color: 'var(--ink-900)', lineHeight: 1.55 }}>
-          <MathMarkdown>{q.raw_text || '(no text)'}</MathMarkdown>
+          <MathMarkdown>{stripFigPlaceholders(q.raw_text) || '(no text)'}</MathMarkdown>
         </div>
         {/* Embedded figures inline at the bottom of the question text */}
         {embedded.length > 0 && (

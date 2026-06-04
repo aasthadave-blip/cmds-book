@@ -335,10 +335,13 @@ def _render_inline(p, text: str) -> None:
             r.italic = True
             r.font.size = Pt(10)
         elif kind == "fig":
-            r = p.add_run(f"[Figure: {_normalise_math_prose(payload or 'unlabelled')}]")
-            r.italic = True
-            r.font.size = Pt(9)
-            r.font.color.rgb = MUTED
+            # Strip the placeholder silently. The actual figure is rendered
+            # separately below the question text via the embedded_figures
+            # pipeline, so an inline "[Figure: ...]" muted callout here is
+            # redundant. Keeping the callout caused visible duplication
+            # ("[Figure: A, B, C, D - (unlabelled diagram)]" + image of
+            # the same figure rendered right below).
+            pass
 
 
 def _strip_options_from_stem(raw_text: str) -> str:

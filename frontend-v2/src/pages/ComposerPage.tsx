@@ -44,6 +44,7 @@ import { API_BASE, ApiError, req } from '../api/client';
 import { useBook } from '../api/books';
 import { Icon } from '../components/Icon';
 import { MathMarkdown } from '../components/MathMarkdown';
+import { stripFigPlaceholders } from '../lib/questionText';
 
 type Block = { t: string; [k: string]: unknown };
 
@@ -681,7 +682,7 @@ function ItemContent({ item }: { item: FinalDraftItem }) {
     return (
       <div>
         <div style={{ fontSize: 13, color: 'var(--ink-900)', lineHeight: 1.55 }}>
-          {String(q.raw_text ?? '(no question text)')}
+          {stripFigPlaceholders(q.raw_text) || '(no question text)'}
         </div>
         {q.solution_text && (
           <div style={{ marginTop: 6, padding: '8px 10px', background: 'var(--bg-tint)', borderRadius: 6, fontSize: 12, color: 'var(--ink-700)', lineHeight: 1.55 }}>
