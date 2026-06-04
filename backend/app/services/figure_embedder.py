@@ -421,6 +421,44 @@ def _compute_figure_placements(
                             counters["question_inline"] += 1
                             placed = True
                             break
+
+            # NEW: anchor_text → question.raw_text substring match.
+            # Runs when ctx="question" AND either question_no is empty
+            # (example sections often emit empty question_number) OR the
+            # question_no lookup above didn't find a match. We try the
+            # OTHER direction: is the figure's anchor_text a substring of
+            # any question's raw_text? If so, that's the figure's question.
+            # Handles two failure classes:
+            #   - Empty question_number (Q9.6/Q9.11 example sections)
+            #   - Mis-classified figure (Gemini labelled it question but
+            #     used the question stem as anchor_text — common pattern)
+            if not placed and ctx == "question" and (anchor_text or "").strip():
+                # Need _norm_match defined earlier — pull it up here.
+                # Simple normalisation: lowercase + whitespace-collapse.
+                import re as _re_q
+                _anchor_norm_q = _re_q.sub(
+                    r"\s+", " ", (anchor_text or "").strip().lower()
+                )
+                if len(_anchor_norm_q) >= 20:  # avoid 1-2 word false matches
+                    for q in questions:
+                        if not q.raw_text:
+                            continue
+                        q_norm = _re_q.sub(
+                            r"\s+", " ", q.raw_text.strip().lower()
+                        )
+                        if _anchor_norm_q in q_norm:
+                            char_end = len(q.raw_text or "")
+                            new_refs.append(FigureReference(
+                                figure_id=fig.id, book_id=book_id,
+                                section_ref=(q.section_ref or target_sid),
+                                context="question", question_id=q.id,
+                                placeholder_text=None, link_method="auto",
+                                placement_kind="inline", placement_block_idx=None,
+                                placement_char_offset=char_end,
+                            ))
+                            counters["question_inline"] += 1
+                            placed = True
+                            break
             if placed:
                 continue
 
@@ -476,6 +514,12 @@ def _compute_figure_placements(
                     # broaden Z-as-letter to match ∠-as-glyph, that would
                     # false-match prose containing words like "Zone".
                     "∠": "z",
+                    # Parallel-lines glyph. Theory OCR commonly writes it
+                    # as "||" (two pipes). Map ∥ → "||" so anchors like
+                    # "l₁ ∥ l₂" match blocks like "l1 || l2" after
+                    # normalisation. Multi-char mapping is supported by
+                    # str.maketrans + translate.
+                    "∥": "||",
                 })
 
                 def _norm_match(text: str) -> str:
@@ -598,6 +642,18 @@ def _compute_figure_placements(
                             matched_sid = sid_iter
                             matched_idx = idx
                             break
+
+                # NOTE: a 4th-pass fuzzy fallback was considered and
+                # rejected. Token-containment / jaccard cannot reliably
+                # distinguish a genuine paraphrase (anchor adds 2-3
+                # words) from a same-language false positive (both
+                # contain common stopwords). A silently-mis-placed
+                # figure that LOOKS correct is worse than a section-end
+                # page_fallback the user can spot and reposition. The
+                # right answer for true paraphrase cases is Task #19
+                # (one Gemini verification call: "of these N candidate
+                # blocks, which one does this anchor refer to?") —
+                # cheaper and more accurate than text heuristics.
 
                 if matched_sid is not None and matched_idx is not None:
                     # anchor_position semantics — relative to where the
