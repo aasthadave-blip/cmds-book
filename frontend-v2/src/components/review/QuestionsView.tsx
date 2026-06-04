@@ -424,7 +424,7 @@ function MarkAllReviewedBanner({
   const [state, setState] = useState<
     | { kind: "idle" }
     | { kind: "loading" }
-    | { kind: "done"; restored: number; rescued: number }
+    | { kind: "done"; restored: number; rescued: number; attached: number }
     | { kind: "error"; message: string }
   >({ kind: "idle" });
 
@@ -437,6 +437,7 @@ function MarkAllReviewedBanner({
         kind: "done",
         restored: r.restored ?? 0,
         rescued: r.solutions_rescued ?? 0,
+        attached: r.figures_attached ?? 0,
       });
       if (onDone) onDone();
     } catch (e) {
@@ -462,6 +463,7 @@ function MarkAllReviewedBanner({
       >
         ✓ Marked {state.restored} item{state.restored === 1 ? "" : "s"} as reviewed
         {state.rescued > 0 && ` · rescued ${state.rescued} solution${state.rescued === 1 ? "" : "s"}`}
+        {state.attached > 0 && ` · attached ${state.attached} figure${state.attached === 1 ? "" : "s"}`}
         . Refresh the page to see them under their sections.
       </div>
     );

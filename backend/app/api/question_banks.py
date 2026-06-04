@@ -1117,11 +1117,32 @@ async def restore_all_rejected(
                 exc_info=True,
             )
 
+    # Re-run figure embedder so any question_no-tagged figure now has a
+    # newly-restored question to attach to. Without this, the figure stays
+    # in the unattached tray even though its target question is in DB.
+    # Same pattern as the existing tail-embedder calls in the 5 workers.
+    figures_attached = 0
+    if book_id_for_q2 is not None:
+        try:
+            from app.services.figure_embedder import embed_figures_for_book_sync
+            from app.workers.questions_v3 import SyncSession as _SyncSession
+            with _SyncSession() as own:
+                counters = embed_figures_for_book_sync(own, book_id_for_q2)
+            figures_attached = int(
+                (counters or {}).get("question_inline", 0)
+            )
+        except Exception:
+            import logging
+            logging.getLogger(__name__).warning(
+                "figure embedder after restore-all failed", exc_info=True,
+            )
+
     return {
         "ok": True,
         "restored": restored,
         "skipped": 0,
         "solutions_rescued": solutions_rescued,
+        "figures_attached": figures_attached,
     }
 
 
