@@ -616,6 +616,24 @@ def _flatten_sections(
             if not residual:
                 emit_self = False
 
+        # P-1 HARD STOP: if the parent has ANY Cat A (questions) children,
+        # NEVER emit the parent itself as a Cat A unit — even when the
+        # page-coverage check above leaves residual pages. The schema may
+        # over-report parent.page_end vs the leaves' actual coverage
+        # (observed Indefinite Integrals book: parent 4-critical-thinking
+        # claims pages 434-435 but its only leaf claims 434 only → 26
+        # questions on page 435 attached to the parent instead of the
+        # leaf). Children own the question pool; the parent is purely a
+        # container for grouping. If real prelude theory exists before
+        # the first child's heading, the theory pipeline still extracts
+        # it via the existing next_title hard-stop (extract.py:411-416).
+        has_cat_a_children = any(
+            "questions" in (c.content_types or [])
+            for c in children
+        )
+        if has_cat_a_children:
+            emit_self = False
+
         if emit_self:
             # CATEGORY A FILTER (Q1) — only sections explicitly tagged as
             # questions in the schema get a Gemini call. Category B (theory
