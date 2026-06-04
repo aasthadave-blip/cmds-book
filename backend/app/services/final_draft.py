@@ -128,19 +128,32 @@ async def seed_draft_items_from_merge(
                 target = b.get("section_id")
                 if target and target in section_ids_in_doc:
                     continue
-            # Conditional fig-block suppression: when the figure embedder
-            # has placed an actual figure item at this exact block index
-            # (figures_by_idx[i] non-empty), drop the fig-block placeholder
-            # — the image item below will render in its place. When there
-            # is NO figure item for this position, KEEP the fig block as
-            # a muted callout so the reader sees that a figure was meant
-            # to appear here. Earlier behaviour unconditionally dropped
-            # fig blocks in the renderers, which caused silent gaps when
-            # the embedder couldn't link a labelled figure.
+            # Conditional fig-block suppression: drop the theory
+            # extractor's `fig` placeholder block when a figure item is
+            # already rendering ADJACENT to it (at this index OR the
+            # previous index). The figure_embedder places figures at
+            # placement_block_idx=N meaning "render after block N", so a
+            # fig block sitting at index N+1 immediately follows that
+            # render and would visually duplicate the image (image +
+            # muted "📷 caption" callout for the same figure).
+            #
+            # When no adjacent figure exists, KEEP the fig block — its
+            # muted callout signals to the reader that a figure was
+            # extracted by the theory worker but the embedder couldn't
+            # link an actual image to this spot. Previously fig blocks
+            # were unconditionally suppressed in renderers, which caused
+            # silent gaps for unlinked labelled figures.
             if isinstance(b, dict) and b.get("t") == "fig":
-                if figures_by_idx.get(i):
-                    # Image will render — emit only the figure item(s),
-                    # skip the redundant placeholder block.
+                has_adjacent_figure = (
+                    bool(figures_by_idx.get(i))
+                    or bool(figures_by_idx.get(i - 1))
+                )
+                if has_adjacent_figure:
+                    # Emit any figure item(s) anchored AT this exact
+                    # index. Figures anchored at i-1 already rendered
+                    # immediately before this block (via the previous
+                    # iteration's `figures_by_idx.get(i)` emit), so no
+                    # additional emit needed here.
                     for f in figures_by_idx.get(i, []):
                         items.append({
                             "id": _new_id(),
@@ -156,9 +169,8 @@ async def seed_draft_items_from_merge(
                             "question": q,
                         })
                     continue
-                # No figure item at this position — keep the fig block as
-                # a visible placeholder. Fall through to the normal
-                # emit-block path below.
+                # No adjacent figure → keep the fig block as a visible
+                # placeholder. Fall through to the normal emit-block path.
             items.append({
                 "id": _new_id(),
                 "type": "block",
