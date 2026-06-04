@@ -534,7 +534,29 @@ def _compute_figure_placements(
                             break
 
                 if matched_sid is not None and matched_idx is not None:
-                    placement_idx = matched_idx if anchor_position == "above" else matched_idx + 1
+                    # anchor_position semantics — relative to where the
+                    # printed anchor sentence sits with respect to the
+                    # image on the original page:
+                    #   "above"  → anchor sits ABOVE the image (image is
+                    #              below the anchor) → figure renders
+                    #              right AFTER the anchor block
+                    #   "below"  → anchor sits BELOW the image (image is
+                    #              above the anchor) → figure renders
+                    #              right BEFORE the anchor block, i.e.
+                    #              after the previous block
+                    #   "beside" → anchor is at the same vertical level
+                    #              as the image; conventionally we put
+                    #              the image just BEFORE the anchor so
+                    #              the reader sees the figure first,
+                    #              then the descriptive sentence
+                    # seed_draft_items_from_merge emits figures with
+                    # placement_block_idx=i AFTER block i.
+                    if anchor_position == "above":
+                        placement_idx = matched_idx
+                    elif anchor_position == "below":
+                        placement_idx = max(0, matched_idx - 1)
+                    else:  # "beside" or unknown
+                        placement_idx = max(0, matched_idx - 1)
                     new_refs.append(FigureReference(
                         figure_id=fig.id, book_id=book_id,
                         section_ref=matched_sid,   # MIGRATE to the section where anchor was found
