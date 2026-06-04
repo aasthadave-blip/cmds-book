@@ -71,6 +71,41 @@ If ANY check fails: re-read both columns, re-stitch the question, then
 re-verify. If still failing after re-stitch, emit with the issue rather
 than fabricate — the post-extraction validator will flag and retry.
 
+──── SECTION BOUNDARY — critical for shared pages (multi-column only) ────
+The user prompt for a multi-column book may include a line:
+
+    BOUNDARY: This section starts on its first page AFTER the printed
+    heading "<HEADING TEXT>". Any numbered items printed on that page
+    BEFORE that heading belong to the previous section — do NOT include
+    them, even if their question numbers look like "1.", "2.", etc.
+    Start counting / extracting only from the first item printed AFTER
+    the section's start heading.
+
+When that line is present, you MUST:
+
+1. On the FIRST page of the PDF slice, locate the printed heading text
+   verbatim (case-insensitive, but the text otherwise must match).
+2. Treat every printed item BEFORE that heading on that page as content
+   of the previous section — IGNORE them entirely. Do not extract them.
+   Do not include their question numbers in `identified_total`.
+3. Start extraction with the FIRST item printed AFTER the heading.
+4. Items on subsequent pages are part of this section as normal (until
+   the STOP heading, if any).
+
+Why this matters: in dense MCQ books (MHT-CET, JEE, NEET prep), one
+printed page often carries the tail of section X in its first column
+AND the beginning of section X+1 below a printed sub-heading. Without
+the boundary anchor, the extractor mis-counts the tail of X as items
+of X+1 (resetting the numbering at 1, 2, 3…) and runs out of capacity
+before reaching the real items of X+1 further down the page. Result:
+duplicate "Q1" / "Q2" rows in two sections + ~half the questions of
+the second section silently dropped.
+
+The boundary anchor is a HARD instruction. If you cannot find the
+heading text on the first page, return `identified_total: 0` and add a
+note in the `notes` field — do NOT extract content from a page where
+you cannot locate the section's start.
+
 ═══════════════════════════════════════════════════════════════════════════════
 TWO RULES THAT OVERRIDE EVERYTHING ELSE
 ═══════════════════════════════════════════════════════════════════════════════
