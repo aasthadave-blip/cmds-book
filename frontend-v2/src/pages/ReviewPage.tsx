@@ -732,6 +732,18 @@ export default function ReviewPage() {
                 ? `Error: ${questionsState.error}`
                 : undefined
             }
+            bankId={banksDetail?.bank_id ?? null}
+            pendingReviewCount={
+              banksDetail
+                ? banksDetail.sections.reduce(
+                    (n, s) => n + (s.rejected?.length ?? 0),
+                    0,
+                  )
+                : 0
+            }
+            onPendingResolved={() => {
+              void questionsState.refetch();
+            }}
           />
         )}
         {tab === 'figures' && (

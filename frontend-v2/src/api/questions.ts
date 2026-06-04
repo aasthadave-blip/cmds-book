@@ -50,6 +50,14 @@ export type ExtractedQuestion = {
   embedded_figures?: QuestionEmbeddedFigure[];
 };
 
+export type RejectedItem = {
+  id: string;
+  section_ref: string;
+  page_start: number | null;
+  raw_text: string;
+  reject_reason: string | null;
+};
+
 export type SectionQuestions = {
   section_ref: string;
   section_title: string | null;
@@ -58,6 +66,10 @@ export type SectionQuestions = {
   identified: number;
   missed: number;
   by_kind?: Record<string, number>;
+  // Pending rejected items for this section (backend already returns
+  // this; field was missing from the type so TypeScript users couldn't
+  // see it). Used to surface "Mark all reviewed" bulk action.
+  rejected?: RejectedItem[];
 };
 
 export type QuestionBankDetail = {
@@ -118,6 +130,15 @@ export const hideQuestion = (questionId: string) =>
 
 export const unhideQuestion = (questionId: string) =>
   req(`/api/question-banks/questions/${questionId}/unhide`, { method: 'PATCH' });
+
+// Bulk-restore every pending rejected_question for a bank. Also fires
+// the Q-2 solution-completeness retry server-side so newly-restored
+// rows with empty solution_text get rescued in the same call.
+export const restoreAllRejected = (bankId: string) =>
+  req<{ ok: boolean; restored: number; skipped: number; solutions_rescued?: number }>(
+    `/api/question-banks/${bankId}/rejected/restore-all`,
+    { method: 'POST' },
+  );
 
 // ─── Hook ─────────────────────────────────────────────────────────
 type State =

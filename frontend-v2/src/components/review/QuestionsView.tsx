@@ -1,9 +1,11 @@
 // Real Questions view — renders the extracted question rows for the
 // selected section.
 
+import { useState } from 'react';
 import { Icon } from '../Icon';
 import { API_BASE } from '../../api/client';
 import { stripFigPlaceholders } from '../../lib/questionText';
+import { restoreAllRejected } from '../../api/questions';
 import type {
   ExtractedQuestion,
   SectionQuestions,
@@ -14,6 +16,13 @@ type Props = {
   sectionQuestions: SectionQuestions | null;
   loading?: boolean;
   emptyMessage?: string;
+  // Book-wide pending-review state. When pendingReviewCount > 0 we
+  // surface a "Mark all reviewed" bulk action above the section
+  // header. Optional so existing call sites that don't pass these
+  // remain valid (banner just won't render).
+  bankId?: string | null;
+  pendingReviewCount?: number;
+  onPendingResolved?: () => void;
 };
 
 export function QuestionsView({
@@ -21,6 +30,9 @@ export function QuestionsView({
   sectionQuestions,
   loading,
   emptyMessage,
+  bankId,
+  pendingReviewCount,
+  onPendingResolved,
 }: Props) {
   if (loading) {
     return (
@@ -92,6 +104,13 @@ export function QuestionsView({
       }}
     >
       <div style={{ maxWidth: 760, margin: '0 auto' }}>
+        {(pendingReviewCount ?? 0) > 0 && bankId && (
+          <MarkAllReviewedBanner
+            bankId={bankId}
+            count={pendingReviewCount ?? 0}
+            onDone={onPendingResolved}
+          />
+        )}
         <SectionHeader sectionQuestions={sectionQuestions} />
         <div style={{ marginTop: 18, display: 'flex', flexDirection: 'column', gap: 12 }}>
           {sectionQuestions.questions.map((q) => (
@@ -388,6 +407,107 @@ function QuestionCard({ q }: { q: ExtractedQuestion }) {
           </div>
         </details>
       )}
+    </div>
+  );
+}
+
+
+function MarkAllReviewedBanner({
+  bankId,
+  count,
+  onDone,
+}: {
+  bankId: string;
+  count: number;
+  onDone?: () => void;
+}) {
+  const [state, setState] = useState<
+    | { kind: "idle" }
+    | { kind: "loading" }
+    | { kind: "done"; restored: number; rescued: number }
+    | { kind: "error"; message: string }
+  >({ kind: "idle" });
+
+  const onClick = async () => {
+    if (state.kind === "loading") return;
+    setState({ kind: "loading" });
+    try {
+      const r = await restoreAllRejected(bankId);
+      setState({
+        kind: "done",
+        restored: r.restored ?? 0,
+        rescued: r.solutions_rescued ?? 0,
+      });
+      if (onDone) onDone();
+    } catch (e) {
+      setState({
+        kind: "error",
+        message: e instanceof Error ? e.message : String(e),
+      });
+    }
+  };
+
+  if (state.kind === "done") {
+    return (
+      <div
+        style={{
+          padding: "10px 14px",
+          background: "#F0F9F0",
+          border: "1px solid #B6E2B6",
+          borderRadius: 8,
+          marginBottom: 14,
+          fontSize: 13,
+          color: "var(--ink-800)",
+        }}
+      >
+        ✓ Marked {state.restored} item{state.restored === 1 ? "" : "s"} as reviewed
+        {state.rescued > 0 && ` · rescued ${state.rescued} solution${state.rescued === 1 ? "" : "s"}`}
+        . Refresh the page to see them under their sections.
+      </div>
+    );
+  }
+
+  return (
+    <div
+      style={{
+        display: "flex",
+        alignItems: "center",
+        justifyContent: "space-between",
+        gap: 12,
+        padding: "10px 14px",
+        background: "#FFF8E5",
+        border: "1px solid #FFE38A",
+        borderRadius: 8,
+        marginBottom: 14,
+        fontSize: 13,
+        color: "var(--ink-800)",
+      }}
+    >
+      <span>
+        ⚠ <strong>{count}</strong> item{count === 1 ? "" : "s"} pending review across this book.
+        {state.kind === "error" && (
+          <span style={{ color: "var(--danger, #c33)", marginLeft: 8 }}>
+            Error: {state.message}
+          </span>
+        )}
+      </span>
+      <button
+        onClick={onClick}
+        disabled={state.kind === "loading"}
+        style={{
+          padding: "6px 14px",
+          fontSize: 13,
+          fontWeight: 600,
+          background: state.kind === "loading" ? "var(--ink-200)" : "var(--indigo-700)",
+          color: "white",
+          border: "none",
+          borderRadius: 6,
+          cursor: state.kind === "loading" ? "default" : "pointer",
+          whiteSpace: "nowrap",
+        }}
+      >
+        {state.kind === "loading" ? "Marking…" : `✓ Mark all reviewed (${count})`}
+      </button>
     </div>
   );
 }
