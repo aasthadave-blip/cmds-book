@@ -737,6 +737,19 @@ def re_extract_section_task(self, section_id: str, job_id: str) -> dict:
             except Exception as e:
                 logger.warning("example_linker failed after re_extract (section=%s): %s", section_uuid, e)
 
+            # Re-run figure embedder so anchor matches against the freshly
+            # re-extracted theory blocks land in this section. Without
+            # this, the figure_references for this section's figures stay
+            # stale pointing at the OLD blocks. Best-effort.
+            try:
+                from app.services.figure_embedder import embed_figures_for_book_sync
+                embed_figures_for_book_sync(session, sec.book_id)
+            except Exception as e:
+                logger.warning(
+                    "figure_embedder failed after theory re_extract "
+                    "(section=%s): %s", section_uuid, e,
+                )
+
             _update_job(
                 session,
                 job_uuid,
