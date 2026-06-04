@@ -665,6 +665,85 @@ async def build_final_merge(
         )
     ).scalars().all()
     fig_ids = {r.figure_id for r in all_refs}
+
+    # 3b. AUTO-HEAL — workers race when calling the figure embedder at
+    # their tails (extract/figures_tasks/questions_v3 all call it). If the
+    # last writer ran before bank flipped "ready" (or before questions
+    # were committed), question-context figures end up unattached even
+    # though the data to attach them now exists. Detect that narrow case
+    # here and re-run the embedder ONCE.
+    #
+    # Narrow conditions (all must hold) so we never heal a healthy book:
+    #   - bank.status in ("ready", "partial")              → questions are loadable
+    #   - >0 figures with context_hint="question"          → there's work to do
+    #   - 0 FigureReference rows attach to a question_id   → none attached
+    #   - the figures' question_no values intersect the
+    #     bank's question_number set                       → heal CAN succeed
+    # Failure is swallowed — current refs are served unchanged.
+    try:
+        from sqlalchemy import func as _func
+        bank_ready_n = (
+            await session.execute(
+                select(_func.count(QuestionBank.id))
+                .where(QuestionBank.book_id == book_id)
+                .where(QuestionBank.status.in_(["ready", "partial"]))
+            )
+        ).scalar() or 0
+        if bank_ready_n > 0:
+            q_metas = (
+                await session.execute(
+                    select(Figure.regen_meta)
+                    .where(Figure.book_id == book_id)
+                    .where(Figure.context_hint == "question")
+                )
+            ).scalars().all()
+            wanted_qnos: set[str] = set()
+            for m in q_metas:
+                if isinstance(m, dict):
+                    qno = m.get("question_no")
+                    if qno:
+                        wanted_qnos.add(str(qno).strip())
+            if wanted_qnos:
+                already_attached = any(
+                    r.context == "question" and r.question_id is not None
+                    for r in all_refs
+                )
+                if not already_attached:
+                    have_qnos = (
+                        await session.execute(
+                            select(Question.question_number)
+                            .where(Question.book_id == book_id)
+                            .where(Question.is_hidden.is_(False))
+                        )
+                    ).scalars().all()
+                    have_set = {str(q).strip() for q in have_qnos if q}
+                    if wanted_qnos & have_set:
+                        logger.info(
+                            "auto_heal: book=%s q_figs=%d, q_refs=0, "
+                            "intersect=%d — re-running embedder once",
+                            book_id, len(q_metas),
+                            len(wanted_qnos & have_set),
+                        )
+                        from app.services.figure_embedder import (
+                            embed_figures_for_book,
+                        )
+                        await embed_figures_for_book(session, book_id)
+                        await session.flush()
+                        all_refs = (
+                            await session.execute(
+                                select(FigureReference)
+                                .where(FigureReference.book_id == book_id)
+                            )
+                        ).scalars().all()
+                        fig_ids = {r.figure_id for r in all_refs}
+                        logger.info(
+                            "auto_heal: book=%s healed; refs=%d",
+                            book_id, len(all_refs),
+                        )
+    except Exception as e:
+        logger.warning(
+            "auto_heal skipped (book=%s, non-fatal): %s", book_id, e
+        )
     figs = (
         await session.execute(
             select(Figure).where(Figure.id.in_(fig_ids))
