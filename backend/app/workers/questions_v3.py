@@ -255,13 +255,23 @@ def _tokens_for_match(s: str) -> list[str]:
     """Return >3-char alphanumeric tokens from a string for substring matching.
 
     Lower-cased, strips LaTeX backslash commands (which often vary by source
-    rendering). Used for the raw_text substring overlap check.
+    rendering). ALSO strips {{fig: ...}} placeholders entirely — those are
+    not in the source PDF text and would falsely deflate the coverage
+    ratio. Observed: figure-heavy chemistry MCQs (ACFROG) had 47/47
+    questions rejected because {{fig: (i) — (unlabelled diagram)}}
+    placeholders dominated raw_text tokens, dragging coverage to 40%.
+    Used for the raw_text substring overlap check.
     """
     if not s:
         return []
+    # Strip {{fig: ...}} placeholders so they don't count against coverage.
+    # These are extractor-emitted markers indicating an inline figure
+    # location; they are NOT in the source PDF text and rejecting on
+    # them is a false positive.
+    no_fig = re.sub(r"\{\{\s*fig\s*:.*?\}\}", " ", s, flags=re.IGNORECASE | re.DOTALL)
     # Strip LaTeX commands like \frac, \sqrt — they're often present in
     # extracted JSON but rendered differently in pypdf text.
-    cleaned = re.sub(r"\\[a-zA-Z]+", " ", s)
+    cleaned = re.sub(r"\\[a-zA-Z]+", " ", no_fig)
     # Pull alphanumeric tokens longer than 3 chars.
     toks = re.findall(r"[A-Za-z0-9]{4,}", cleaned)
     return [t.lower() for t in toks]
