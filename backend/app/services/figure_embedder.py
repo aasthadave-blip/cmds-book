@@ -299,18 +299,51 @@ def _pick_label_match(
     return section_id, block_idx
 
 
-async def embed_figures_for_book(
-    session: AsyncSession,
+# ─── PURE PLACEMENT LOGIC ─────────────────────────────────────────
+# Single source of truth for Pass 1 (labelled) + Pass 2 (unlabelled)
+# figure placement decisions. Called by both the async and sync
+# wrappers below. Pure function — no DB I/O. Eliminates the
+# duplication that previously caused async/sync drift bugs (e.g.
+# bf73339 + 3950df8 had to be fixed in both variants separately).
+
+def _compute_figure_placements(
+    figures,
+    sections_by_id,
+    questions,
+    questions_by_section,
+    label_index,
     book_id: UUID,
-) -> dict[str, int]:
-    """Walk every Figure for this book, compute its placement, and write
-    the result back to ``figure_references``.
+):
+    """Walk every figure and decide where each FigureReference row
+    should land. Returns (refs_to_insert, counters_dict). No DB I/O.
 
-    Idempotent: rebuilds all placement rows from scratch so re-running
-    after schema edits or new regen variants produces a consistent
-    state.
+    Two passes per figure:
 
-    Returns a small counters dict for logging.
+    Pass 2 (UNLABELLED) — figures whose regen_meta carries
+    is_labelled=False were extracted without a "Figure X.Y" caption.
+    Placement strategy:
+      1. Resolve target section via fig.section_id or page_number → section
+      2. context=question + question_no → attach to the matching
+         question (searched globally; question_number is unique per
+         book) at the END of question.raw_text
+      3. context=theory + anchor_text → fuzzy-match the anchor against
+         section.blocks[].c (60-char snippet, 30-char fallback);
+         anchor_position="above" inserts BEFORE the matched block;
+         "below"/"beside" inserts AFTER
+      4. Ultimate fallback: section end (placement_kind="page_fallback")
+      5. No section resolvable: unattached tray
+
+    Pass 1 (LABELLED) — figures with a "Figure X.Y" caption. Default
+    path. Routing follows context_hint strictly:
+      context="theory" → only placed in theory body
+      context="question" → only placed beside a question
+    Within each, the priority is:
+      1. Global label match against text bodies (theory blocks or
+         question raw_text + solution_text)
+      2. Section fallback (figure's page-detected section_id)
+      3. (Theory only) orphan page-range fallback for figures whose
+         extraction anchor was lost
+      4. Unattached tray
     """
     counters = {
         "figures_seen": 0,
@@ -318,92 +351,17 @@ async def embed_figures_for_book(
         "theory_appended": 0,
         "question_inline": 0,
         "question_appended": 0,
-        "unattached": 0,           # no valid target — surfaced in Unattached tray
+        "unattached": 0,
         "skipped_no_section": 0,
+        "theory_relinked_by_label": 0,
     }
-
-    # Pre-load sections and questions for this book
-    sections = (
-        await session.execute(
-            select(Section).where(Section.book_id == book_id)
-        )
-    ).scalars().all()
-    sections_by_id = {s.section_id: s for s in sections}
-
-    # Load questions from ONLY the latest ready bank for this book — older
-    # banks have stale question_ids that newer extractions replace. Without
-    # this filter the embedder picks the first global match, which is
-    # usually the oldest bank's question, leaving the current bank's
-    # question without an embedded figure.
-    from app.models.question_bank import QuestionBank
-    latest_bank = (
-        await session.execute(
-            select(QuestionBank)
-            .where(QuestionBank.book_id == book_id)
-            .where(QuestionBank.status == "ready")
-            .order_by(QuestionBank.created_at.desc())
-            .limit(1)
-        )
-    ).scalars().first()
-    if latest_bank is not None:
-        questions = (
-            await session.execute(
-                select(Question)
-                .where(Question.book_id == book_id)
-                .where(Question.bank_id == latest_bank.id)
-                .where(Question.regen_id.is_(None))
-            )
-        ).scalars().all()
-    else:
-        questions = []
-    questions_by_section: dict[str, list[Question]] = {}
-    for q in questions:
-        ref = q.section_ref
-        if ref:
-            questions_by_section.setdefault(ref, []).append(q)
-
-    figures = (
-        await session.execute(
-            select(Figure).where(Figure.book_id == book_id)
-        )
-    ).scalars().all()
-
-    # Strategy: drop existing FigureReference rows for this book and
-    # rebuild from scratch. Cleaner than diffing; idempotent.
-    await session.execute(
-        delete(FigureReference).where(FigureReference.book_id == book_id)
-    )
-
-    # Build the global label index — used by Pass 1 label-first matching
-    # so a figure can land in the section where its label actually
-    # appears in the theory body, regardless of what page-based section
-    # the figure linker assigned it to.
-    label_index = _build_global_label_index(sections)
-    counters["theory_relinked_by_label"] = 0
-
     new_refs: list[FigureReference] = []
 
     for fig in figures:
         counters["figures_seen"] += 1
         section_id = fig.section_id or ""
 
-        # ─── Pass 2 (NEW): positional placement for UNLABELLED figures ──
-        # Figures that came in without a "Figure X.Y" caption carry
-        # positional metadata in regen_meta (see linker.py + figures_tasks.py).
-        # Flow:
-        #   1. Resolve target section via fig.section_id (already set by
-        #      page→section linker) OR via page_number fallback.
-        #   2. If context=question + question_no exists → attach to the
-        #      matching question in that section, placed BELOW the
-        #      question body (char_offset = len(raw_text)).
-        #   3. If context=theory + anchor_text exists → fuzzy-match the
-        #      anchor against blocks in that section; anchor_position=
-        #      "above" inserts BEFORE the matched block, "below"/"beside"
-        #      inserts AFTER. Falls through to broader 30-char window
-        #      match if 60-char snippet fails.
-        #   4. Ultimate fallback: section end (trailing figure).
-        # Labelled figures (is_labelled True or missing) bypass this
-        # block entirely and run through the existing Pass 1 logic below.
+        # ─── Pass 2: positional placement for UNLABELLED figures ──
         pos_meta = fig.regen_meta if isinstance(fig.regen_meta, dict) else None
         if pos_meta and pos_meta.get("is_labelled") is False:
             anchor_text = (pos_meta.get("anchor_text") or "").strip()
@@ -422,16 +380,12 @@ async def embed_figures_for_book(
 
             placed = False
 
-            # Question path — search ACROSS ALL questions for the matching
-            # question_number. The figure's page-based target_sid often does
-            # NOT equal the question's section_ref (questions like
-            # EXAMPLE 6.13 get filed under their own section
-            # "6-example-6.13" by the schema, while the figure lands under
-            # the surrounding theory section by page anchor). Restricting
-            # the lookup to target_sid causes nearly every unlabelled
-            # question figure to miss and fall through to the page-end
-            # fallback. Global lookup is correct because question_number
-            # is unique per book.
+            # Question path — global question_number lookup. The
+            # figure's page-based section_id often does NOT match the
+            # question's section_ref (e.g. EXAMPLE 6.13 is filed under
+            # its own section "6-example-6.13" while the figure lands
+            # under the surrounding theory section). question_number
+            # is globally unique per book, so a global search is safe.
             if ctx == "question" and question_no:
                 for q in questions:
                     if (q.question_number or "").strip() == question_no:
@@ -450,11 +404,11 @@ async def embed_figures_for_book(
             if placed:
                 continue
 
-            # Theory path — anchor_text fuzzy match
+            # Theory path — fuzzy-match anchor_text against blocks
             if ctx != "question" and target_sid and anchor_text:
                 sec_row = sections_by_id.get(target_sid)
                 blocks = (sec_row.blocks if sec_row else None) or []
-                matched_idx: int | None = None
+                matched_idx = None
                 snippet60 = anchor_text[:60].lower()
                 if snippet60:
                     for idx, b in enumerate(blocks):
@@ -513,57 +467,25 @@ async def embed_figures_for_book(
             continue
 
         # ─── Pass 1: label-first placement for LABELLED figures ──
-        # NOTE (figures-orphan fix): even when the extractor couldn't pin
-        # this figure to a real section ("_orphan"), still try label-match
-        # across all theory + question text. A figure labelled "Figure 4.7"
-        # that's referenced in theory should embed there even if its
-        # extraction anchor was lost. Only fall back to "unattached" if
-        # the label genuinely isn't mentioned anywhere.
         orphan = (not section_id or section_id == "_orphan")
-
         label_norm = (fig.normalized_label or _normalize_label(fig.figure_number) or "").strip()
         label_pattern = _build_label_pattern(label_norm)
-
         context = (fig.context_hint or "theory").lower()
-        # We embed in theory by default; only questions if explicitly tagged
         target_kind = "question" if context == "question" else "theory"
 
-        # STRICT context routing per user spec:
-        #   context="theory"   → only placed in theory body (never in questions).
-        #                        If no theory match anywhere → "unattached".
-        #   context="question" → only placed beside its question (never in theory).
-        #                        If no question target → "unattached".
-        # No more cross-fallback. Unattached figures are surfaced in a
-        # dedicated UI tray for user review, not dumped into a random
-        # section. User can remove appended figures via the ✕ button
-        # (is_hidden flag) which suppresses rendering AND export.
-
         if target_kind == "theory":
-            # Pass 1: label-first global match against theory blocks
+            # Label-first global match against theory blocks
             label_match = None
             if label_norm:
                 cands = label_index.get(label_norm) or []
-                label_match = _pick_label_match(
-                    cands, fig.page_number, sections_by_id,
-                )
+                label_match = _pick_label_match(cands, fig.page_number, sections_by_id)
             if label_match is not None:
                 matched_sec_id, matched_block_idx = label_match
-                # NOTE (E4 fix): we used to mutate fig.section_id here to
-                # match the label-match section. That made figures hop to
-                # whichever section happened to mention "Fig X.Y" in its
-                # text, which was often a cross-reference, not the home
-                # section. Keep Figure.section_id as the extraction anchor
-                # (page-based, more conservative). The FigureReference row
-                # below carries the per-mention section_ref independently,
-                # so theory-side rendering still works.
                 new_refs.append(FigureReference(
-                    figure_id=fig.id,
-                    book_id=book_id,
+                    figure_id=fig.id, book_id=book_id,
                     section_ref=matched_sec_id,
-                    context="theory",
-                    question_id=None,
-                    placeholder_text=fig.figure_number,
-                    link_method="auto",
+                    context="theory", question_id=None,
+                    placeholder_text=fig.figure_number, link_method="auto",
                     placement_kind="inline",
                     placement_block_idx=matched_block_idx,
                     placement_char_offset=None,
@@ -571,9 +493,7 @@ async def embed_figures_for_book(
                 counters["theory_inline"] += 1
                 continue
 
-            # SECTION FALLBACK: when no label match anywhere AND the figure
-            # has a section_id from the figure extractor (page-based), append
-            # the figure to that section at end-of-blocks.
+            # Section fallback — figure's page-detected section_id
             if section_id and section_id in sections_by_id:
                 new_refs.append(FigureReference(
                     figure_id=fig.id, book_id=book_id, section_ref=section_id,
@@ -585,13 +505,10 @@ async def embed_figures_for_book(
                 counters["theory_appended"] += 1
                 continue
 
-            # ORPHAN PAGE-RANGE FALLBACK: figure has no usable section_id
-            # but might still belong to a section if its page_number falls
-            # inside that section's page_start..page_end. Don't lose the
-            # figure to the void just because the extractor mis-anchored it.
+            # Orphan page-range fallback
             if orphan and fig.page_number is not None:
                 page = fig.page_number
-                matched_section_id: str | None = None
+                matched_section_id = None
                 for sid_iter, sec_iter in sections_by_id.items():
                     ps = getattr(sec_iter, "page_start", None)
                     pe = getattr(sec_iter, "page_end", None)
@@ -610,7 +527,7 @@ async def embed_figures_for_book(
                     counters["theory_appended"] += 1
                     continue
 
-            # No label match + no usable section → Unattached panel.
+            # No match anywhere → unattached
             new_refs.append(FigureReference(
                 figure_id=fig.id, book_id=book_id, section_ref=section_id,
                 context="theory", question_id=None,
@@ -619,100 +536,143 @@ async def embed_figures_for_book(
                 placement_char_offset=None,
             ))
             counters["unattached"] += 1
+            continue
 
-        else:  # question
-            # Strict: only place in questions. No theory fallback.
-            #
-            # Pass 1 (NEW): label-first GLOBAL match. Scan every question's
-            # raw_text for the figure's label pattern. Mirrors the theory
-            # branch's global label match — handles the very common case
-            # where a question in section A references "Figure X" but the
-            # figure was OCR-tagged to section B by page number.
-            if label_norm and label_pattern is not None:
-                global_hit: tuple[Question, int] | None = None
-                for q in questions:
-                    # Search BOTH the question body and the solution body —
-                    # questions in OCR'd textbooks often reference figures
-                    # only in the solution ("see Figure 4.7"), not the prompt.
-                    combined = (q.raw_text or "") + "\n" + (getattr(q, "solution_text", "") or "")
-                    offset = _find_inline_char_offset(combined, label_pattern)
-                    if offset is not None:
-                        global_hit = (q, offset)
-                        break
-                if global_hit is not None:
-                    q, offset = global_hit
-                    resolved_sec = q.section_ref or section_id
-                    # NOTE (E4 fix): no longer mutate fig.section_id —
-                    # keep the extraction anchor. Reference row carries
-                    # the per-question placement independently.
-                    new_refs.append(FigureReference(
-                        figure_id=fig.id, book_id=book_id,
-                        section_ref=resolved_sec,
-                        context="question", question_id=q.id,
-                        placeholder_text=fig.figure_number, link_method="auto",
-                        placement_kind="inline", placement_block_idx=None,
-                        placement_char_offset=offset,
-                    ))
-                    counters["question_inline"] += 1
-                    continue
-
-            # SECTION FALLBACK (question context): when no question's text
-            # mentions the label but the figure has a page-detected section,
-            # append at the section level as a "page_fallback" theory-context
-            # reference. The user can re-link to a specific question in the
-            # UI if needed. Conservative — only fires when section_id is
-            # known.
-            if section_id and section_id in sections_by_id:
+        # target_kind == "question"
+        # Label-first global match in question text (raw_text + solution_text)
+        if label_norm and label_pattern is not None:
+            global_hit = None
+            for q in questions:
+                combined = (q.raw_text or "") + "\n" + (getattr(q, "solution_text", "") or "")
+                offset = _find_inline_char_offset(combined, label_pattern)
+                if offset is not None:
+                    global_hit = (q, offset)
+                    break
+            if global_hit is not None:
+                q, offset = global_hit
+                resolved_sec = q.section_ref or section_id
                 new_refs.append(FigureReference(
-                    figure_id=fig.id, book_id=book_id, section_ref=section_id,
-                    context="theory", question_id=None,
+                    figure_id=fig.id, book_id=book_id,
+                    section_ref=resolved_sec,
+                    context="question", question_id=q.id,
                     placeholder_text=fig.figure_number, link_method="auto",
-                    placement_kind="page_fallback", placement_block_idx=None,
-                    placement_char_offset=None,
+                    placement_kind="inline", placement_block_idx=None,
+                    placement_char_offset=offset,
                 ))
-                counters["theory_appended"] += 1
+                counters["question_inline"] += 1
                 continue
 
+        # Section fallback (question context) — appended as theory
+        if section_id and section_id in sections_by_id:
             new_refs.append(FigureReference(
                 figure_id=fig.id, book_id=book_id, section_ref=section_id,
-                context="question", question_id=None,
+                context="theory", question_id=None,
                 placeholder_text=fig.figure_number, link_method="auto",
-                placement_kind="unattached", placement_block_idx=None,
+                placement_kind="page_fallback", placement_block_idx=None,
                 placement_char_offset=None,
             ))
-            counters["unattached"] += 1
+            counters["theory_appended"] += 1
+            continue
 
-    for ref in new_refs:
+        # Unattached
+        new_refs.append(FigureReference(
+            figure_id=fig.id, book_id=book_id, section_ref=section_id,
+            context="question", question_id=None,
+            placeholder_text=fig.figure_number, link_method="auto",
+            placement_kind="unattached", placement_block_idx=None,
+            placement_char_offset=None,
+        ))
+        counters["unattached"] += 1
+
+    return new_refs, counters
+
+
+# ─── ASYNC WRAPPER ────────────────────────────────────────────────
+async def embed_figures_for_book(
+    session: AsyncSession,
+    book_id: UUID,
+) -> dict[str, int]:
+    """Walk every Figure for this book, compute its placement, and write
+    the result back to ``figure_references``. Idempotent: rebuilds all
+    placement rows from scratch so re-running after schema edits or new
+    regen variants produces a consistent state. All placement decisions
+    live in _compute_figure_placements() — this function is just the
+    async DB I/O wrapper.
+    """
+    sections = (
+        await session.execute(
+            select(Section).where(Section.book_id == book_id)
+        )
+    ).scalars().all()
+    sections_by_id = {s.section_id: s for s in sections}
+
+    # Restrict to latest ready bank — older banks have stale question_ids
+    # that newer extractions replace.
+    from app.models.question_bank import QuestionBank
+    latest_bank = (
+        await session.execute(
+            select(QuestionBank)
+            .where(QuestionBank.book_id == book_id)
+            .where(QuestionBank.status == "ready")
+            .order_by(QuestionBank.created_at.desc())
+            .limit(1)
+        )
+    ).scalars().first()
+    questions: list[Question] = []
+    if latest_bank is not None:
+        questions = (
+            await session.execute(
+                select(Question)
+                .where(Question.book_id == book_id)
+                .where(Question.bank_id == latest_bank.id)
+                .where(Question.regen_id.is_(None))
+            )
+        ).scalars().all()
+    questions_by_section: dict[str, list[Question]] = {}
+    for q in questions:
+        if q.section_ref:
+            questions_by_section.setdefault(q.section_ref, []).append(q)
+
+    figures = (
+        await session.execute(
+            select(Figure).where(Figure.book_id == book_id)
+        )
+    ).scalars().all()
+
+    # Rebuild references from scratch — cleaner than diffing; idempotent.
+    await session.execute(
+        delete(FigureReference).where(FigureReference.book_id == book_id)
+    )
+
+    label_index = _build_global_label_index(sections)
+
+    refs, counters = _compute_figure_placements(
+        figures, sections_by_id, questions,
+        questions_by_section, label_index, book_id,
+    )
+
+    for ref in refs:
         session.add(ref)
-
     await session.flush()
+
     logger.info("figure_embedder: book=%s %s", book_id, counters)
     return counters
 
 
+# ─── SYNC WRAPPER ─────────────────────────────────────────────────
 def embed_figures_for_book_sync(session, book_id: UUID) -> dict[str, int]:
-    """Sync variant for use inside the v3 worker (which runs in a sync
-    SQLAlchemy session context). Behaviour is identical to the async
-    version.
+    """Sync variant for the v3 worker (which runs in a sync SQLAlchemy
+    session context). Identical behaviour to the async wrapper —
+    same placement logic via _compute_figure_placements(), just sync
+    DB I/O.
     """
     from sqlalchemy import delete as _delete, select as _select
-
-    counters = {
-        "figures_seen": 0,
-        "theory_inline": 0,
-        "theory_appended": 0,
-        "question_inline": 0,
-        "question_appended": 0,
-        "unattached": 0,
-        "skipped_no_section": 0,
-    }
 
     sections = session.execute(
         _select(Section).where(Section.book_id == book_id)
     ).scalars().all()
     sections_by_id = {s.section_id: s for s in sections}
 
-    # Restrict to latest ready bank — see async variant for rationale.
     from app.models.question_bank import QuestionBank
     latest_bank = session.execute(
         _select(QuestionBank)
@@ -721,6 +681,7 @@ def embed_figures_for_book_sync(session, book_id: UUID) -> dict[str, int]:
         .order_by(QuestionBank.created_at.desc())
         .limit(1)
     ).scalars().first()
+    questions: list[Question] = []
     if latest_bank is not None:
         questions = session.execute(
             _select(Question)
@@ -728,8 +689,6 @@ def embed_figures_for_book_sync(session, book_id: UUID) -> dict[str, int]:
             .where(Question.bank_id == latest_bank.id)
             .where(Question.regen_id.is_(None))
         ).scalars().all()
-    else:
-        questions = []
     questions_by_section: dict[str, list[Question]] = {}
     for q in questions:
         if q.section_ref:
@@ -743,259 +702,17 @@ def embed_figures_for_book_sync(session, book_id: UUID) -> dict[str, int]:
         _delete(FigureReference).where(FigureReference.book_id == book_id)
     )
 
-    # Pass 1 label index — same as async path
     label_index = _build_global_label_index(sections)
-    counters["theory_relinked_by_label"] = 0
-    # Init the references accumulator BEFORE the loop. The async variant
-    # initializes this at line 384; the sync variant was missing it,
-    # which caused embed Pass 2 (unlabelled figures) to crash with
-    # NameError the moment an unlabelled figure was processed —
-    # aborting the entire embed run and leaving zero figure_references
-    # written for the book.
-    new_refs: list[FigureReference] = []
 
-    for fig in figures:
-        counters["figures_seen"] += 1
-        section_id = fig.section_id or ""
+    refs, counters = _compute_figure_placements(
+        figures, sections_by_id, questions,
+        questions_by_section, label_index, book_id,
+    )
 
-        # ─── Pass 2 (NEW): positional placement for UNLABELLED figures ──
-        # Mirrors the async variant. See embed_figures_for_book() for the
-        # detailed rationale and flow comments.
-        pos_meta = fig.regen_meta if isinstance(fig.regen_meta, dict) else None
-        if pos_meta and pos_meta.get("is_labelled") is False:
-            anchor_text = (pos_meta.get("anchor_text") or "").strip()
-            anchor_position = (pos_meta.get("anchor_position") or "below").lower()
-            question_no = (pos_meta.get("question_no") or "").strip()
-            ctx = (fig.context_hint or "theory").lower()
-
-            target_sid = section_id if section_id and section_id != "_orphan" else ""
-            if (not target_sid or target_sid not in sections_by_id) and fig.page_number is not None:
-                for sid_iter, sec_iter in sections_by_id.items():
-                    ps = getattr(sec_iter, "page_start", None)
-                    pe = getattr(sec_iter, "page_end", None)
-                    if ps is not None and pe is not None and ps <= fig.page_number <= pe:
-                        target_sid = sid_iter
-                        break
-
-            placed = False
-
-            # Question path — search ACROSS ALL questions for the matching
-            # question_number. See async variant for rationale (figures'
-            # page-based section often != question's section_ref).
-            if ctx == "question" and question_no:
-                for q in questions:
-                    if (q.question_number or "").strip() == question_no:
-                        char_end = len((q.raw_text or ""))
-                        new_refs.append(FigureReference(
-                            figure_id=fig.id, book_id=book_id,
-                            section_ref=(q.section_ref or target_sid),
-                            context="question", question_id=q.id,
-                            placeholder_text=None, link_method="auto",
-                            placement_kind="inline", placement_block_idx=None,
-                            placement_char_offset=char_end,
-                        ))
-                        counters["question_inline"] += 1
-                        placed = True
-                        break
-            if placed:
-                continue
-
-            if ctx != "question" and target_sid and anchor_text:
-                sec_row = sections_by_id.get(target_sid)
-                blocks = (sec_row.blocks if sec_row else None) or []
-                matched_idx: int | None = None
-                snippet60 = anchor_text[:60].lower()
-                if snippet60:
-                    for idx, b in enumerate(blocks):
-                        btext = (b.get("c") or "").lower() if isinstance(b, dict) else ""
-                        if snippet60 in btext:
-                            matched_idx = idx
-                            break
-                if matched_idx is None:
-                    snippet30 = anchor_text[:30].lower()
-                    if len(snippet30) >= 10:
-                        for idx, b in enumerate(blocks):
-                            btext = (b.get("c") or "").lower() if isinstance(b, dict) else ""
-                            if snippet30 in btext:
-                                matched_idx = idx
-                                break
-                if matched_idx is not None:
-                    placement_idx = matched_idx if anchor_position == "above" else matched_idx + 1
-                    new_refs.append(FigureReference(
-                        figure_id=fig.id, book_id=book_id,
-                        section_ref=target_sid,
-                        context="theory", question_id=None,
-                        placeholder_text=None, link_method="auto",
-                        placement_kind="inline",
-                        placement_block_idx=placement_idx,
-                        placement_char_offset=None,
-                    ))
-                    counters["theory_inline"] += 1
-                    placed = True
-            if placed:
-                continue
-
-            if target_sid:
-                new_refs.append(FigureReference(
-                    figure_id=fig.id, book_id=book_id,
-                    section_ref=target_sid,
-                    context="theory" if ctx != "question" else "question",
-                    question_id=None,
-                    placeholder_text=None, link_method="auto",
-                    placement_kind="page_fallback",
-                    placement_block_idx=None,
-                    placement_char_offset=None,
-                ))
-                counters["theory_appended"] += 1
-                continue
-
-            new_refs.append(FigureReference(
-                figure_id=fig.id, book_id=book_id, section_ref=section_id,
-                context="theory", question_id=None,
-                placeholder_text=None, link_method="auto",
-                placement_kind="unattached", placement_block_idx=None,
-                placement_char_offset=None,
-            ))
-            counters["unattached"] += 1
-            continue
-
-        # ─── Pass 1: label-first placement for LABELLED figures ──
-        # NOTE (figures-orphan fix): even when the extractor couldn't pin
-        # this figure to a real section ("_orphan"), still try label-match
-        # across all theory + question text. A figure labelled "Figure 4.7"
-        # that's referenced in theory should embed there even if its
-        # extraction anchor was lost. Only fall back to "unattached" if
-        # the label genuinely isn't mentioned anywhere.
-        orphan = (not section_id or section_id == "_orphan")
-
-        label_norm = (fig.normalized_label or _normalize_label(fig.figure_number) or "").strip()
-        label_pattern = _build_label_pattern(label_norm)
-        context = (fig.context_hint or "theory").lower()
-        target_kind = "question" if context == "question" else "theory"
-
-        # STRICT context routing — see async version for full notes.
-        if target_kind == "theory":
-            label_match = None
-            if label_norm:
-                cands = label_index.get(label_norm) or []
-                label_match = _pick_label_match(cands, fig.page_number, sections_by_id)
-            if label_match is not None:
-                matched_sec_id, matched_block_idx = label_match
-                # NOTE (E4 fix, sync variant): do NOT mutate fig.section_id.
-                # Keep the extraction anchor; FigureReference below carries
-                # the per-mention section_ref independently.
-                session.add(FigureReference(
-                    figure_id=fig.id, book_id=book_id, section_ref=matched_sec_id,
-                    context="theory", question_id=None,
-                    placeholder_text=fig.figure_number, link_method="auto",
-                    placement_kind="inline", placement_block_idx=matched_block_idx,
-                    placement_char_offset=None,
-                ))
-                counters["theory_inline"] += 1
-                continue
-
-            # SECTION FALLBACK — same logic as async variant: use the figure
-            # extractor's page-detected section as a soft placement, flagged
-            # so the UI can prompt user verification.
-            if section_id and section_id in sections_by_id:
-                session.add(FigureReference(
-                    figure_id=fig.id, book_id=book_id, section_ref=section_id,
-                    context="theory", question_id=None,
-                    placeholder_text=fig.figure_number, link_method="auto",
-                    placement_kind="page_fallback", placement_block_idx=None,
-                    placement_char_offset=None,
-                ))
-                counters["theory_appended"] += 1
-                continue
-
-            # ORPHAN PAGE-RANGE FALLBACK (sync variant) — match figure to
-            # any section whose page range contains it.
-            if orphan and fig.page_number is not None:
-                page = fig.page_number
-                matched_section_id: str | None = None
-                for sid_iter, sec_iter in sections_by_id.items():
-                    ps = getattr(sec_iter, "page_start", None)
-                    pe = getattr(sec_iter, "page_end", None)
-                    if ps is not None and pe is not None and ps <= page <= pe:
-                        matched_section_id = sid_iter
-                        break
-                if matched_section_id:
-                    session.add(FigureReference(
-                        figure_id=fig.id, book_id=book_id,
-                        section_ref=matched_section_id,
-                        context="theory", question_id=None,
-                        placeholder_text=fig.figure_number, link_method="auto",
-                        placement_kind="page_fallback", placement_block_idx=None,
-                        placement_char_offset=None,
-                    ))
-                    counters["theory_appended"] += 1
-                    continue
-
-            session.add(FigureReference(
-                figure_id=fig.id, book_id=book_id, section_ref=section_id,
-                context="theory", question_id=None,
-                placeholder_text=fig.figure_number, link_method="auto",
-                placement_kind="unattached", placement_block_idx=None,
-                placement_char_offset=None,
-            ))
-            counters["unattached"] += 1
-
-        else:
-            # Pass 1 (NEW): label-first GLOBAL match across ALL questions.
-            # Mirrors theory branch. Handles "question in section A references
-            # figure tagged to section B" case.
-            if label_norm and label_pattern is not None:
-                global_hit: tuple[Question, int] | None = None
-                for q in questions:
-                    combined = (q.raw_text or "") + "\n" + (getattr(q, "solution_text", "") or "")
-                    offset = _find_inline_char_offset(combined, label_pattern)
-                    if offset is not None:
-                        global_hit = (q, offset)
-                        break
-                if global_hit is not None:
-                    q, offset = global_hit
-                    resolved_sec = q.section_ref or section_id
-                    # NOTE (E4 fix, sync variant): no Figure.section_id mutation.
-                    session.add(FigureReference(
-                        figure_id=fig.id, book_id=book_id,
-                        section_ref=resolved_sec,
-                        context="question", question_id=q.id,
-                        placeholder_text=fig.figure_number, link_method="auto",
-                        placement_kind="inline", placement_block_idx=None,
-                        placement_char_offset=offset,
-                    ))
-                    counters["question_inline"] += 1
-                    continue
-
-            # SECTION FALLBACK (question context) — same logic as async.
-            if section_id and section_id in sections_by_id:
-                session.add(FigureReference(
-                    figure_id=fig.id, book_id=book_id, section_ref=section_id,
-                    context="theory", question_id=None,
-                    placeholder_text=fig.figure_number, link_method="auto",
-                    placement_kind="page_fallback", placement_block_idx=None,
-                    placement_char_offset=None,
-                ))
-                counters["theory_appended"] += 1
-                continue
-
-            session.add(FigureReference(
-                figure_id=fig.id, book_id=book_id, section_ref=section_id,
-                context="question", question_id=None,
-                placeholder_text=fig.figure_number, link_method="auto",
-                placement_kind="unattached", placement_block_idx=None,
-                placement_char_offset=None,
-            ))
-            counters["unattached"] += 1
-
-    # Persist any refs that were collected via Pass 2 (unlabelled figures
-    # use the new_refs list pattern from the async variant). Without this,
-    # Pass 2 entries get garbage-collected on function return and the
-    # unlabelled figures never appear in figure_references — symptom is
-    # "embedder counters say 41, DB has only 38 (just the labelled ones)".
-    for ref in new_refs:
+    for ref in refs:
         session.add(ref)
     session.flush()
+
     logger.info("figure_embedder (sync): book=%s %s", book_id, counters)
     return counters
 
