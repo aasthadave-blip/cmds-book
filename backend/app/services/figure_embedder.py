@@ -422,14 +422,23 @@ async def embed_figures_for_book(
 
             placed = False
 
-            # Question path
-            if ctx == "question" and target_sid and question_no:
-                for q in questions_by_section.get(target_sid, []):
+            # Question path — search ACROSS ALL questions for the matching
+            # question_number. The figure's page-based target_sid often does
+            # NOT equal the question's section_ref (questions like
+            # EXAMPLE 6.13 get filed under their own section
+            # "6-example-6.13" by the schema, while the figure lands under
+            # the surrounding theory section by page anchor). Restricting
+            # the lookup to target_sid causes nearly every unlabelled
+            # question figure to miss and fall through to the page-end
+            # fallback. Global lookup is correct because question_number
+            # is unique per book.
+            if ctx == "question" and question_no:
+                for q in questions:
                     if (q.question_number or "").strip() == question_no:
                         char_end = len((q.raw_text or ""))
                         new_refs.append(FigureReference(
                             figure_id=fig.id, book_id=book_id,
-                            section_ref=target_sid,
+                            section_ref=(q.section_ref or target_sid),
                             context="question", question_id=q.id,
                             placeholder_text=None, link_method="auto",
                             placement_kind="inline", placement_block_idx=None,
@@ -737,6 +746,13 @@ def embed_figures_for_book_sync(session, book_id: UUID) -> dict[str, int]:
     # Pass 1 label index — same as async path
     label_index = _build_global_label_index(sections)
     counters["theory_relinked_by_label"] = 0
+    # Init the references accumulator BEFORE the loop. The async variant
+    # initializes this at line 384; the sync variant was missing it,
+    # which caused embed Pass 2 (unlabelled figures) to crash with
+    # NameError the moment an unlabelled figure was processed —
+    # aborting the entire embed run and leaving zero figure_references
+    # written for the book.
+    new_refs: list[FigureReference] = []
 
     for fig in figures:
         counters["figures_seen"] += 1
@@ -763,13 +779,16 @@ def embed_figures_for_book_sync(session, book_id: UUID) -> dict[str, int]:
 
             placed = False
 
-            if ctx == "question" and target_sid and question_no:
-                for q in questions_by_section.get(target_sid, []):
+            # Question path — search ACROSS ALL questions for the matching
+            # question_number. See async variant for rationale (figures'
+            # page-based section often != question's section_ref).
+            if ctx == "question" and question_no:
+                for q in questions:
                     if (q.question_number or "").strip() == question_no:
                         char_end = len((q.raw_text or ""))
                         new_refs.append(FigureReference(
                             figure_id=fig.id, book_id=book_id,
-                            section_ref=target_sid,
+                            section_ref=(q.section_ref or target_sid),
                             context="question", question_id=q.id,
                             placeholder_text=None, link_method="auto",
                             placement_kind="inline", placement_block_idx=None,
@@ -969,6 +988,13 @@ def embed_figures_for_book_sync(session, book_id: UUID) -> dict[str, int]:
             ))
             counters["unattached"] += 1
 
+    # Persist any refs that were collected via Pass 2 (unlabelled figures
+    # use the new_refs list pattern from the async variant). Without this,
+    # Pass 2 entries get garbage-collected on function return and the
+    # unlabelled figures never appear in figure_references — symptom is
+    # "embedder counters say 41, DB has only 38 (just the labelled ones)".
+    for ref in new_refs:
+        session.add(ref)
     session.flush()
     logger.info("figure_embedder (sync): book=%s %s", book_id, counters)
     return counters
