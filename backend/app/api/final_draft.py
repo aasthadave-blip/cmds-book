@@ -89,57 +89,38 @@ async def _load_or_seed(
         )
     ).scalars().first()
 
-    # Detect "stale" cached draft: figure_references have been
-    # rewritten since the draft was last seeded (e.g. by the auto-heal
-    # pass inside build_final_merge, or by a re-extract / restore-all
-    # action). When stale, re-seed the items but PRESERVE the draft
-    # row (so user edits like drag-drop reorder still work — those
-    # update the draft separately).
+    # UNCONDITIONAL auto-reseed: every Preview/Composer load triggers a
+    # fresh seed from build_final_merge → which itself fires the
+    # unconditional auto-heal embedder pass. Net effect: every page
+    # load reflects the LATEST DB state — figures, questions, theory
+    # blocks, schema edits all materialise without manual refresh.
     #
-    # Detection: if any FigureReference for this book has created_at
-    # newer than draft.last_seeded_at, the cached items are stale.
-    if existing is not None and existing.last_seeded_at is not None:
-        from app.models.figure_reference import FigureReference as _FR
-        newest_ref = (
-            await session.execute(
-                select(_FR.created_at)
-                .where(_FR.book_id == book_id)
-                .order_by(_FR.created_at.desc())
-                .limit(1)
-            )
-        ).scalar_one_or_none()
-        if newest_ref is not None and newest_ref > existing.last_seeded_at:
-            # Re-seed items while keeping the row identity (so the
-            # frontend's draft id stays stable). Only the items + the
-            # last_seeded_at timestamp change. If the user had a
-            # status="exported" already, we still re-seed — figure
-            # changes should always reflect; user can re-export.
-            #
-            # Wrapped in try/except so a re-seed failure NEVER breaks
-            # the GET — we serve the previously-cached items instead.
-            # The next GET will try the re-seed again if data is still
-            # stale. Mirrors the auto-heal failure handling in
-            # build_final_merge.
-            try:
-                fresh_items = await seed_draft_items_from_merge(
-                    session, book_id, prefer_regen=prefer_regen
-                )
-                existing.items = fresh_items
-                existing.last_seeded_at = datetime.utcnow()
-                existing.prefer_regen = prefer_regen
-                await session.commit()
-                await session.refresh(existing)
-            except Exception as e:
-                import logging as _logging
-                _logging.getLogger(__name__).warning(
-                    "auto-reseed failed (book=%s, non-fatal): %s",
-                    book_id, e,
-                )
-                # Roll back any partial commit and serve the cached
-                # items unchanged.
-                await session.rollback()
-        return existing
+    # Tradeoff (accepted, explicit user direction): drag-drop reorders
+    # / custom_text / edit_item modifications are OVERWRITTEN on the
+    # next read. The principle is "freshness > staleness of edits."
+    # If preserving user edits across re-seeds becomes a requirement,
+    # add an `is_dirty` flag on FinalDraft + skip re-seed when set.
+    #
+    # Wrapped in try/except so the re-seed NEVER breaks the GET — on
+    # any failure we serve whatever items were last persisted. Mirrors
+    # the auto-heal failure handling in build_final_merge.
     if existing is not None:
+        try:
+            fresh_items = await seed_draft_items_from_merge(
+                session, book_id, prefer_regen=prefer_regen
+            )
+            existing.items = fresh_items
+            existing.last_seeded_at = datetime.utcnow()
+            existing.prefer_regen = prefer_regen
+            await session.commit()
+            await session.refresh(existing)
+        except Exception as e:
+            import logging as _logging
+            _logging.getLogger(__name__).warning(
+                "auto-reseed failed (book=%s, non-fatal): %s",
+                book_id, e,
+            )
+            await session.rollback()
         return existing
 
     items = await seed_draft_items_from_merge(
