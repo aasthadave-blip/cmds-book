@@ -558,6 +558,25 @@ def _compute_figure_placements(
                             matched_idx = idx
                             break
 
+                # 3. Last-resort full anchor scan ignoring page hint.
+                # Catches schema bugs where a leaf section's page_end
+                # didn't grow with its extracted block content (e.g.
+                # blocks span pages 3-5 but page_end=3), leaving figures
+                # on the un-covered pages with no page-overlapping leaf
+                # to migrate to. Anchor_text is a full-sentence strict
+                # substring match — extremely unlikely to false-match
+                # across sections, so safe to widen the scan.
+                if matched_idx is None and anchor_norm:
+                    tried = {target_sid} if target_sid else set()
+                    for sid_iter in sections_by_id:
+                        if sid_iter in tried:
+                            continue
+                        idx = _match_in_section(sid_iter)
+                        if idx is not None:
+                            matched_sid = sid_iter
+                            matched_idx = idx
+                            break
+
                 if matched_sid is not None and matched_idx is not None:
                     # anchor_position semantics — relative to where the
                     # printed anchor sentence sits with respect to the
