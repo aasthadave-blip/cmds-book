@@ -680,66 +680,42 @@ async def build_final_merge(
     #   - the figures' question_no values intersect the
     #     bank's question_number set                       → heal CAN succeed
     # Failure is swallowed — current refs are served unchanged.
+    # Unconditional auto-heal: re-run the embedder on EVERY read so
+    # figure placements are always fresh, regardless of how many figures
+    # are currently attached or what their state is.
+    #
+    # Rationale: every Preview/Composer/Export read is a snapshot of
+    # state at that moment. Source data changes constantly — questions
+    # get rescued via Q-1 retry, restored via "Mark all reviewed",
+    # sections re-extracted, schema edited. Running the embedder per
+    # read guarantees figure_references reflects the CURRENT data, not
+    # a stale snapshot from whichever worker happened to finish last.
+    #
+    # Cost: pure compute, ~100ms-1s per read for typical books. No
+    # Gemini calls. DB: a DELETE + INSERT of ~26 rows per book.
+    # Idempotent — running 100x on settled data produces identical refs.
+    #
+    # Replaces the previous "narrow trigger" auto-heal (which only fired
+    # when ZERO question figures were attached). That narrow check was
+    # too restrictive — it left partial attachments stuck (e.g. 19 of
+    # 24 figures attached, 5 stuck in page_fallback because their target
+    # questions came in after the embedder's snapshot). Unconditional
+    # re-run catches this and all related timing/race bugs.
     try:
-        from sqlalchemy import func as _func
-        bank_ready_n = (
+        from app.services.figure_embedder import embed_figures_for_book
+        await embed_figures_for_book(session, book_id)
+        await session.flush()
+        all_refs = (
             await session.execute(
-                select(_func.count(QuestionBank.id))
-                .where(QuestionBank.book_id == book_id)
-                .where(QuestionBank.status.in_(["ready", "partial"]))
+                select(FigureReference)
+                .where(FigureReference.book_id == book_id)
             )
-        ).scalar() or 0
-        if bank_ready_n > 0:
-            q_metas = (
-                await session.execute(
-                    select(Figure.regen_meta)
-                    .where(Figure.book_id == book_id)
-                    .where(Figure.context_hint == "question")
-                )
-            ).scalars().all()
-            wanted_qnos: set[str] = set()
-            for m in q_metas:
-                if isinstance(m, dict):
-                    qno = m.get("question_no")
-                    if qno:
-                        wanted_qnos.add(str(qno).strip())
-            if wanted_qnos:
-                already_attached = any(
-                    r.context == "question" and r.question_id is not None
-                    for r in all_refs
-                )
-                if not already_attached:
-                    have_qnos = (
-                        await session.execute(
-                            select(Question.question_number)
-                            .where(Question.book_id == book_id)
-                            .where(Question.is_hidden.is_(False))
-                        )
-                    ).scalars().all()
-                    have_set = {str(q).strip() for q in have_qnos if q}
-                    if wanted_qnos & have_set:
-                        logger.info(
-                            "auto_heal: book=%s q_figs=%d, q_refs=0, "
-                            "intersect=%d — re-running embedder once",
-                            book_id, len(q_metas),
-                            len(wanted_qnos & have_set),
-                        )
-                        from app.services.figure_embedder import (
-                            embed_figures_for_book,
-                        )
-                        await embed_figures_for_book(session, book_id)
-                        await session.flush()
-                        all_refs = (
-                            await session.execute(
-                                select(FigureReference)
-                                .where(FigureReference.book_id == book_id)
-                            )
-                        ).scalars().all()
-                        fig_ids = {r.figure_id for r in all_refs}
-                        logger.info(
-                            "auto_heal: book=%s healed; refs=%d",
-                            book_id, len(all_refs),
-                        )
+        ).scalars().all()
+        fig_ids = {r.figure_id for r in all_refs}
+        logger.debug(
+            "auto_heal (unconditional): book=%s refs=%d",
+            book_id, len(all_refs),
+        )
     except Exception as e:
         logger.warning(
             "auto_heal skipped (book=%s, non-fatal): %s", book_id, e
