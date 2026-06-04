@@ -65,8 +65,31 @@ def _sanitize_schema(data: dict) -> dict:
         if t and t not in excluded_titles:
             excluded_titles.append(t)
 
-    def _fix_sections(sections: list[dict]) -> None:
+    def _fix_sections(sections) -> list:
+        """Walk a sections list, normalizing in place AND filtering out
+        any non-dict elements.
+
+        Gemini occasionally emits malformed entries — a nested list, a
+        bare string, or null — instead of a proper section object. This
+        used to crash with ``'list' object has no attribute 'get'`` and
+        kill all 3 schema-generation retries identically. Now: log and
+        drop bad elements, keep the good ones, let pydantic validate
+        the rest. Worst case is a partial schema (better than no
+        schema at all)."""
+        if not isinstance(sections, list):
+            logger.warning(
+                "schema sanitize: expected list of sections, got %s — treating as empty",
+                type(sections).__name__,
+            )
+            return []
+        cleaned: list[dict] = []
         for s in sections:
+            if not isinstance(s, dict):
+                logger.warning(
+                    "schema sanitize: dropping non-dict section element of type %s: %r",
+                    type(s).__name__, s,
+                )
+                continue
             raw_type = s.get("type") or ""
             if raw_type not in _VALID_TYPES:
                 mapped = _TYPE_MAP.get(raw_type, "subsection")
@@ -90,9 +113,11 @@ def _sanitize_schema(data: dict) -> dict:
                     ct, new_ct, s.get("id"),
                 )
                 s["content_types"] = new_ct
-            _fix_sections(s.get("subsections") or [])
+            s["subsections"] = _fix_sections(s.get("subsections") or [])
+            cleaned.append(s)
+        return cleaned
 
-    _fix_sections(data.get("sections") or [])
+    data["sections"] = _fix_sections(data.get("sections") or [])
     return {**data, "exclusion_summary": excluded_titles}
 
 
