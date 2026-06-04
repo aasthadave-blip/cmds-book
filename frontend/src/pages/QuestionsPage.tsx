@@ -15,6 +15,7 @@ import {
   useReExtractBlock,
   useRegenQuestions,
   useRestoreRejected,
+  useRestoreAllRejected,
   useDiscardRejected,
   useHideFigureReference,
   useHideQuestion,
@@ -885,6 +886,14 @@ function QuestionList({
   const sectionsByRef: Record<string, typeof detail.sections[number]> = {};
   for (const s of detail.sections) sectionsByRef[s.section_ref] = s;
 
+  // Book-wide pending-review count (sums pending items across all sections).
+  // When > 0 we surface a "Mark all reviewed" bulk action so users don't
+  // have to click Keep on each pending item individually.
+  const totalPendingReview = detail.sections.reduce(
+    (n, s) => n + (s.rejected?.length ?? 0),
+    0,
+  );
+
   // Build the render plan in this priority:
   //   1) Walk schemaOrder (hierarchical, with titles + depth)
   //   2) Append any detail.sections whose section_ref didn't appear in schema
@@ -1028,7 +1037,18 @@ function QuestionList({
               </>
             );
           })()}
+          {totalPendingReview > 0 && bankId && (
+            <span style={{ color: "var(--warn, #c80)", marginLeft: 8 }}>
+              · {totalPendingReview} pending review
+            </span>
+          )}
         </div>
+        {totalPendingReview > 0 && bankId && (
+          <MarkAllReviewedButton
+            bankId={bankId}
+            count={totalPendingReview}
+          />
+        )}
       </div>
 
       {renderable.map((node) => {
@@ -1103,6 +1123,31 @@ function EmptySectionRetryButton({
       }}
     >
       {busy ? "Retrying…" : "↺ Retry this section"}
+    </button>
+  );
+}
+
+function MarkAllReviewedButton({
+  bankId,
+  count,
+}: {
+  bankId: UUID;
+  count: number;
+}) {
+  const restoreAll = useRestoreAllRejected();
+  const busy = restoreAll.isPending;
+  return (
+    <button
+      className="btn primary"
+      disabled={busy}
+      style={{ fontSize: "0.72rem", padding: "4px 12px" }}
+      title={`Promote all ${count} pending items into the questions list`}
+      onClick={() => {
+        if (busy) return;
+        restoreAll.mutate({ bankId });
+      }}
+    >
+      {busy ? "Marking…" : `✓ Mark all reviewed (${count})`}
     </button>
   );
 }
