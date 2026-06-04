@@ -1520,6 +1520,228 @@ def _classify_unit(
 
 
 # ---------------------------------------------------------------------------
+# Q-1 figure-witness retry — rescue questions silently dropped because they
+# contain inline figures. Uses the figure extractor's regen_meta.question_no
+# field as the witness for "which question_numbers MUST exist on which pages."
+# ---------------------------------------------------------------------------
+_QNO_PREFIX_RE = re.compile(r"^q\.?\s*", re.IGNORECASE)
+
+
+def _norm_qno(s) -> str:
+    """Normalize a question number for set comparison. Handles the
+    cosmetic differences between Gemini's figure-extractor output
+    (``Q.39``, ``(39)``, ``39.``) and the question worker's stored
+    ``question_number`` field (``39``). Mirrors the same normalizer
+    used by the figure embedder."""
+    if not s:
+        return ""
+    t = str(s).strip().lower()
+    t = _QNO_PREFIX_RE.sub("", t)
+    return t.strip("().[]{} \t.")
+
+
+async def _retry_missing_questions_from_figures(
+    book_id: UUID,
+    bank_id: UUID,
+    units: list["_Unit"],
+    pdf_bytes: bytes,
+    system_prompt: str,
+) -> None:
+    """If figure.regen_meta.question_no points at a question that doesn't
+    exist in the DB, re-call the question worker on the affected section
+    with a focused prompt naming the missing q_nos.
+
+    Multi-column safe: the unit's existing ``section_start_heading`` is
+    preserved on retry, so the BOUNDARY hint still flows into the prompt.
+    """
+    from app.models.figure import Figure
+    from app.models.question import Question
+
+    # 1. Build figure-witness map: page_number → set of question_nos
+    with SyncSession() as session:
+        figures = session.execute(
+            select(Figure).where(Figure.book_id == book_id)
+        ).scalars().all()
+
+        # Pull question_no from regen_meta where present + context=question.
+        witness_qnos: set[str] = set()
+        qnos_with_page: list[tuple[str, int | None]] = []
+        for f in figures:
+            ctx = (f.context_hint or "").lower()
+            meta = f.regen_meta if isinstance(f.regen_meta, dict) else None
+            if not meta or ctx != "question":
+                continue
+            qno = (meta.get("question_no") or "").strip()
+            if not qno:
+                continue
+            witness_qnos.add(qno)
+            qnos_with_page.append((qno, f.page_number))
+
+        if not witness_qnos:
+            logger.info(
+                "[q-retry] no figure witnesses for book=%s — skipping",
+                book_id,
+            )
+            return
+
+        # 2. Read currently-extracted question_numbers from DB.
+        existing_qrows = session.execute(
+            select(Question).where(
+                Question.bank_id == bank_id,
+                Question.regen_id.is_(None),
+            )
+        ).scalars().all()
+        existing_qnos = {
+            _norm_qno(q.question_number) for q in existing_qrows
+            if q.question_number
+        }
+
+    # 3. Compute missing — every witness q_no that's NOT in DB.
+    missing_qnos = {
+        q for q in witness_qnos if _norm_qno(q) not in existing_qnos
+    }
+    if not missing_qnos:
+        logger.info(
+            "[q-retry] all %d figure witnesses already have questions in DB "
+            "(book=%s) — nothing to retry",
+            len(witness_qnos), book_id,
+        )
+        return
+
+    # 4. Group missing q_nos by section (via figure.page → unit page-range).
+    section_missing: dict[str, list[str]] = {}
+    for qno, page in qnos_with_page:
+        if qno not in missing_qnos:
+            continue
+        if page is None:
+            continue
+        for u in units:
+            if u.page_start is None or u.page_end is None:
+                continue
+            if u.page_start <= page <= u.page_end:
+                section_missing.setdefault(u.id, []).append(qno)
+                break
+
+    if not section_missing:
+        logger.warning(
+            "[q-retry] %d missing q_nos but couldn't map to any unit "
+            "(book=%s) — likely page→section gap; skipping",
+            len(missing_qnos), book_id,
+        )
+        return
+
+    logger.info(
+        "[q-retry] book=%s — %d sections have missing figure-witness "
+        "questions: %s",
+        book_id, len(section_missing),
+        {sid: sorted(set(qs)) for sid, qs in section_missing.items()},
+    )
+
+    # 5. For each affected section, retry + persist (insert-only merge).
+    units_by_id = {u.id: u for u in units}
+    inserted_total = 0
+    still_missing_total = 0
+    for sid, qnos in section_missing.items():
+        unit = units_by_id.get(sid)
+        if unit is None:
+            continue
+        try:
+            result = await _run_targeted_retry(
+                unit=unit,
+                pdf_bytes=pdf_bytes,
+                system_prompt=system_prompt,
+                missing_qnos=sorted(set(qnos)),
+            )
+        except Exception as e:
+            logger.warning(
+                "[q-retry] targeted retry failed for section=%s: %s",
+                sid, e,
+            )
+            continue
+
+        if not result.get("ok") or not result.get("extracted"):
+            still_missing_total += len(set(qnos))
+            logger.warning(
+                "[q-retry] section=%s retry returned 0 questions for "
+                "missing q_nos %s — leaving as gap",
+                sid, sorted(set(qnos)),
+            )
+            continue
+
+        # Insert-only merge: only add items whose question_number isn't
+        # already in DB (avoid wiping existing rows or duplicating).
+        ins = _insert_only_merge(
+            book_id=book_id, bank_id=bank_id, unit=unit, result=result,
+        )
+        inserted_total += ins
+        logger.info(
+            "[q-retry] section=%s inserted %d rescued question(s)",
+            sid, ins,
+        )
+
+    logger.info(
+        "[q-retry] book=%s — done. inserted=%d, still_missing=%d",
+        book_id, inserted_total, still_missing_total,
+    )
+
+
+def _insert_only_merge(
+    book_id: UUID,
+    bank_id: UUID,
+    unit: "_Unit",
+    result: dict[str, Any],
+) -> int:
+    """Insert questions from a retry result WITHOUT wiping existing rows.
+
+    Skips items whose question_number already exists for this bank, so
+    repeated retries don't create duplicates. Returns count inserted.
+    """
+    with SyncSession() as session:
+        existing_qnos_for_bank = {
+            _norm_qno(qn) for (qn,) in session.execute(
+                select(Question.question_number).where(
+                    Question.bank_id == bank_id,
+                    Question.regen_id.is_(None),
+                )
+            ).all() if qn
+        }
+
+        inserted = 0
+        for item in result.get("extracted") or []:
+            raw_text = (item.get("raw_text") or "").strip()
+            if not raw_text:
+                continue
+            qno = item.get("question_number")
+            if qno and _norm_qno(qno) in existing_qnos_for_bank:
+                continue  # already in DB, don't duplicate
+            q = Question(
+                bank_id=bank_id,
+                book_id=book_id,
+                section_ref=unit.id,
+                section_title=unit.title,
+                page_start=item.get("page") or unit.page_start,
+                page_end=unit.page_end,
+                raw_text=raw_text,
+                qc_local={"pass": True, "score": 1.0, "failures": [], "rescued_by": "q1-retry"},
+                attempts=1,
+                status="passed",
+                question_number=qno,
+                exercise_ref=item.get("exercise_ref"),
+                kind=str(item.get("kind") or "exercise"),
+                has_options=bool(item.get("has_options")),
+                solution_text=item.get("solution") or None,
+                has_solution=bool(item.get("has_solution")),
+                identified_total=int(result.get("identified_total") or 0),
+            )
+            session.add(q)
+            if qno:
+                existing_qnos_for_bank.add(_norm_qno(qno))
+            inserted += 1
+        session.commit()
+        return inserted
+
+
+# ---------------------------------------------------------------------------
 # Main task
 # ---------------------------------------------------------------------------
 async def _run_v3(book_id: UUID, bank_id: UUID, job_id: UUID) -> dict[str, Any]:
@@ -1726,6 +1948,32 @@ async def _run_v3(book_id: UUID, bank_id: UUID, job_id: UUID) -> dict[str, Any]:
     bank_status = "ready" if counts["failed"] == 0 else "partial"
     with SyncSession() as session:
         _update_bank(session, bank_id, status=bank_status)
+
+    # ─── Q-1: figure-extractor witness retry ──────────────────────────
+    # The figure extractor's regen_meta.question_no field captures which
+    # question_numbers are PRINTED on each page (next to figures). The
+    # question extractor sometimes silently drops questions that contain
+    # inline figures (the figure region disrupts the OCR text flow → the
+    # question stem gets skipped). Reproducibly observed: MHT-CET 2024
+    # (Q8, Q37, Q77, Q92 missing — all figure-bearing), Chemistry Organic
+    # (15 question figures unattached because parent questions absent).
+    #
+    # Use the figure extractor's question_no list as the source-of-truth
+    # witness. If any figure says question_no=N but no question with
+    # question_number=N exists in DB, retry that section with a focused
+    # prompt naming the missing N. Multi-column safe: retry uses the
+    # same _Unit shape (section_start_heading preserved) the original
+    # extraction used.
+    try:
+        await _retry_missing_questions_from_figures(
+            book_id=book_id, bank_id=bank_id,
+            units=units, pdf_bytes=pdf_bytes,
+            system_prompt=system_prompt,
+        )
+    except Exception as e:
+        logger.warning(
+            "Q-1 figure-witness retry failed (book=%s): %s", book_id, e
+        )
 
     # Auto-embed figures now that questions exist. If figures were extracted
     # before questions, this is when question-tagged figure_references finally
