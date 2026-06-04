@@ -82,13 +82,60 @@ async def list_sections(
     book_id: UUID,
     session: AsyncSession = Depends(get_session),
 ) -> list[SectionOut]:
+    """Return the book's sections ordered by the schema's hierarchical
+    sequence (pre-order tree walk) — NOT lexicographic section_id.
+
+    Lexicographic sort breaks for any chapter with 2-digit subsection
+    numbers (e.g. "8.10" sorts before "8.2"). The Preview/Composer/
+    export pipelines already walk the schema tree directly via
+    final_merge.py + books.py:_get_export_data, so they show the
+    correct order. Until this fix, the sidebar (which calls this
+    endpoint) was the only surface using lexicographic order — that's
+    why users saw jumbled section ordering in the sidebar while
+    Preview rendered correctly.
+
+    Fallback: if the book has no schema or the schema parse fails,
+    fall back to lexicographic order so old/broken books still load.
+    """
+    from app.models.book import Book
+    from app.schemas.analyser import BookSchema
+    from app.services.chunk_builder import flatten_sections as _flatten
+
     result = await session.execute(
-        select(Section).where(Section.book_id == book_id).order_by(Section.section_id)
+        select(Section).where(Section.book_id == book_id)
     )
-    secs = result.scalars().all()
+    secs_by_id = {s.section_id: s for s in result.scalars().all()}
     embedded_by_section = await _load_embedded_figures(session, book_id)
+
+    # Build the canonical schema order. Same helper used by books.py
+    # export ordering — keep the two paths consistent.
+    ordered_ids: list[str] = []
+    book = await session.get(Book, book_id)
+    if book is not None and book.schema:
+        try:
+            schema_obj = BookSchema(**book.schema)
+            for ss in _flatten(schema_obj):
+                if ss.id in secs_by_id and ss.id not in ordered_ids:
+                    ordered_ids.append(ss.id)
+        except Exception:
+            ordered_ids = []
+
+    # Build the output list in schema order, then append any DB-only
+    # sections (defensive — orphans that aren't in the schema but exist
+    # in the sections table) at the end in lexicographic order so they
+    # remain visible to the user / editor.
     out: list[SectionOut] = []
-    for s in secs:
+    seen: set[str] = set()
+    for sid in ordered_ids:
+        s = secs_by_id[sid]
+        d = SectionOut.model_validate(s)
+        d.embedded_figures = embedded_by_section.get(s.section_id, [])
+        out.append(d)
+        seen.add(sid)
+    for sid in sorted(secs_by_id):
+        if sid in seen:
+            continue
+        s = secs_by_id[sid]
         d = SectionOut.model_validate(s)
         d.embedded_figures = embedded_by_section.get(s.section_id, [])
         out.append(d)
