@@ -111,6 +111,24 @@ OPERATOR PRESERVATION — STRICTEST:
 - Multi-line derivations: each printed line of a derivation is its OWN `equation` block, in printed order. Do NOT collapse them into a single block.
 - If any character of an equation is unclear → wrap that portion in `[UNCLEAR: best-guess]`, NEVER drop the operator entirely.
 
+MATH GLYPH PRESERVATION — MANDATORY (visual-similarity Latin substitution is the most common silent OCR bug):
+- When you encounter a math symbol, transcribe it as the EXACT Unicode character. NEVER transcribe a math glyph as the visually-similar Latin letter.
+- Specific glyphs and their common-but-WRONG Latin substitutions to AVOID:
+    ∠ (angle)         — never "Z" (e.g. write "∠AOC", not "ZAOC")
+    ⊥ (perpendicular) — never "T" or "_|_"
+    ∥ (parallel)      — never "II" or "||"
+    ∴ (therefore)     — never ":." or "..."
+    ∵ (because)       — never ":'"
+    → ← ↔ ⇒ ⇔        — never "->", "<-", "=>" etc.
+    ≤ ≥ ≠ ≈ ≡        — never "<=", ">=", "!=", "~=" etc.
+    ± ∓               — never "+/-"
+    × ÷ ·             — never "x", "/", "."
+    ° (degree)        — never " deg" or absent
+    ∞ (infinity)      — never "inf"
+    Δ Σ Π Ω           — never "delta", "sum", "pi", "omega"
+- Same printed glyph must read identically across every Gemini call. Downstream code joins your transcription to figure-extractor anchors via exact substring match; any single-character drift breaks the join.
+- If a glyph is unclear, prefer `[UNCLEAR: ∠]` over silently writing the wrong character.
+
 INTERLEAVED THEORY — KEEP TRANSCRIBING BETWEEN PLACEHOLDERS — CRITICAL:
 - A common textbook pattern: `theory paragraph A → EXAMPLE 5.1 → theory paragraph B (1-2 lines) → EXAMPLE 5.2 → theory paragraph C`
 - Correct output: `[body(A), example_ref(5.1), body(B), example_ref(5.2), body(C)]`
