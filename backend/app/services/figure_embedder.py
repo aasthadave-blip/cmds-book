@@ -404,26 +404,46 @@ def _compute_figure_placements(
             if placed:
                 continue
 
-            # Theory path — fuzzy-match anchor_text against blocks
+            # Theory path — STRICT full-anchor substring match.
+            #
+            # The prompt instructs Gemini to emit anchor_text as the
+            # complete verbatim OCR wording of the printed sentence
+            # adjacent to the image (no paraphrase, no truncation, no
+            # length cap). Block.c contains the same OCR of the same
+            # printed text. So a 100% substring of the normalised
+            # anchor_text in the normalised block.c is the strong
+            # signal that THIS block is the right anchor.
+            #
+            # We deliberately do NOT fall back to a shorter fuzzy
+            # window. A wrong-position match (figure pinned to the
+            # wrong block because a 30-char prefix happened to appear
+            # somewhere else) is worse than the page_fallback below
+            # — the user can spot a section-end figure and reposition,
+            # but a silently-misplaced inline figure looks intentional.
+            #
+            # Normalisation kept minimal:
+            #   - lowercase
+            #   - collapse runs of whitespace to a single space
+            # We deliberately keep punctuation and math symbols
+            # (∠, ≤, π, etc.) — those are part of the anchor identity
+            # and a real OCR-to-OCR match preserves them.
+            import re as _re
             if ctx != "question" and target_sid and anchor_text:
                 sec_row = sections_by_id.get(target_sid)
                 blocks = (sec_row.blocks if sec_row else None) or []
+                anchor_norm = _re.sub(r"\s+", " ", anchor_text.lower()).strip()
                 matched_idx = None
-                snippet60 = anchor_text[:60].lower()
-                if snippet60:
+                if anchor_norm:
                     for idx, b in enumerate(blocks):
-                        btext = (b.get("c") or "").lower() if isinstance(b, dict) else ""
-                        if snippet60 in btext:
+                        if not isinstance(b, dict):
+                            continue
+                        block_text = b.get("c") or ""
+                        block_norm = _re.sub(r"\s+", " ", block_text.lower()).strip()
+                        if not block_norm:
+                            continue
+                        if anchor_norm in block_norm:
                             matched_idx = idx
                             break
-                if matched_idx is None:
-                    snippet30 = anchor_text[:30].lower()
-                    if len(snippet30) >= 10:
-                        for idx, b in enumerate(blocks):
-                            btext = (b.get("c") or "").lower() if isinstance(b, dict) else ""
-                            if snippet30 in btext:
-                                matched_idx = idx
-                                break
                 if matched_idx is not None:
                     placement_idx = matched_idx if anchor_position == "above" else matched_idx + 1
                     new_refs.append(FigureReference(
