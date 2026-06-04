@@ -130,6 +130,54 @@ def _sanitize_schema(data) -> dict:
                 t = s.get("title", "")
                 if t and t not in excluded_titles:
                     excluded_titles.append(t)
+            # Coerce page_start/page_end from string to int. Observed
+            # in prod: Gemini occasionally emits question identifiers
+            # like "9.18" / "9.22" / "9.26" as page values (confusion
+            # between question_no and page_no fields). Pydantic
+            # validation fails on these → entire schema attempt is
+            # discarded → all 3 retries fail identically → user sees
+            # "Schema Queued 0%" forever. Coerce safely:
+            #   - int already → keep
+            #   - string "N" or "N.M" → take int part if valid 1-9999
+            #   - anything else → set to None (let pydantic accept
+            #     null and we move on — better than crashing the
+            #     entire schema)
+            for _pf in ("page_start", "page_end"):
+                _pv = s.get(_pf)
+                if _pv is None:
+                    continue
+                if isinstance(_pv, int):
+                    continue
+                if isinstance(_pv, str):
+                    _ps = _pv.strip()
+                    # First try direct int (e.g. "5")
+                    try:
+                        s[_pf] = int(_ps)
+                        continue
+                    except (TypeError, ValueError):
+                        pass
+                    # Try int part of "9.18" → 9 — but reject values
+                    # that look like question numbers (must be ≤ 9999
+                    # and look like a real page).
+                    head = _ps.split(".")[0] if "." in _ps else _ps
+                    try:
+                        _candidate = int(head)
+                        if 1 <= _candidate <= 9999:
+                            logger.warning(
+                                "schema sanitize: coerced page %s=%r → %d (id=%s)",
+                                _pf, _pv, _candidate, s.get("id"),
+                            )
+                            s[_pf] = _candidate
+                            continue
+                    except (TypeError, ValueError):
+                        pass
+                # Anything else → null it so pydantic accepts
+                logger.warning(
+                    "schema sanitize: nulling unparseable page %s=%r (id=%s)",
+                    _pf, _pv, s.get("id"),
+                )
+                s[_pf] = None
+
             # Remove "Mixed" content_types — a section is EITHER theory OR
             # questions, never both. If both are present, the section is
             # theory-bearing (its Cat A items are nested subsections with
