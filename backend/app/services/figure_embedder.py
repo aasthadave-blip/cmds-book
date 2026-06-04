@@ -520,6 +520,22 @@ def _compute_figure_placements(
                     # normalisation. Multi-char mapping is supported by
                     # str.maketrans + translate.
                     "∥": "||",
+                    # Triangle glyph confusions. Theory OCR commonly
+                    # transcribes the triangle ∆ (U+2206 INCREMENT) or
+                    # Δ (U+0394 GREEK CAPITAL LETTER DELTA) as a plain
+                    # capital "A" (visual similarity in sans-serif
+                    # fonts). Figure extractor reads the glyph
+                    # correctly. Map both glyphs → "A" so anchors with
+                    # "∆ABC" match blocks containing "AABC" once both
+                    # sides are lowercased. Risk profile mirrors the
+                    # ∠→z mapping: false positives possible only when a
+                    # block legitimately contains "A" before the same
+                    # 3-letter sequence that follows the anchor's
+                    # triangle glyph, AND the full anchor sentence
+                    # also substring-matches — very unlikely outside
+                    # the math-prose case this targets.
+                    "∆": "A",
+                    "Δ": "A",
                 })
 
                 def _norm_match(text: str) -> str:
