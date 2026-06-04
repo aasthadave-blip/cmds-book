@@ -322,6 +322,18 @@ export function useRestoreRejected() {
   });
 }
 
+export function useRestoreAllRejected() {
+  const qc = useQueryClient();
+  return useMutation({
+    mutationFn: ({ bankId }: { bankId: UUID }) =>
+      api.restoreAllRejected(bankId),
+    onSuccess: (_data, vars) => {
+      void qc.invalidateQueries({ queryKey: qk.questions(vars.bankId) });
+      void qc.invalidateQueries({ queryKey: qk.questionBank(vars.bankId) });
+    },
+  });
+}
+
 export function useDiscardRejected() {
   const qc = useQueryClient();
   return useMutation({

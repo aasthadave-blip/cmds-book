@@ -644,6 +644,11 @@ export const api = {
       `/api/question-banks/${bankId}/rejected/${rejectedId}/restore`,
       { method: "POST" },
     ),
+  restoreAllRejected: (bankId: UUID) =>
+    req<{ ok: boolean; restored: number; skipped: number }>(
+      `/api/question-banks/${bankId}/rejected/restore-all`,
+      { method: "POST" },
+    ),
   discardRejected: (bankId: UUID, rejectedId: UUID) =>
     req<{ ok: boolean; rejected_id: UUID }>(
       `/api/question-banks/${bankId}/rejected/${rejectedId}/discard`,

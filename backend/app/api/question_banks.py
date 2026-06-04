@@ -976,6 +976,67 @@ async def restore_rejected(
     return {"ok": True, "question_id": str(q.id), "rejected_id": str(rej.id)}
 
 
+@banks_router.post("/{bank_id}/rejected/restore-all")
+async def restore_all_rejected(
+    bank_id: UUID,
+    session: AsyncSession = Depends(get_session),
+) -> dict:
+    """Bulk-restore every pending rejected_question for this bank.
+
+    Use case: after extraction, the user trusts the OCR enough to
+    accept all flagged items as questions rather than reviewing each
+    individually. Each pending item is promoted to a Question row
+    (same logic as the per-item restore endpoint), and the original
+    RejectedQuestion row is marked status='restored' for audit.
+
+    Items already restored/discarded are skipped. Returns the count of
+    items restored.
+    """
+    from datetime import datetime, timezone
+    from uuid import uuid4
+
+    pending = (await session.execute(
+        select(RejectedQuestion)
+        .where(RejectedQuestion.bank_id == bank_id)
+        .where(RejectedQuestion.status == "pending")
+    )).scalars().all()
+
+    if not pending:
+        return {"ok": True, "restored": 0, "skipped": 0}
+
+    now = datetime.now(timezone.utc)
+    restored = 0
+    for rej in pending:
+        payload = rej.payload or {}
+        q = Question(
+            id=uuid4(),
+            bank_id=rej.bank_id,
+            book_id=rej.book_id,
+            section_ref=rej.section_ref,
+            section_title=rej.section_title,
+            page_start=rej.page_start,
+            page_end=rej.page_end,
+            raw_text=rej.raw_text,
+            status="passed",
+            question_number=payload.get("question_number"),
+            exercise_ref=payload.get("exercise_ref"),
+            chapter_ref=payload.get("chapter_ref"),
+            sub_part=payload.get("sub_part"),
+            question_type=payload.get("question_type"),
+            has_options=bool(payload.get("has_options") or False),
+            solution_text=payload.get("solution_text"),
+            has_solution=bool(payload.get("has_solution") or False),
+            kind=(payload.get("kind") or "exercise"),
+        )
+        session.add(q)
+        rej.status = "restored"
+        rej.decided_at = now
+        rej.decided_by = "user-bulk"
+        restored += 1
+    await session.commit()
+    return {"ok": True, "restored": restored, "skipped": 0}
+
+
 @banks_router.post("/{bank_id}/rejected/{rejected_id}/discard")
 async def discard_rejected(
     bank_id: UUID,
