@@ -429,7 +429,33 @@ def _compute_figure_placements(
             # and a real OCR-to-OCR match preserves them.
             import re as _re
             if ctx != "question" and anchor_text:
-                anchor_norm = _re.sub(r"\s+", " ", anchor_text.lower()).strip()
+                # Subscript / superscript digits (and a few math letters)
+                # commonly drift between Gemini passes — the figure
+                # extractor may transcribe "l1, l2" while the theory
+                # extractor uses Unicode "l₁, l₂". Both refer to the
+                # same printed glyph. Normalising before substring match
+                # preserves accuracy without weakening to fuzzy logic.
+                _SUB_SUP_TR = str.maketrans({
+                    "₀": "0", "₁": "1", "₂": "2", "₃": "3", "₄": "4",
+                    "₅": "5", "₆": "6", "₇": "7", "₈": "8", "₉": "9",
+                    "⁰": "0", "¹": "1", "²": "2", "³": "3", "⁴": "4",
+                    "⁵": "5", "⁶": "6", "⁷": "7", "⁸": "8", "⁹": "9",
+                    "₊": "+", "₋": "-", "⁺": "+", "⁻": "-",
+                    "ₓ": "x", "ⁿ": "n",
+                })
+
+                def _norm_match(text: str) -> str:
+                    """Lowercase + collapse whitespace + flatten
+                    subscript/superscript digits to ASCII. Keeps math
+                    symbols (∠, ≤, π, etc.) and punctuation intact so the
+                    substring check remains identity-preserving — we only
+                    smooth over OCR-pass differences."""
+                    if not text:
+                        return ""
+                    t = text.translate(_SUB_SUP_TR).lower()
+                    return _re.sub(r"\s+", " ", t).strip()
+
+                anchor_norm = _norm_match(anchor_text)
 
                 # Anchor text is the PRIMARY signal for placement — page
                 # assignment is just an initial hint. The linker sometimes
@@ -445,6 +471,21 @@ def _compute_figure_placements(
                 # 100%-substring match wins and the figure migrates to
                 # that section. Still strict — wrong placement is worse
                 # than section-end fallback.
+                def _block_candidates(b: dict) -> list[str]:
+                    """Return the normalised text(s) to try matching the
+                    anchor against. For `def` blocks the candidate is
+                    `term + ": " + c` (the printed form often combines
+                    them) AND `c` alone (some def blocks are body-only).
+                    For other block types just `c`."""
+                    out: list[str] = []
+                    c = b.get("c") or ""
+                    term = b.get("term") or ""
+                    if b.get("t") == "def" and term:
+                        out.append(_norm_match(f"{term}: {c}"))
+                    if c:
+                        out.append(_norm_match(c))
+                    return [s for s in out if s]
+
                 def _match_in_section(sid: str) -> int | None:
                     """Strict full-anchor substring match against blocks
                     of section ``sid``. Returns matched block index or None."""
@@ -457,12 +498,9 @@ def _compute_figure_placements(
                     for idx, b in enumerate(blocks):
                         if not isinstance(b, dict):
                             continue
-                        block_text = b.get("c") or ""
-                        block_norm = _re.sub(r"\s+", " ", block_text.lower()).strip()
-                        if not block_norm:
-                            continue
-                        if anchor_norm in block_norm:
-                            return idx
+                        for cand in _block_candidates(b):
+                            if anchor_norm in cand:
+                                return idx
                     return None
 
                 matched_sid: str | None = None
