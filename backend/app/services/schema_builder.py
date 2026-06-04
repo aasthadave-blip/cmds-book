@@ -52,15 +52,46 @@ _TYPE_MAP = {
 }
 
 
-def _sanitize_schema(data: dict) -> dict:
+def _sanitize_schema(data) -> dict:
     """Normalize Gemini output to valid BookSchema fields.
 
     - Maps unknown section types (e.g. 'subsubsection') to valid Literal values
     - Bridges excluded_sections → exclusion_summary for UI compatibility
+
+    Top-level shape recovery: Gemini occasionally returns a JSON array
+    (e.g. ``[{...sections...}]``) at the root instead of the expected
+    object. If we receive a list, try the first dict inside it as the
+    real payload; otherwise return an empty schema shell so pydantic
+    can surface a precise validation error rather than a Python
+    AttributeError.
     """
+    if not isinstance(data, dict):
+        logger.warning(
+            "schema sanitize: top-level payload is %s, not dict — attempting recovery",
+            type(data).__name__,
+        )
+        if isinstance(data, list):
+            inner = next((x for x in data if isinstance(x, dict)), None)
+            if inner is not None:
+                data = inner
+            else:
+                logger.warning(
+                    "schema sanitize: no dict found inside top-level list — returning empty"
+                )
+                return {"sections": [], "excluded_sections": [], "exclusion_summary": []}
+        else:
+            return {"sections": [], "excluded_sections": [], "exclusion_summary": []}
+
     excluded_titles: list[str] = []
 
-    for ex in data.get("excluded_sections") or []:
+    excluded_raw = data.get("excluded_sections") or []
+    if not isinstance(excluded_raw, list):
+        logger.warning(
+            "schema sanitize: excluded_sections is %s, not list — ignoring",
+            type(excluded_raw).__name__,
+        )
+        excluded_raw = []
+    for ex in excluded_raw:
         t = ex.get("title", "") if isinstance(ex, dict) else str(ex)
         if t and t not in excluded_titles:
             excluded_titles.append(t)
