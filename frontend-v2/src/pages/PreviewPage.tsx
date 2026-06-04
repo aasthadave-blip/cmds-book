@@ -501,14 +501,15 @@ function BlockRow({ block }: { block: Block }) {
     </ol>;
   }
   if (t === 'fig') {
-    // Suppress the fig-block placeholder. The actual figure image is
-    // emitted as a separate item.type='figure' immediately after this
-    // block by seed_draft_items_from_merge (using placement_block_idx),
-    // and it renders with proper caption + alt text. Showing the muted
-    // "📷 Figure X.Y Caption" placeholder here too produced visible
-    // duplication ("📷 Figure 8.2 Transfer of charge..." then the same
-    // figure image with the same caption right below).
-    return null;
+    // The seeder (seed_draft_items_from_merge) drops fig BLOCKS when a
+    // matching figure ITEM exists at the same position (the image item
+    // renders the actual figure). A fig block that DOES reach this
+    // renderer means the embedder couldn't link a figure here — show a
+    // muted "📷 Figure X.Y" callout so the reader sees that a figure
+    // was meant to appear at this spot rather than getting a silent gap.
+    return <div style={{ marginBottom: 12, padding: '12px 14px', background: 'var(--bg-tint)', borderRadius: 6, fontSize: 12, color: 'var(--ink-500)' }}>
+      📷 {c || 'Figure placeholder'}
+    </div>;
   }
   if (t === 'example_ref' || t === 'exercise_ref' || t === 'question_ref') {
     const label = String((block as { label?: string }).label ?? '');

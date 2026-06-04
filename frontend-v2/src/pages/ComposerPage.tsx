@@ -736,12 +736,12 @@ function BlockRender({ block }: { block: Block }) {
     return <span style={{ display: 'inline-block', padding: '2px 8px', background: 'var(--indigo-50)', color: 'var(--indigo-700)', borderRadius: 12, fontSize: 11, fontWeight: 700 }}>{label}</span>;
   }
   if (t === 'fig') {
-    // Suppress the fig-block placeholder. The actual figure renders as
-    // a separate item.type='figure' immediately after this block in the
-    // seeded draft. Showing the muted "📷 Figure placeholder — caption"
-    // text here too duplicated the figure visually (placeholder + image
-    // with the same caption right below).
-    return null;
+    // The seeder drops fig BLOCKS when a matching figure ITEM exists at
+    // the same position. A fig block that reaches this renderer means
+    // the embedder couldn't link a figure here — show a muted callout
+    // so the user sees a figure was expected, rather than a silent gap.
+    const label = String((block as { label?: string }).label ?? '');
+    return <div style={{ fontSize: 12, color: 'var(--ink-500)' }}>📷 Figure placeholder — {c || label}</div>;
   }
   return <div style={{ fontSize: 12, color: 'var(--ink-400)' }}>[{t}] {c}</div>;
 }
