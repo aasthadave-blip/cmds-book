@@ -474,14 +474,29 @@ function BlockRow({ block }: { block: Block }) {
     </div>
   );
   if (t === 'eq') {
-    // RAW OCR rendering — render the eq block content EXACTLY as it
-    // was extracted from the PDF. No math wrapping, no LaTeX rendering,
-    // no transformations. KaTeX's math-mode `%` comment behavior was
-    // truncating equations like "10/100 = 10%, 25/100 = 25%, ..." at
-    // the first `%`. Source-faithful display is the priority.
+    // Auto-wrap bare eq content in $$...$$ so KaTeX renders the
+    // superscripts/subscripts/integral notation properly. Skip the
+    // wrap when:
+    //   - the content already has `$` delimiters (Gemini emitted real
+    //     LaTeX) → MathMarkdown handles it natively
+    //   - the content contains `%` (KaTeX treats `%` as a math-mode
+    //     comment and truncates the rest of the line; rather than
+    //     rendering a mangled equation, we show the raw OCR text)
+    //   - the content is mostly PROSE with an equals sign (geometry
+    //     justifications like "Area of ABDC = Area of ABDF"). Math
+    //     mode would italicize every letter and DROP all whitespace,
+    //     producing "Areaof ABDC = Areaof ABDF" → "AreaofABDC =
+    //     AreaofABDF". Detection: presence of 3+ consecutive letters
+    //     (English words) AND absence of LaTeX command tokens.
+    const hasDelimiter = c.includes('$');
+    const hasPercent = c.includes('%');
+    const hasLatexCommand = /\\[a-zA-Z]+|\^[\{\(]|_[\{\(]|\\frac|\\sqrt|\\int|\\sum|\\prod/.test(c);
+    const hasProseWords = /[A-Za-z]{4,}/.test(c);
+    const isMostlyProse = hasProseWords && !hasLatexCommand;
+    const wrapped = (hasDelimiter || hasPercent || isMostlyProse) ? c : `$$${c}$$`;
     return (
-      <div style={{ background: 'var(--bg-tint)', padding: '10px 14px', borderRadius: 6, marginBottom: 12, fontSize: 14, color: 'var(--indigo-700)', fontFamily: 'var(--font-mono)', whiteSpace: 'pre-wrap' }}>
-        {c}
+      <div style={{ background: 'var(--bg-tint)', padding: '10px 14px', borderRadius: 6, marginBottom: 12, fontSize: 14, color: 'var(--indigo-700)' }}>
+        <MathMarkdown>{wrapped}</MathMarkdown>
       </div>
     );
   }
@@ -489,15 +504,22 @@ function BlockRow({ block }: { block: Block }) {
     const term = String((block as { term?: string }).term ?? '');
     return (
       <div style={{ marginBottom: 12, padding: '8px 12px', background: '#F3F6FF', borderLeft: '3px solid var(--indigo-700)', borderRadius: 4 }}>
-        <strong style={{ color: 'var(--indigo-700)' }}>{term}: </strong>
-        <span>{c}</span>
+        <strong style={{ color: 'var(--indigo-700)' }}>
+          <MathMarkdown inline>{term}</MathMarkdown>
+          {': '}
+        </strong>
+        <MathMarkdown inline>{c}</MathMarkdown>
       </div>
     );
   }
   if (t === 'list') {
     const items = ((block as { items?: string[] }).items ?? []);
     return <ol style={{ marginBottom: 12, paddingLeft: 22 }}>
-      {items.map((it, k) => <li key={k} style={{ marginBottom: 4, lineHeight: 1.55, fontSize: 14, whiteSpace: 'pre-wrap' }}>{it}</li>)}
+      {items.map((it, k) => (
+        <li key={k} style={{ marginBottom: 4, lineHeight: 1.55, fontSize: 14 }}>
+          <MathMarkdown inline>{it}</MathMarkdown>
+        </li>
+      ))}
     </ol>;
   }
   if (t === 'fig') {
