@@ -131,9 +131,17 @@ the SAME bounding_box rules as labelled figures, AND emit these extra
 fields so the downstream linker can place it positionally:
 
   "is_labelled": false
-  "anchor_text": "<one verbatim sentence/phrase printed immediately
-                   above, below, or beside the image — exactly as
-                   it appears, no paraphrase>"
+  "anchor_text": "<pure verbatim OCR text of the COMPLETE printed
+                   sentence or paragraph that sits immediately
+                   above / below / beside the image. Include the
+                   FULL sentence(s) verbatim — punctuation,
+                   capitalisation, math symbols, spacing — exactly
+                   as printed on the page. NO paraphrase, NO
+                   abbreviation, NO truncation. Downstream code
+                   matches this string as a 100%% substring against
+                   the OCR'd theory blocks — any wording drift
+                   between this anchor_text and the actual block
+                   breaks placement.>"
   "anchor_position": "above" | "below" | "beside"
   "question_no": "<just the numeric portion of the nearest question
                    number ABOVE the image on the same page, e.g.
@@ -144,8 +152,18 @@ anchor_position, question_no as null — the figure_label + caption
 are enough for the linker.
 
 EXTRACTION RULES for unlabelled figures:
-  - anchor_text MUST be one short line (≤ 1 sentence, ≤ ~120 chars).
-    If no readable text sits adjacent to the image, DO NOT extract.
+  - anchor_text MUST be the EXACT printed sentence(s) — no rewording,
+    no normalisation, no condensing. Copy the OCR character-for-character
+    including math symbols ("∠", "≤", "π"), special characters
+    ("—", "'", "'"), and any subscripts/superscripts. Length is
+    whatever the printed sentence is — do NOT cap at any character
+    count. A longer accurate anchor gives a better placement match.
+  - The anchor MUST be a CONTIGUOUS run of printed text — one full
+    sentence or one full paragraph beginning. Do NOT splice
+    text from two different paragraphs.
+  - If no readable text sits adjacent to the image OR you cannot
+    transcribe the anchor verbatim, DO NOT extract — set the figure
+    aside; better to skip than mis-place.
   - For context="question" or "solution": question_no MUST be set
     (infer from the nearest question number above the image on the
     page). If you cannot identify the question, DO NOT extract.
