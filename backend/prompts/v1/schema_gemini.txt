@@ -74,20 +74,24 @@ Unnumbered headings: place at the level of their visual peers (typically 2 or 3 
 
 For each heading: "Does the content under it teach or explain something?" Yes → include. No → put in `excluded_sections`.
 
-| Include (`type` = chapter / section / subsection) | Exclude (`excluded_sections`) |
+| Include as section (`type` = chapter / section / subsection, `content_types` = "theory" OR "questions") | Exclude (`excluded_sections`) |
 |---|---|
-| Prose explanations, definitions, derivations | Exercises, Practice Problems |
-| Worked examples with explanations | MCQs, Objective Questions, Fill-in-the-blanks |
-| Biographical content about scientists | Answer Keys, Solutions to Exercises |
-| Historical context, applications | End-of-chapter question banks |
-| "Summary" with actual prose | "Summary" with only exercise numbers |
-| "Key Points" / "Remember" boxes | Index, Bibliography, References |
-| "In-text Questions" if they explain answers | "In-text Questions" / "QUESTIONS" boxes with only numbered questions |
-| Glossary with definitions | Standalone answer keys |
+| Prose explanations, definitions, derivations → `["theory"]` | Standalone answer keys (printed without question stems alongside) |
+| Worked examples with explanations → `["theory"]` | Index, Bibliography, References, Glossary as page only |
+| Biographical content about scientists → `["theory"]` | Truly anonymous numbered question blocks (NO heading naming the block) |
+| Historical context, applications → `["theory"]` | Terminal hint/solutions sections that only contain "Ans: B" style 1-line entries (no teaching content) |
+| "Summary" with actual prose → `["theory"]` | |
+| "Key Points" / "Remember" boxes → `["theory"]` | |
+| "In-text Questions" if they explain answers → `["theory"]` | |
+| Glossary with definitions → `["theory"]` | |
+| **Exercises, Practice Problems with a printed heading** (e.g. "Exercise 8.3", "Practice Problems") → `["questions"]` Cat A section | |
+| **MCQs / Objective Questions under a named heading** (e.g. "Level 2: Review Your Concepts", "Classical Thinking", "Critical Thinking") → `["questions"]` Cat A section | |
+| **End-of-chapter question banks with a heading** (e.g. "Unit Exercise", "Question Bank", "MCQ Bank") → `["questions"]` Cat A section | |
+| **Solutions / Explanations with multi-sentence teaching prose** (not 1-line answers) → `["theory"]` | |
 
-Rule: teaches → include. Pure student assessment → exclude.
+Rule: teaches → include as theory. Has a printed heading naming a question block → include as Cat A questions. Truly anonymous question lists or 1-line answer keys → exclude. **A printed heading naming the content NEVER goes to `excluded_sections` — it always becomes a real section.**
 
-**"In-text Questions" tiebreaker:** if the box contains only numbered questions with no surrounding explanation → exclude (assessment). If each question has a written answer/explanation alongside → include. If unclear → exclude (default).
+**"In-text Questions" tiebreaker:** if the box contains only numbered questions with no surrounding explanation AND has no heading naming it → exclude (assessment). If it has a heading (e.g. "In-text Questions" itself) → Cat A section. If each question has a written answer/explanation alongside → Cat B theory section.
 
 ## PASS 3.5 — In-section labeled items
 
@@ -154,7 +158,28 @@ subsections:              [each labeled item as its own subsection]
 ### Section-level vs end-of-chapter exercises
 
 - Inline numbered exercises (Exercise 1.1, Exercise 8.3) **between theory sections and BEFORE the chapter's last theory heading** → nest under the immediately-preceding theory heading using the parent rule. `type="subsection"`, `content_types=["questions"]`.
-- Exercise/question blocks **AFTER the last theory heading** (rest of chapter is only questions + answer keys) → `excluded_sections`. Examples: Unit Exercise, Question Bank, MCQ Bank, final review block. **Note:** Crosswords / Word Puzzles do NOT get their own schema entry — their text is transcribed as part of the surrounding theory section's body content (no subsection, no chip).
+
+- Question blocks **AFTER the last theory heading** are routed by whether they carry a printed heading:
+
+  - **Named question bank (has a visible heading above the question numbers)** — emit as a real Cat A SECTION (or subsection of the chapter), NOT excluded. Examples of headings to recognise: "Practice Questions", "Practice Problems", "Level 1: Apply your Concepts", "Level 2: Review Your Concepts", "Level 3: Assess Your Concepts", "Classical Thinking", "Critical Thinking", "Exercise 8.3", "Unit Exercise", "Question Bank", "MCQ Bank", "Self-Assessment", "Quick Check Drill", "MHT-CET Drill", "JEE Practice", "Comprehension-Based Questions", "Match the Column", "Assertion and Reason Type Questions", "Multiple-Answer Type Questions". Shape:
+    ```
+    id:                       <chapter-id>-<heading-slugified>
+    title:                    <printed heading verbatim>
+    type:                     "section"   (or "subsection" if nested under a theory parent)
+    level:                    parent.level + 1
+    content_types:            ["questions"]
+    page_start / page_end:    pages the bank spans
+    expected_question_count:  total questions printed under this heading
+    subsections:              []                  (or nested Cat A buckets if the bank
+                                                   has its own sub-headings like
+                                                   "Essay Type" / "Short Answer")
+    ```
+
+  - **Truly anonymous block (only numbered questions on the page, NO heading naming the block)** → `excluded_sections`. Same for terminal answer keys, indexes, bibliographies — they are not assessed content.
+
+  Why this matters: dumping a named question bank into `excluded_sections` orphans the chip-merge in downstream merging. Parent sections then capture the bank's content as chip-only theory blocks, the parent-vs-leaf rule cannot apply (no schema subsection to anchor against), and questions printed above the named heading on the same page get dropped from extraction. Emitting the named bank as a real Cat A section fixes all three failure modes at once.
+
+  **Note:** Crosswords / Word Puzzles do NOT get their own schema entry — their text is transcribed as part of the surrounding theory section's body content (no subsection, no chip).
 
 ## PASS 4 — Question census
 
@@ -165,6 +190,20 @@ For every section AND every `excluded_sections` entry, set `expected_question_co
 **Don't count:** fill-in-blank decorative panels, hint boxes, "Did You Know", learning objectives, summaries, standalone answer keys, headings, crosswords / word puzzles (these are part of the surrounding theory body, not a separate counted section).
 
 Pure theory section → 0. End-of-chapter "Exercises" / "Practice Questions" almost always have a non-zero count — don't leave at 0 by default.
+
+## PASS 4.5 — Anti-placeholder guard (HARD RULE)
+
+If the input PDF contains ANY printed instructional content (numbered questions, named headings introducing question banks, theory paragraphs, definitions, formulas, problem statements, worked examples), the schema MUST emit at least one section whose `content_types` includes either `"theory"` or `"questions"`. A chapter wrapper with `content_types: []`, `expected_question_count: 0`, and `subsections: []` is FORBIDDEN unless the input is genuinely devoid of instructional content (blank pages, copyright/colophon only).
+
+Concrete cases this guard protects against:
+
+- **Single-page question fragment** (e.g. one page out of a 50-page chapter, containing only "Level 2: Review Your Concepts" + question numbers): emit the chapter root + ONE Cat A subsection for the named question bank, with `expected_question_count` = total questions on the page including any printed above the heading. NEVER emit a bare placeholder chapter with the bank dumped into `excluded_sections`.
+
+- **Solution/explanation-only pages** (e.g. an "EXPLANATIONS" or "Answers" section with multi-sentence solution paragraphs that read like teaching content): emit the chapter root + at least one Cat B section under the printed heading (`content_types=["theory"]`). NEVER drop everything into `excluded_sections` leaving an empty placeholder.
+
+- **Dense MCQ-bank books** (MHT-CET / JEE / NEET prep with column-heavy layouts): each printed sub-heading (Classical Thinking, Critical Thinking, Practice Questions Level 1/2/3 etc.) gets its own Cat A section per Pass 3.5. NEVER collapse the whole chapter into a single placeholder when per-heading classification is possible.
+
+If you cannot identify ANY section structure for the input, populate `extraction_notes` with a precise explanation of what you saw and why it cannot be classified. Returning an empty placeholder is not an acceptable fallback.
 
 ## PASS 5 — IDs (unique across document)
 
