@@ -135,7 +135,13 @@ export const unhideQuestion = (questionId: string) =>
 // the Q-2 solution-completeness retry server-side so newly-restored
 // rows with empty solution_text get rescued in the same call.
 export const restoreAllRejected = (bankId: string) =>
-  req<{ ok: boolean; restored: number; skipped: number; solutions_rescued?: number }>(
+  req<{
+    ok: boolean;
+    restored: number;
+    skipped: number;
+    solutions_rescued?: number;
+    figures_attached?: number;
+  }>(
     `/api/question-banks/${bankId}/rejected/restore-all`,
     { method: 'POST' },
   );
