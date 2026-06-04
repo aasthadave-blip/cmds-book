@@ -432,6 +432,17 @@ HARD RULES — ANTI-HALLUCINATION
 10. NEVER FABRICATE. If unsure → omit. If unclear → "[illegible]". An empty
     `extracted` list for a pure-theory section is correct.
 
+11. INTERNAL CONSISTENCY (mandatory):
+    - has_options=true → the `raw_text` field MUST contain the printed
+      option markers (e.g. "(A) ... (B) ... (C) ... (D) ...") verbatim.
+    - has_solution=true → the `solution` field MUST be a non-empty string
+      containing the verbatim transcribed solution text.
+    - If you cannot transcribe the solution verbatim, set has_solution=false
+      and leave `solution` null — DO NOT set has_solution=true with an
+      empty solution field.
+    - If you cannot transcribe all options verbatim, set has_options=false
+      and explain in `raw_text` via [UNCLEAR: ...] markers.
+
 ═══════════════════════════════════════════════════════════════════════════════
 OUTPUT — STRICT JSON, no prose, no markdown fencing
 ═══════════════════════════════════════════════════════════════════════════════
