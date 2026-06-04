@@ -572,12 +572,30 @@ def _flatten_sections(
     units: list[_Unit] = []
 
     def emit(node: SchemaSection, depth: int) -> None:
-        # Chapter wrapper → recurse into children only, never emit the
-        # chapter itself (would re-cover the whole book).
+        # Chapter wrapper handling:
+        # - Normal case: chapter is a container with children — recurse
+        #   only, never emit chapter itself (would re-cover the whole
+        #   book).
+        # - Special case (pure question-bank PDFs): chapter has
+        #   content_types=["questions"] AND zero subsections. Gemini
+        #   correctly classified the whole PDF as one Cat A block but
+        #   there are no sub-headings to nest. If we recurse-only here,
+        #   ZERO units get emitted → ZERO Gemini calls → ZERO questions
+        #   extracted. Treat the chapter itself as the Cat A leaf and
+        #   fall through to the normal emit path.
         if (node.type or "").lower() == "chapter":
-            for c in node.subsections or []:
-                emit(c, depth + 1)
-            return
+            has_q_at_chapter = "questions" in (node.content_types or [])
+            no_children = not (node.subsections or [])
+            if has_q_at_chapter and no_children:
+                # Fall through to the Cat A leaf-emit path below by
+                # NOT returning. The is_category_a check at line ~613
+                # will pick this up because content_types contains
+                # "questions".
+                pass
+            else:
+                for c in node.subsections or []:
+                    emit(c, depth + 1)
+                return
         # Excluded sections inside .sections tree (rare) handled below
         if (node.type or "").lower() == "excluded":
             return
