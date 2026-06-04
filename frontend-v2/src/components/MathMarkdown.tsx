@@ -41,7 +41,12 @@ export function MathMarkdown({ children, inline = false }: Props) {
   return (
     <ReactMarkdown
       remarkPlugins={[remarkMath, remarkGfm]}
-      rehypePlugins={[rehypeKatex]}
+      // throwOnError:false + errorColor:inherit — when KaTeX hits an
+      // unparseable expression (unbalanced braces, unknown command),
+      // render the raw source in normal text color instead of the
+      // default red error box. Source-faithful fallback beats a loud
+      // red box for users skimming the doc.
+      rehypePlugins={[[rehypeKatex, { throwOnError: false, errorColor: 'inherit', strict: 'ignore' }]]}
       components={components}
     >
       {safe}
