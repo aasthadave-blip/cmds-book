@@ -1006,6 +1006,7 @@ async def restore_all_rejected(
 
     now = datetime.now(timezone.utc)
     restored = 0
+    book_id_for_q2: UUID | None = None
     for rej in pending:
         payload = rej.payload or {}
         q = Question(
@@ -1033,8 +1034,95 @@ async def restore_all_rejected(
         rej.decided_at = now
         rej.decided_by = "user-bulk"
         restored += 1
+        book_id_for_q2 = rej.book_id
     await session.commit()
-    return {"ok": True, "restored": restored, "skipped": 0}
+
+    # Q-2 fire-on-restore: any restored question may carry has_solution=true
+    # with an empty solution_text (the rejected_question payload faithfully
+    # preserved Gemini's original output, including the inconsistency).
+    # Fire the solution-completeness retry so the user doesn't need to
+    # re-extract the whole book to get solutions on restored items.
+    # Non-fatal — restore itself already succeeded above.
+    solutions_rescued = 0
+    if book_id_for_q2 is not None:
+        try:
+            from app.workers.questions_v3 import (
+                _retry_missing_solutions, _flatten_sections, SyncSession,
+            )
+            from app.models.book import Book as _Book
+            from app.schemas.analyser import BookSchema as _BookSchema
+            from app.core.storage import download_pdf
+            from app.services.prompt_loader import load_raw
+
+            # Snapshot what's needed BEFORE calling into the worker
+            # (it uses its own sync sessions internally).
+            with SyncSession() as own:
+                book = own.get(_Book, book_id_for_q2)
+                if book and book.schema:
+                    is_multi = bool((book.analyser or {}).get("is_multi_column", False))
+                    schema_obj = _BookSchema(**book.schema)
+                    units = _flatten_sections(schema_obj, is_multi_column=is_multi)
+                    pdf_bytes = download_pdf(book.pdf_url or "")
+                    system_prompt = load_raw("question_extractor_v3")
+                else:
+                    units = []
+                    pdf_bytes = b""
+                    system_prompt = ""
+
+            if units and pdf_bytes:
+                # Count empty solutions before so we can report rescued count
+                from app.models.question import Question as _Question
+                from sqlalchemy import select as _select
+                with SyncSession() as own:
+                    before_empty = own.execute(
+                        _select(_Question).where(
+                            _Question.book_id == book_id_for_q2,
+                            _Question.bank_id == bank_id,
+                            _Question.regen_id.is_(None),
+                            _Question.has_solution.is_(True),
+                        )
+                    ).scalars().all()
+                    before_empty_count = sum(
+                        1 for q in before_empty
+                        if not (q.solution_text or "").strip()
+                    )
+
+                await _retry_missing_solutions(
+                    book_id=book_id_for_q2,
+                    bank_id=bank_id,
+                    units=units,
+                    pdf_bytes=pdf_bytes,
+                    system_prompt=system_prompt,
+                )
+
+                with SyncSession() as own:
+                    after_empty = own.execute(
+                        _select(_Question).where(
+                            _Question.book_id == book_id_for_q2,
+                            _Question.bank_id == bank_id,
+                            _Question.regen_id.is_(None),
+                            _Question.has_solution.is_(True),
+                        )
+                    ).scalars().all()
+                    after_empty_count = sum(
+                        1 for q in after_empty
+                        if not (q.solution_text or "").strip()
+                    )
+                solutions_rescued = max(0, before_empty_count - after_empty_count)
+        except Exception:
+            # Q-2 best-effort — restore already succeeded
+            import logging
+            logging.getLogger(__name__).warning(
+                "Q-2 solution retry on restore-all failed",
+                exc_info=True,
+            )
+
+    return {
+        "ok": True,
+        "restored": restored,
+        "skipped": 0,
+        "solutions_rescued": solutions_rescued,
+    }
 
 
 @banks_router.post("/{bank_id}/rejected/{rejected_id}/discard")
