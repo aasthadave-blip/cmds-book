@@ -467,6 +467,15 @@ def _compute_figure_placements(
                     "⁵": "5", "⁶": "6", "⁷": "7", "⁸": "8", "⁹": "9",
                     "₊": "+", "₋": "-", "⁺": "+", "⁻": "-",
                     "ₓ": "x", "ⁿ": "n",
+                    # Math-glyph OCR confusion. Theory extractor sometimes
+                    # transcribes the angle glyph ∠ as a capital Z (slab-
+                    # serif visual similarity). Figure extractor reads ∠
+                    # correctly. Map ∠ → z so anchors containing "∠AOC"
+                    # match blocks containing "ZAOC" once both sides are
+                    # lowercased. One-direction only (Z stays Z) — never
+                    # broaden Z-as-letter to match ∠-as-glyph, that would
+                    # false-match prose containing words like "Zone".
+                    "∠": "z",
                 })
 
                 def _norm_match(text: str) -> str:
