@@ -1760,6 +1760,198 @@ def _insert_only_merge(
 
 
 # ---------------------------------------------------------------------------
+# Q-2 solution-completeness retry — rescue missing solution_text where a
+# question claims has_solution=true but solution_text is empty. Item-level
+# retry; UPDATE existing rows (don't INSERT — questions already exist).
+# ---------------------------------------------------------------------------
+async def _run_solution_retry(
+    unit: "_Unit",
+    pdf_bytes: bytes,
+    system_prompt: str,
+    qnos_needing_solution: list[str],
+) -> dict[str, Any]:
+    """Re-OCR ONLY the solutions for the listed question numbers.
+
+    Returns ``{"ok": True, "items": [{question_number, solution}, ...]}``
+    on success, or ``{"ok": False, "items": []}`` on failure.
+    """
+    is_example = bool(unit.id) and "example" in (unit.id or "").lower()
+    is_tight = (
+        unit.page_start is not None
+        and unit.page_end is not None
+        and unit.page_end - unit.page_start <= 0
+    )
+    leading_pad = 1 if (
+        is_example and is_tight and unit.page_start and unit.page_start > 1
+    ) else 0
+    start = (unit.page_start - leading_pad) if unit.page_start is not None else None
+    padded_end = (unit.page_end + 1) if unit.page_end is not None else None
+    pdf_slice = _slice_pdf(pdf_bytes, start, padded_end)
+
+    qnos_str = ", ".join(qnos_needing_solution[:50])
+    user_prompt = (
+        f"SOLUTION RECOVERY pass for section: \"{unit.title}\" (ID: {unit.id}).\n\n"
+        f"On a previous pass, the following question numbers were extracted but "
+        f"their printed solution text was NOT transcribed: {qnos_str}.\n\n"
+        f"Re-scan the pages. For each listed question_number, locate the printed "
+        f"SOLUTION / ANSWER / WORKED-OUT text that appears below, beside, or "
+        f"adjacent to that question on the page. Transcribe it VERBATIM into a "
+        f"`solution` field. Apply OCR-only rules — never compute, complete, "
+        f"derive, or supply a missing step. Never use training knowledge to "
+        f"fill in what is illegible.\n\n"
+        f"If a listed question genuinely has no printed solution visible on the "
+        f"page, OMIT it from the response (do NOT fabricate). If the printed "
+        f"solution is partially illegible, transcribe what is readable and stop.\n\n"
+        f"Return JSON: {{\"section_id\": \"{unit.id}\", \"items\": "
+        f"[{{\"question_number\": \"<as printed>\", \"solution\": "
+        f"\"<verbatim solution text>\"}}, ...]}}"
+    )
+    try:
+        raw = await _gemini_call_with_transient_retries(
+            pdf_slice, system_prompt, user_prompt,
+            ctx=f"q2-solution-retry {unit.kind}/{unit.id}",
+        )
+        data = parse_json(raw)
+        if not isinstance(data, dict):
+            return {"ok": False, "items": []}
+        items = list(data.get("items") or data.get("extracted") or [])
+        # Sanitize: only keep items with both question_number and non-empty solution
+        clean: list[dict[str, Any]] = []
+        for it in items:
+            if not isinstance(it, dict):
+                continue
+            qn = (it.get("question_number") or "").strip()
+            sol = (it.get("solution") or "").strip()
+            if not qn or not sol:
+                continue
+            clean.append({"question_number": qn, "solution": sol})
+        return {"ok": True, "items": clean}
+    except Exception as e:
+        logger.warning("Q2 solution retry failed for %s/%s: %s",
+                       unit.kind, unit.id, e)
+        return {"ok": False, "items": []}
+
+
+async def _retry_missing_solutions(
+    book_id: UUID,
+    bank_id: UUID,
+    units: list["_Unit"],
+    pdf_bytes: bytes,
+    system_prompt: str,
+) -> None:
+    """Scan questions with has_solution=true and empty solution_text;
+    retry per-section to rescue the missing solution_text.
+    """
+    # 1. Find affected questions in DB
+    with SyncSession() as session:
+        affected = session.execute(
+            select(Question).where(
+                Question.book_id == book_id,
+                Question.bank_id == bank_id,
+                Question.regen_id.is_(None),
+                Question.has_solution.is_(True),
+            )
+        ).scalars().all()
+        # Filter: only those with empty solution_text
+        affected = [
+            q for q in affected
+            if not (q.solution_text or "").strip()
+        ]
+
+    if not affected:
+        logger.info(
+            "[q2-solution-retry] book=%s — no questions with missing "
+            "solution_text — nothing to retry", book_id,
+        )
+        return
+
+    # 2. Group by section_ref
+    by_section: dict[str, list[str]] = {}
+    for q in affected:
+        if not q.question_number:
+            continue
+        by_section.setdefault(q.section_ref, []).append(q.question_number)
+
+    if not by_section:
+        logger.info(
+            "[q2-solution-retry] book=%s — %d affected questions have no "
+            "question_number, cannot retry safely", book_id, len(affected),
+        )
+        return
+
+    logger.info(
+        "[q2-solution-retry] book=%s — %d sections, %d total questions "
+        "need solution recovery",
+        book_id, len(by_section), len(affected),
+    )
+
+    # 3. For each section, retry + update
+    units_by_id = {u.id: u for u in units}
+    updated_total = 0
+    for sid, qnos in by_section.items():
+        unit = units_by_id.get(sid)
+        if unit is None:
+            logger.warning(
+                "[q2-solution-retry] section=%s not in units list, skipping",
+                sid,
+            )
+            continue
+        try:
+            result = await _run_solution_retry(
+                unit=unit,
+                pdf_bytes=pdf_bytes,
+                system_prompt=system_prompt,
+                qnos_needing_solution=sorted(set(qnos)),
+            )
+        except Exception as e:
+            logger.warning(
+                "[q2-solution-retry] retry failed for section=%s: %s",
+                sid, e,
+            )
+            continue
+
+        items = result.get("items") or []
+        if not result.get("ok") or not items:
+            logger.info(
+                "[q2-solution-retry] section=%s — retry returned 0 solutions",
+                sid,
+            )
+            continue
+
+        # 4. UPDATE existing question rows
+        items_by_qno = {_norm_qno(it["question_number"]): it["solution"] for it in items}
+        with SyncSession() as session:
+            section_qs = session.execute(
+                select(Question).where(
+                    Question.bank_id == bank_id,
+                    Question.section_ref == sid,
+                    Question.regen_id.is_(None),
+                )
+            ).scalars().all()
+            updated_here = 0
+            for q in section_qs:
+                if not q.question_number:
+                    continue
+                if (q.solution_text or "").strip():
+                    continue  # already has solution; don't overwrite
+                sol = items_by_qno.get(_norm_qno(q.question_number))
+                if sol:
+                    q.solution_text = sol
+                    updated_here += 1
+            session.commit()
+            updated_total += updated_here
+            logger.info(
+                "[q2-solution-retry] section=%s — updated %d solution(s)",
+                sid, updated_here,
+            )
+
+    logger.info(
+        "[q2-solution-retry] book=%s — done. solutions rescued=%d",
+        book_id, updated_total,
+    )
+
+
+# ---------------------------------------------------------------------------
 # Main task
 # ---------------------------------------------------------------------------
 async def _run_v3(book_id: UUID, bank_id: UUID, job_id: UUID) -> dict[str, Any]:
@@ -1991,6 +2183,26 @@ async def _run_v3(book_id: UUID, bank_id: UUID, job_id: UUID) -> dict[str, Any]:
     except Exception as e:
         logger.warning(
             "Q-1 figure-witness retry failed (book=%s): %s", book_id, e
+        )
+
+    # ─── Q-2: solution-completeness retry ─────────────────────────────
+    # If Gemini emitted has_solution=true but the solution_text is
+    # empty (observed across multiple books: Class 9th Maths 3/22 empty,
+    # Geometry 7abc7ae1 7/21 empty), re-call Gemini for that specific
+    # section listing the question_numbers whose solutions are missing,
+    # and UPDATE the existing rows. Companion to the INTERNAL
+    # CONSISTENCY prompt rule (commit 2077893) — that rule is the
+    # front-line cure; this is the safety net for when Gemini ignores
+    # the rule.
+    try:
+        await _retry_missing_solutions(
+            book_id=book_id, bank_id=bank_id,
+            units=units, pdf_bytes=pdf_bytes,
+            system_prompt=system_prompt,
+        )
+    except Exception as e:
+        logger.warning(
+            "Q-2 solution-completeness retry failed (book=%s): %s", book_id, e
         )
 
     # Auto-embed figures now that questions exist. If figures were extracted
