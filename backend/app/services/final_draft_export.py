@@ -248,8 +248,14 @@ def _block_to_md(block: dict[str, Any]) -> str:
             out.append(f"$${e}$$")
         return "\n\n".join(out)
     if t == "fig":
-        label = block.get("label") or ""
-        return f"*{label}* {c}".strip()
+        # Suppress the fig-block placeholder text. The actual figure
+        # renders as a separate item.type='figure' via
+        # seed_draft_items_from_merge's placement_block_idx mapping; the
+        # markdown image is emitted with caption right after. Without
+        # this strip the export contained "*Figure 8.2* Transfer of
+        # charge in positive charged bodies" lines followed by the same
+        # image with the same caption — visible duplication.
+        return ""
     if t in ("example_ref", "exercise_ref", "question_ref"):
         # A3 fix — see docx_export.py: suppress unmatched chips in the
         # exported document. Matched chips already get their question

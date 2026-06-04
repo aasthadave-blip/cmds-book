@@ -938,6 +938,15 @@ def _render_block_item(b: _DocBuilder, block: dict[str, Any],
         # missing. To restore the old "spot me" rendering, look up
         # commit 58c5e1e in git history.
         return
+    if t == "fig":
+        # Suppress fig-block placeholders. The actual figure renders as
+        # a separate item.type='figure' immediately after this block
+        # via seed_draft_items_from_merge's placement_block_idx mapping;
+        # the renderer at the call site embeds the real image with
+        # caption. Showing a muted figure_callout here too duplicated
+        # the visual ("Figure 8.2 ..." callout followed by the same
+        # figure image rendered right below).
+        return
     # Delegate to the existing theory renderer for the standard types
     _render_theory_block(b, block, title_key, last_sub)
 

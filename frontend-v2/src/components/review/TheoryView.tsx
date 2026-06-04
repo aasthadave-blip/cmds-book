@@ -110,10 +110,26 @@ type TheoryViewProps = {
 };
 
 /** Normalize a figure label / number for matching against block labels.
- *  Backend uses many shapes: "Figure 8.10" / "Fig. 8.10" / "8.10". */
+ *
+ * Backend stores labels in many shapes:
+ *   - figure_number:    "Figure 8.10" / "Fig. 8.10"
+ *   - normalized_label: "8.10"
+ *   - block.label:      "Figure 8.10"   (clean)
+ *   - block.c:          "Figure 8.10 Diagram showing X"   (full caption)
+ *
+ * For block.c we need to extract just the "Figure X.Y" prefix; otherwise the
+ * normalized form picks up the whole caption text and never matches the
+ * figure_number that the Figure row carries. Without this prefix-extract,
+ * theory body figures all fall through to the "Figure not available inline"
+ * branch even when the Figure row + image_bytes + figure_references all exist.
+ */
 function normLabel(s: string | null | undefined): string {
   if (!s) return '';
-  return s
+  // Match "Figure X.Y", "Fig. X.Y", or "Fig X.Y" prefix and capture the
+  // numeric part (allows trailing letters like "8.3a", "8.3b").
+  const m = s.match(/^(?:figure|fig\.?)\s*([\d]+(?:\.[\d]+)*[a-z]?)/i);
+  const head = m ? m[1] : s;
+  return head
     .toLowerCase()
     .replace(/figure|fig\.?/g, '')
     .replace(/[\s.]/g, '')
