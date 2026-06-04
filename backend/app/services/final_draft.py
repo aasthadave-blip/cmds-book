@@ -128,6 +128,37 @@ async def seed_draft_items_from_merge(
                 target = b.get("section_id")
                 if target and target in section_ids_in_doc:
                     continue
+            # Conditional fig-block suppression: when the figure embedder
+            # has placed an actual figure item at this exact block index
+            # (figures_by_idx[i] non-empty), drop the fig-block placeholder
+            # — the image item below will render in its place. When there
+            # is NO figure item for this position, KEEP the fig block as
+            # a muted callout so the reader sees that a figure was meant
+            # to appear here. Earlier behaviour unconditionally dropped
+            # fig blocks in the renderers, which caused silent gaps when
+            # the embedder couldn't link a labelled figure.
+            if isinstance(b, dict) and b.get("t") == "fig":
+                if figures_by_idx.get(i):
+                    # Image will render — emit only the figure item(s),
+                    # skip the redundant placeholder block.
+                    for f in figures_by_idx.get(i, []):
+                        items.append({
+                            "id": _new_id(),
+                            "type": "figure",
+                            "parent_section_id": section_id,
+                            "figure": f,
+                        })
+                    for q in inlined_by_idx.get(str(i), []):
+                        items.append({
+                            "id": _new_id(),
+                            "type": "question",
+                            "parent_section_id": section_id,
+                            "question": q,
+                        })
+                    continue
+                # No figure item at this position — keep the fig block as
+                # a visible placeholder. Fall through to the normal
+                # emit-block path below.
             items.append({
                 "id": _new_id(),
                 "type": "block",
@@ -163,6 +194,34 @@ async def seed_draft_items_from_merge(
                 "type": "question",
                 "parent_section_id": section_id,
                 "question": q,
+            })
+
+    # Emit unattached figures at the END of the items list so they
+    # remain visible in Preview / Composer / DOCX / Markdown. These are
+    # figures the embedder couldn't place in any section (no label
+    # match, no anchor match, no question_no match, no page→section
+    # resolution). Without surfacing them here, the user has no way to
+    # see them in the document view — they only appear in the Figures
+    # tab. Rendered with a synthetic parent_section_id so the front-end
+    # can group them under an "Unattached figures" heading.
+    unattached = doc.get("unattached_figures") or []
+    if unattached:
+        # Synthetic section heading so the tray sits visually distinct.
+        items.append({
+            "id": _new_id(),
+            "type": "section_heading",
+            "parent_section_id": "__unattached__",
+            "section_id": "__unattached__",
+            "title": "Unattached Figures",
+            "level": 2,
+            "regen": False,
+        })
+        for f in unattached:
+            items.append({
+                "id": _new_id(),
+                "type": "figure",
+                "parent_section_id": "__unattached__",
+                "figure": f,
             })
 
     return items

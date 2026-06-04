@@ -386,21 +386,41 @@ def _compute_figure_placements(
             # its own section "6-example-6.13" while the figure lands
             # under the surrounding theory section). question_number
             # is globally unique per book, so a global search is safe.
+            #
+            # Normalise both sides: strip surrounding parens / dots /
+            # whitespace and lowercase. Handles Gemini emitting "Q.39"
+            # / "(39)" / "39." / "Q39" while the question_number field
+            # in DB carries just "39", and vice versa. Without this
+            # the match fails on any cosmetic difference.
+            import re as _qre
+
+            def _norm_qno(s: str | None) -> str:
+                if not s:
+                    return ""
+                t = s.strip().lower()
+                # Drop a leading "Q" prefix ("q.39", "q39", "q 39")
+                t = _qre.sub(r"^q\.?\s*", "", t)
+                # Drop wrapping parens / brackets / dots
+                t = t.strip("().[]{} \t.")
+                return t
+
             if ctx == "question" and question_no:
-                for q in questions:
-                    if (q.question_number or "").strip() == question_no:
-                        char_end = len((q.raw_text or ""))
-                        new_refs.append(FigureReference(
-                            figure_id=fig.id, book_id=book_id,
-                            section_ref=(q.section_ref or target_sid),
-                            context="question", question_id=q.id,
-                            placeholder_text=None, link_method="auto",
-                            placement_kind="inline", placement_block_idx=None,
-                            placement_char_offset=char_end,
-                        ))
-                        counters["question_inline"] += 1
-                        placed = True
-                        break
+                want = _norm_qno(question_no)
+                if want:
+                    for q in questions:
+                        if _norm_qno(q.question_number) == want:
+                            char_end = len((q.raw_text or ""))
+                            new_refs.append(FigureReference(
+                                figure_id=fig.id, book_id=book_id,
+                                section_ref=(q.section_ref or target_sid),
+                                context="question", question_id=q.id,
+                                placeholder_text=None, link_method="auto",
+                                placement_kind="inline", placement_block_idx=None,
+                                placement_char_offset=char_end,
+                            ))
+                            counters["question_inline"] += 1
+                            placed = True
+                            break
             if placed:
                 continue
 
