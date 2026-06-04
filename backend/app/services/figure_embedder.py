@@ -501,7 +501,9 @@ def _compute_figure_placements(
                     anchor against. For `def` blocks the candidate is
                     `term + ": " + c` (the printed form often combines
                     them) AND `c` alone (some def blocks are body-only).
-                    For other block types just `c`."""
+                    For `list` blocks each `items[i]` string is its own
+                    candidate (the text lives in items[], not c). Other
+                    block types fall through to just `c`."""
                     out: list[str] = []
                     c = b.get("c") or ""
                     term = b.get("term") or ""
@@ -509,6 +511,10 @@ def _compute_figure_placements(
                         out.append(_norm_match(f"{term}: {c}"))
                     if c:
                         out.append(_norm_match(c))
+                    if b.get("t") == "list":
+                        for it in (b.get("items") or []):
+                            if isinstance(it, str) and it:
+                                out.append(_norm_match(it))
                     return [s for s in out if s]
 
                 def _match_in_section(sid: str) -> int | None:
