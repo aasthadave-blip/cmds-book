@@ -150,27 +150,27 @@ def _sanitize_schema(data) -> dict:
                     continue
                 if isinstance(_pv, str):
                     _ps = _pv.strip()
-                    # First try direct int (e.g. "5")
+                    # Clean integer string "5" → 5
                     try:
                         s[_pf] = int(_ps)
                         continue
                     except (TypeError, ValueError):
                         pass
-                    # Try int part of "9.18" → 9 — but reject values
-                    # that look like question numbers (must be ≤ 9999
-                    # and look like a real page).
-                    head = _ps.split(".")[0] if "." in _ps else _ps
-                    try:
-                        _candidate = int(head)
-                        if 1 <= _candidate <= 9999:
-                            logger.warning(
-                                "schema sanitize: coerced page %s=%r → %d (id=%s)",
-                                _pf, _pv, _candidate, s.get("id"),
-                            )
-                            s[_pf] = _candidate
-                            continue
-                    except (TypeError, ValueError):
-                        pass
+                    # Values containing "." (like "9.18") are almost
+                    # certainly question identifiers Gemini put in the
+                    # wrong field. Do NOT coerce "9.18" → 9 — that would
+                    # be a wrong page number masquerading as a real one
+                    # and break downstream page-range overlap checks.
+                    # Null it instead so the embedder falls back to
+                    # anchor_text matching.
+                    if "." in _ps:
+                        logger.warning(
+                            "schema sanitize: nulling question-like page "
+                            "value %s=%r (id=%s)",
+                            _pf, _pv, s.get("id"),
+                        )
+                        s[_pf] = None
+                        continue
                 # Anything else → null it so pydantic accepts
                 logger.warning(
                     "schema sanitize: nulling unparseable page %s=%r (id=%s)",
