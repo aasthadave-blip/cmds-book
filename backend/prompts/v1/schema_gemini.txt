@@ -102,8 +102,10 @@ Examples, Exercises, Illustrations, Activities, etc. that appear INSIDE a theory
 | Cat | Printed labels (any of) | Schema entry | `content_types` | Chip in sidebar? | Body extracted by |
 |---|---|---|---|---|---|
 | **A — Questions** | EXAMPLE, Worked Example, Solved Example, Exercise N.M, Problem, Practice Problem, Practice, In-text Question, Drill, Workout | `type="subsection"` | `["questions"]` | yes | question pipeline |
-| **B — Theory aid** | Illustration, Progress Check, Activity, Try It, Quick Check, Test Yourself, Self-Check, Check Your Understanding | `type="subsection"` | `["theory"]` | no | theory pipeline (as body) |
-| **C — Inline callout** | Note, Remember, DO YOU KNOW, Thinking Corner, Key Point, Recall, Errata, Note to Teacher, Scientific Cryptic | **NO schema entry** | n/a | n/a | theory pipeline (as `key_point` inside parent's body) |
+| **B — Theory aid** | Illustration, Progress Check, Activity, Try It, Quick Check, Test Yourself, Self-Check, Check Your Understanding, Scientific Crypt, Scientific Cryptic, biographical sidebars about a named scientist | `type="subsection"` | `["theory"]` | no | theory pipeline (as body) |
+| **C — Inline callout** | Note, Remember, DO YOU KNOW, Thinking Corner, Key Point, Recall, Errata, Note to Teacher | **NO schema entry** | n/a | n/a | theory pipeline (as `key_point` inside parent's body) |
+
+**Scientific Crypt / biographical sidebars are a SINGLE LEAF Cat B section.** Their printed format is typically `Scientific Crypt` (heading) + a one-line subtitle like `A Tribute to <Name> (<years>)`. The subtitle is BODY TEXT of the section — do NOT promote it as a subsection. The schema entry has exactly ONE node: `id` derived from the section heading (e.g. `<chapter>-scientific-crypt`), `type="subsection"`, `content_types=["theory"]`, no children.
 
 If a label doesn't match anything above:
 - Asks reader to do/solve/answer → default to (A)
