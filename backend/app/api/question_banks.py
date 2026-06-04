@@ -973,7 +973,29 @@ async def restore_rejected(
     rej.decided_by = "user"
     await session.commit()
 
-    return {"ok": True, "question_id": str(q.id), "rejected_id": str(rej.id)}
+    # Re-run figure embedder so any figure pointing at the newly-restored
+    # question via regen_meta.question_no gets attached. Same pattern as
+    # restore-all and the worker tails. Best-effort — restore already
+    # succeeded if embedder throws.
+    figures_attached = 0
+    try:
+        from app.services.figure_embedder import embed_figures_for_book_sync
+        from app.workers.questions_v3 import SyncSession as _SyncSession
+        with _SyncSession() as own:
+            counters = embed_figures_for_book_sync(own, rej.book_id)
+        figures_attached = int((counters or {}).get("question_inline", 0))
+    except Exception:
+        import logging
+        logging.getLogger(__name__).warning(
+            "figure embedder after single-item restore failed", exc_info=True,
+        )
+
+    return {
+        "ok": True,
+        "question_id": str(q.id),
+        "rejected_id": str(rej.id),
+        "figures_attached": figures_attached,
+    }
 
 
 @banks_router.post("/{bank_id}/rejected/restore-all")

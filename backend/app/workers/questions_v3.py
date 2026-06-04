@@ -2412,6 +2412,23 @@ async def _run_section_retry(
             finished_at=datetime.utcnow(),
         )
 
+    # Re-run figure embedder so figures with question_no pointing at
+    # questions in this section get attached now that the questions
+    # exist (or got updated). Best-effort — retry already succeeded.
+    try:
+        from app.services.figure_embedder import embed_figures_for_book_sync
+        with SyncSession() as own:
+            # bank.book_id is needed; pull from the bank row
+            from app.models.question_bank import QuestionBank as _QB
+            qb = own.get(_QB, bank_id)
+            if qb is not None and qb.book_id is not None:
+                embed_figures_for_book_sync(own, qb.book_id)
+    except Exception as e:
+        logger.warning(
+            "figure_embedder failed after question section retry "
+            "(section=%s): %s", section_ref, e,
+        )
+
     return {"ok": True, "section_ref": section_ref, "status": status,
             "extracted": kept, "identified": identified}
 
