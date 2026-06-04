@@ -114,14 +114,30 @@ async def _load_or_seed(
             # last_seeded_at timestamp change. If the user had a
             # status="exported" already, we still re-seed — figure
             # changes should always reflect; user can re-export.
-            fresh_items = await seed_draft_items_from_merge(
-                session, book_id, prefer_regen=prefer_regen
-            )
-            existing.items = fresh_items
-            existing.last_seeded_at = datetime.utcnow()
-            existing.prefer_regen = prefer_regen
-            await session.commit()
-            await session.refresh(existing)
+            #
+            # Wrapped in try/except so a re-seed failure NEVER breaks
+            # the GET — we serve the previously-cached items instead.
+            # The next GET will try the re-seed again if data is still
+            # stale. Mirrors the auto-heal failure handling in
+            # build_final_merge.
+            try:
+                fresh_items = await seed_draft_items_from_merge(
+                    session, book_id, prefer_regen=prefer_regen
+                )
+                existing.items = fresh_items
+                existing.last_seeded_at = datetime.utcnow()
+                existing.prefer_regen = prefer_regen
+                await session.commit()
+                await session.refresh(existing)
+            except Exception as e:
+                import logging as _logging
+                _logging.getLogger(__name__).warning(
+                    "auto-reseed failed (book=%s, non-fatal): %s",
+                    book_id, e,
+                )
+                # Roll back any partial commit and serve the cached
+                # items unchanged.
+                await session.rollback()
         return existing
     if existing is not None:
         return existing
