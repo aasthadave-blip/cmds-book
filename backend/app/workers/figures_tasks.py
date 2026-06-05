@@ -152,7 +152,13 @@ def _extract_figures_v2_impl(book_id: str, job_id: str) -> dict[str, Any]:
                 status="failed", error="book has no pdf_url",
                 finished_at=datetime.utcnow(),
             )
+            book.figures_status = "failed"
+            session.commit()
             return {"status": "failed", "error": "book has no pdf_url"}
+        # Phase 5d (CONTRACT.md §2): mark figures stage as running. Watchdog
+        # (Phase 7) will detect runs that stall past stale_after.
+        book.figures_status = "running"
+        session.commit()
 
         _update_job(
             session, job_uuid,
@@ -191,6 +197,11 @@ def _extract_figures_v2_impl(book_id: str, job_id: str) -> dict[str, Any]:
                 status="failed", error=f"Gemini extract failed: {e}",
                 finished_at=datetime.utcnow(),
             )
+            # Phase 5d: Gemini extract failed.
+            b = session.get(Book, book_uuid)
+            if b is not None:
+                b.figures_status = "failed"
+                session.commit()
         return {"status": "failed", "error": str(e)}
 
     figures_raw = metadata.get("figures") or []
@@ -349,6 +360,21 @@ def _extract_figures_v2_impl(book_id: str, job_id: str) -> dict[str, Any]:
             "references_created": inserted_refs,
             "missed_anchors": metadata.get("missed_anchors") or [],
         }
+        # Phase 5d: figures stage done. "partial" if some anchors missed
+        # but at least one figure was inserted; "done" if everything clean.
+        # Empty PDFs (no figures detected at all) count as "done", not failed.
+        book_row = session.get(Book, book_uuid)
+        if book_row is not None:
+            missed = len(result["missed_anchors"])
+            if inserted_figures == 0 and missed == 0:
+                book_row.figures_status = "done"  # no figures in PDF
+            elif missed > 0 and inserted_figures > 0:
+                book_row.figures_status = "partial"
+            elif inserted_figures > 0:
+                book_row.figures_status = "done"
+            else:
+                book_row.figures_status = "failed"
+            session.commit()
         _update_job(
             session, job_uuid,
             status="succeeded", progress=100,

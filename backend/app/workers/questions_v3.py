@@ -2271,8 +2271,30 @@ def _extract_questions_v3(book_id: str, bank_id: str, job_id: str) -> dict[str, 
     book_uuid = UUID(book_id)
     bank_uuid = UUID(bank_id)
     job_uuid = UUID(job_id)
+    # Phase 5d (CONTRACT.md §2): mark questions stage as running so
+    # /quality and watchdog (Phase 7) can detect stale runs.
+    with SyncSession() as session:
+        b = session.get(Book, book_uuid)
+        if b is not None:
+            b.questions_status = "running"
+            session.commit()
     try:
-        return asyncio.run(_run_v3(book_uuid, bank_uuid, job_uuid))
+        result = asyncio.run(_run_v3(book_uuid, bank_uuid, job_uuid))
+        # Phase 5d: derive questions_status from bank outcome. The bank
+        # has the authoritative per-section accounting; the book-level
+        # field just summarises it.
+        with SyncSession() as session:
+            b = session.get(Book, book_uuid)
+            bk = session.get(QuestionBank, bank_uuid)
+            if b is not None:
+                if bk is None or bk.status == "failed":
+                    b.questions_status = "failed"
+                elif bk.status == "partial":
+                    b.questions_status = "partial"
+                else:  # "ready" or anything else clean
+                    b.questions_status = "done"
+                session.commit()
+        return result
     except Exception as e:
         logger.exception("extract_questions_v3 crashed")
         with SyncSession() as session:
@@ -2284,6 +2306,11 @@ def _extract_questions_v3(book_id: str, bank_id: str, job_id: str) -> dict[str, 
             )
             _update_bank(session, bank_uuid, status="failed",
                          last_error=str(e)[:2000])
+            # Phase 5d: stage failed.
+            b = session.get(Book, book_uuid)
+            if b is not None:
+                b.questions_status = "failed"
+                session.commit()
         return {"ok": False, "error": str(e)}
 
 

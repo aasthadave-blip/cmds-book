@@ -171,6 +171,12 @@ def analyse_book_task(self, book_id: str, job_id: str) -> dict:
             pdf_type = "digital" if local_result is not None else "scanned"
             layout_tag = "multi-column" if is_multi_column else pdf_type
             _update_job(session, job_uuid, message=f"Running Gemini schema ({layout_tag} PDF)", progress=30)
+            # Phase 5d (CONTRACT.md §2): mark schema stage as running. Lets
+            # /quality endpoint distinguish "schema in flight" from "schema
+            # not yet attempted". Watchdog (Phase 7) will look for stale
+            # "running" stages.
+            book.schema_status = "running"
+            session.commit()
             # Heartbeat keeps the watchdog from killing long Gemini schema
             # calls for scanned PDFs (5–10 min is normal for image-based pages).
             with Heartbeat(
@@ -250,6 +256,9 @@ def analyse_book_task(self, book_id: str, job_id: str) -> dict:
                 book.title = schema.document_title or "Untitled"
             book.subject = schema.subject or book.subject
             book.status = "schema_ready"
+            # Phase 5d: schema completed successfully. Downstream stages stay
+            # "pending" until extract_book picks them up.
+            book.schema_status = "done"
             session.commit()
 
             _update_job(
@@ -275,6 +284,9 @@ def analyse_book_task(self, book_id: str, job_id: str) -> dict:
             book = session.get(Book, book_uuid)
             if book is not None:
                 book.status = "failed"
+                # Phase 5d: schema-stage failure (analyse_book is the schema
+                # task — extract_book covers theory/questions/figures).
+                book.schema_status = "failed"
                 session.commit()
             return {"ok": False, "error": str(e)}
 
@@ -311,6 +323,10 @@ def extract_book_task(self, book_id: str, job_id: str) -> dict:
             if not book.pdf_url:
                 raise RuntimeError("PDF URL missing — cannot extract")
             pdf_bytes = download_pdf(book.pdf_url)
+
+            # Phase 5d (CONTRACT.md §2): mark theory stage as running.
+            book.theory_status = "running"
+            session.commit()
 
             schema = BookSchema(**book.schema)
             # all_sections: full flat list — used for both DB upsert and extraction.
@@ -576,6 +592,20 @@ def extract_book_task(self, book_id: str, job_id: str) -> dict:
                     failed_section_ids.append(section_id)
 
             book.status = "ready"
+            # Phase 5d (CONTRACT.md §2): per-stage status derived from
+            # outcomes, not blindly "done". Failed/crashed sections count
+            # against theory: all-failed → failed, some-failed → partial,
+            # none-failed → done. Phase 5e will make book.status itself
+            # derived; for now we keep the existing field write to avoid
+            # breaking downstream code that reads book.status directly.
+            if total == 0:
+                book.theory_status = "done"  # no theory sections to extract
+            elif len(failed_section_ids) == 0:
+                book.theory_status = "done"
+            elif len(failed_section_ids) == total:
+                book.theory_status = "failed"
+            else:
+                book.theory_status = "partial"
             session.commit()
 
             # Inject example/exercise placeholder chips into parent theory
@@ -635,6 +665,9 @@ def extract_book_task(self, book_id: str, job_id: str) -> dict:
             book = session.get(Book, book_uuid)
             if book is not None:
                 book.status = "failed"
+                # Phase 5d: extract_book failure = theory stage failure
+                # (questions/figures have their own tasks + status writes).
+                book.theory_status = "failed"
                 session.commit()
             return {"ok": False, "error": str(e)}
 
