@@ -237,6 +237,25 @@ async def get_book(book_id: UUID, session: AsyncSession = Depends(get_session)) 
     return BookOut.from_orm_book(book)
 
 
+@router.get("/{book_id}/quality")
+async def get_book_quality(
+    book_id: UUID,
+    session: AsyncSession = Depends(get_session),
+) -> dict:
+    """Phase 5c (CONTRACT.md §3 — Verification Contract).
+
+    Read-only quality report — what does the book actually contain
+    vs what the schema promised? Use to detect "ready with empty
+    content" lies, missing sections, unattached figures.
+
+    Does NOT mutate. Safe to call repeatedly. Caches nothing.
+
+    Response shape: see app/services/verify_book.py docstring.
+    """
+    from app.services.verify_book import verify_book
+    return await verify_book(session, book_id)
+
+
 @router.delete("/{book_id}", status_code=status.HTTP_204_NO_CONTENT)
 async def delete_book(book_id: UUID, session: AsyncSession = Depends(get_session)) -> None:
     book = await session.get(Book, book_id)

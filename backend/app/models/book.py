@@ -30,6 +30,26 @@ class Book(Base):
     analyser: Mapped[dict | None] = mapped_column(sa.JSON)
     raw_text: Mapped[str | None] = mapped_column(Text)
     status: Mapped[str] = mapped_column(String(32), default="pending", nullable=False)
+    # Phase 5 (CONTRACT.md §2 — state contract). Per-stage status fields.
+    # Today book.status is unconditionally "ready" regardless of per-stage
+    # outcome (extract.py:578). These four fields record the actual outcome
+    # of each stage. Eventually book.status becomes derived from these
+    # (see derive_book_status()); for now they're populated alongside.
+    schema_status: Mapped[str] = mapped_column(
+        String(32), default="pending", nullable=False, server_default="pending",
+    )
+    theory_status: Mapped[str] = mapped_column(
+        String(32), default="pending", nullable=False, server_default="pending",
+    )
+    questions_status: Mapped[str] = mapped_column(
+        String(32), default="pending", nullable=False, server_default="pending",
+    )
+    figures_status: Mapped[str] = mapped_column(
+        String(32), default="pending", nullable=False, server_default="pending",
+    )
+    # Last verify_book() report — populated by the quality endpoint.
+    # Shape documented in app/services/verify_book.py.
+    verification_log: Mapped[dict | None] = mapped_column(sa.JSON, nullable=True)
     created_at: Mapped[datetime] = mapped_column(
         DateTime(timezone=True), server_default=func.now(), nullable=False
     )
