@@ -622,6 +622,45 @@ async def build_final_merge(
         )
     ).scalars().all()
     section_by_id = {s.section_id: s for s in sec_rows}
+    # Phase 3 of canonical identity migration (CONTRACT.md §1):
+    # build a title-based fallback index so when ss.id (schema's slug)
+    # doesn't match Section.section_id (DB's slug) — today's Ammonia bug
+    # — we can still resolve the section via title. Every fallback hit
+    # is logged so we can audit slug divergence in prod.
+    sections_by_title: dict[str, list] = {}
+    for _s in sec_rows:
+        sections_by_title.setdefault((_s.title or "").strip().lower(), []).append(_s)
+
+    def _resolve_section_row(_ss):
+        """Return Section row matching schema section _ss, with logged fallbacks.
+
+        Lookup order:
+          1. Exact slug match (Section.section_id == _ss.id) — current path
+          2. Title-based fallback — Section.title == _ss.title, single match
+          3. None — true miss, drop as before
+        """
+        row = section_by_id.get(_ss.id)
+        if row is not None:
+            return row
+        # Title fallback
+        candidates = sections_by_title.get((_ss.title or "").strip().lower(), [])
+        if len(candidates) == 1:
+            logger.info(
+                "final_merge: slug-mismatch title-fallback fired "
+                "(book=%s, schema_slug=%r, matched_slug=%r, title=%r)",
+                book_id, _ss.id, candidates[0].section_id, _ss.title,
+            )
+            return candidates[0]
+        if len(candidates) > 1:
+            # Ambiguous — multiple Section rows share this title
+            # (e.g. "Uses" appears under Silicon, Phosphorus, Sulphur).
+            # Refuse to guess. Log so we know how often this happens.
+            logger.warning(
+                "final_merge: slug-mismatch title-fallback ambiguous "
+                "(book=%s, schema_slug=%r, title=%r, candidates=%d)",
+                book_id, _ss.id, _ss.title, len(candidates),
+            )
+        return None
 
     # 2b. Theory regen overlay — for each section_id, find the LATEST
     # regen that contains blocks for it. The regen-side blocks_by_section
@@ -950,7 +989,7 @@ async def build_final_merge(
         ):
             continue
 
-        sec_row = section_by_id.get(ss.id)
+        sec_row = _resolve_section_row(ss)  # Phase 3: slug + title fallback
         # Prefer regen blocks if available; fall back to original blocks
         regen_blocks = theory_regen_blocks.get(ss.id) if prefer_regen else None
         if regen_blocks:
