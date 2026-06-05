@@ -80,6 +80,48 @@ def _scan_once() -> int:
             )
         if killed:
             session.commit()
+
+        # Phase 7 (CONTRACT.md §5): also catch orphan per-stage status.
+        # If a Book has stage_status="running" but no live Job exists for
+        # that book, the worker died mid-stage (OOM, container restart,
+        # process crash). Mark the stage failed so the user can retry,
+        # and derive book.status accordingly.
+        from app.models.book import Book
+        from app.services.book_status import derive_book_status
+
+        book_rows = session.execute(
+            select(Book).where(
+                (Book.schema_status == "running")
+                | (Book.theory_status == "running")
+                | (Book.questions_status == "running")
+                | (Book.figures_status == "running")
+            )
+        ).scalars().all()
+        for book in book_rows:
+            # Does the book still have a live Job?
+            has_live_job = session.execute(
+                select(Job).where(
+                    Job.book_id == book.id,
+                    Job.status.in_(["queued", "running"]),
+                ).limit(1)
+            ).scalars().first()
+            if has_live_job is not None:
+                continue  # legitimate in-flight
+            # No live Job, but stage(s) say "running" → orphan. Fail them.
+            for stage in (
+                "schema_status", "theory_status",
+                "questions_status", "figures_status",
+            ):
+                if getattr(book, stage) == "running":
+                    setattr(book, stage, "failed")
+                    logger.warning(
+                        "watchdog: orphan running stage book=%s %s "
+                        "(no live Job)",
+                        book.id, stage,
+                    )
+                    killed += 1
+            book.status = derive_book_status(book)
+            session.commit()
     return killed
 
 

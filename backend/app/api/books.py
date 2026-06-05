@@ -261,6 +261,30 @@ async def delete_book(book_id: UUID, session: AsyncSession = Depends(get_session
     book = await session.get(Book, book_id)
     if book is None:
         raise HTTPException(404, detail="Book not found")
+    # Phase 7 (CONTRACT.md §5 — Atomicity & Concurrency): refuse to delete
+    # a book that has an in-flight Celery task. The zombie-task bug we hit
+    # today (15-min ObjectDeletedError grind) was caused by deleting a
+    # book while extract_book was running — the task kept hitting deleted
+    # row commits.
+    #
+    # 409 Conflict tells the user explicitly: "this book has running work
+    # — wait for it to finish or cancel the job first". This is preferable
+    # to silently letting the worker spin uselessly until it errors out.
+    in_flight = (await session.execute(
+        select(Job).where(
+            Job.book_id == book_id,
+            Job.status.in_(["queued", "running"]),
+        ).limit(1)
+    )).scalars().first()
+    if in_flight is not None:
+        raise HTTPException(
+            status.HTTP_409_CONFLICT,
+            detail=(
+                f"Book has an in-flight task (job_id={in_flight.id}, "
+                f"status={in_flight.status!r}). Wait for it to finish or "
+                "cancel it before deleting."
+            ),
+        )
     await session.delete(book)
 
 
@@ -279,11 +303,37 @@ async def analyse_book(
     if not book.pdf_url:
         raise HTTPException(400, detail="Book has no associated PDF")
 
+    # Phase 7 (CONTRACT.md §5): refuse to start a second analyse while
+    # one is already in flight. Today's prod chaos came from triggering
+    # /analyse 3 times during the OOM window — three workers fought over
+    # the same book.schema field, last writer won, state went incoherent.
+    # 409 Conflict is the user-visible signal "we already heard you".
+    in_flight = (await session.execute(
+        select(Job).where(
+            Job.book_id == book_id,
+            Job.status.in_(["queued", "running"]),
+        ).limit(1)
+    )).scalars().first()
+    if in_flight is not None:
+        raise HTTPException(
+            status.HTTP_409_CONFLICT,
+            detail=(
+                f"Already analysing (job_id={in_flight.id}). Wait for it "
+                "to finish or cancel it before re-triggering."
+            ),
+        )
+
     job = Job(book_id=book.id, type="analyse", status="queued", progress=0)
     session.add(job)
     await session.flush()
 
     book.status = "analysing"
+    # Phase 5d/7: reset stage statuses on a fresh analyse cycle so the
+    # watchdog and /quality see this as a new run, not a stale one.
+    book.schema_status = "pending"
+    book.theory_status = "pending"
+    book.questions_status = "pending"
+    book.figures_status = "pending"
 
     # Commit before dispatch so worker thread sees the new Job row.
     await session.commit()
