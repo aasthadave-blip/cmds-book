@@ -12,12 +12,25 @@ flag still wins.
 
 Pure CPU work via PyMuPDF. Sub-second on typical PDFs.
 
-Detection algorithm:
+Detection algorithm (Day 12a — rewritten after real-data testing showed
+the prior x-bucket rule misfired on 2-column pages whenever centred
+elements like display-math, headings, or page numbers landed in the
+middle band, producing per-page votes like [triple, double, triple,
+double] with confidence stuck at 0.5):
+
 1. For each sampled page (up to 10), get text blocks via page.get_text("blocks")
-2. Compute the horizontal-midpoint distribution of block x-centres
-3. If two distinct clusters → 2 columns; three distinct → 3 columns
-4. Otherwise → single column
+2. Compute each block's x-centre as a fraction of page width
+3. If ≥25% of blocks live in the LEFT third (x < 0.4) AND ≥25% live
+   in the RIGHT third (x > 0.6) → page is `multi` column.
+   Middle-band density is IGNORED — centred headings, full-width
+   tables, and display math legitimately occupy the middle and must
+   not disqualify the multi classification.
+4. Otherwise → `single`
 5. Majority across sampled pages wins
+
+We deliberately collapse double/triple into a single `multi` verdict
+because the schema prompt only cares whether content is in columns,
+not how many. Distinguishing 2-col from 3-col is brittle and unused.
 
 Used by `services/schema_builder.py` (SCHEMA Week 2 wiring).
 """
@@ -28,7 +41,7 @@ from dataclasses import dataclass
 from typing import Literal
 
 
-LayoutType = Literal["single", "double", "triple", "unknown"]
+LayoutType = Literal["single", "multi", "unknown"]
 
 
 @dataclass(frozen=True)
@@ -190,39 +203,21 @@ def _detect_page_layout(page) -> LayoutType:
         ((b[0] + b[2]) / 2.0) / page_width
         for b in text_blocks
     ]
-
-    # Cluster by simple bucketing into thirds.
-    #   left third  (< 0.4)
-    #   middle      (0.4-0.6)
-    #   right third (> 0.6)
-    # If blocks cluster around both LEFT and RIGHT thirds with similar
-    # density → 2 columns. If left/middle/right → 3 columns. Otherwise
-    # single column.
-    left = sum(1 for x in x_centres if x < 0.4)
-    middle = sum(1 for x in x_centres if 0.4 <= x <= 0.6)
-    right = sum(1 for x in x_centres if x > 0.6)
     total = len(x_centres)
     if total == 0:
         return "unknown"
 
-    left_frac = left / total
-    middle_frac = middle / total
-    right_frac = right / total
+    # Bimodality check: a true multi-column page has substantial block
+    # density on BOTH sides of centre. Middle-band density is allowed
+    # and ignored — that's where centred headings, full-width tables,
+    # display math, and page numbers live, all of which legitimately
+    # appear on multi-column pages.
+    left = sum(1 for x in x_centres if x < 0.4)
+    right = sum(1 for x in x_centres if x > 0.6)
 
-    # Triple: all three buckets have ≥20% AND none dominate (>60%)
-    if (
-        left_frac >= 0.2
-        and middle_frac >= 0.2
-        and right_frac >= 0.2
-        and max(left_frac, middle_frac, right_frac) < 0.6
-    ):
-        return "triple"
+    if (left / total) >= 0.25 and (right / total) >= 0.25:
+        return "multi"
 
-    # Double: left ≥ 25% AND right ≥ 25% AND middle < 35%
-    if left_frac >= 0.25 and right_frac >= 0.25 and middle_frac < 0.35:
-        return "double"
-
-    # Default: single column
     return "single"
 
 

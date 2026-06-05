@@ -128,12 +128,15 @@ def assign_uuids_to_schema(
 # either auto-corrected via retry OR surfaced as a validation error.
 
 
-def _run_gemini_schema(pdf_bytes: bytes, schema_prompt: str) -> dict:
+def _run_gemini_schema(
+    pdf_bytes: bytes, schema_prompt: str, *, timeout_s: int = 300,
+) -> dict:
     """One synchronous Gemini call: upload PDF → generate schema → return dict.
 
     Real socket timeout via ``HttpOptions`` — see app.core.gemini_runtime.
     Schema generation runs over the full book PDF and is the slowest single
-    call in the system; we give it 5 min instead of the default 150s.
+    call in the system. Timeout is per-PDF-type (Day 12 wiring): digital
+    PDFs get 180s, scanned PDFs get 600s; default 300s if caller skips it.
     """
     from app.core.gemini_runtime import call_gemini_with_pdf
 
@@ -142,7 +145,7 @@ def _run_gemini_schema(pdf_bytes: bytes, schema_prompt: str) -> dict:
         system_prompt=schema_prompt,
         user_prompt="",
         model=GEMINI_MODEL,
-        timeout_s=300,
+        timeout_s=timeout_s,
         max_output_tokens=32000,
         # temperature=0.1 — slight sampling variance helps Gemini find
         # rule-compliant interpretations on ambiguous page-spanning
@@ -156,21 +159,6 @@ def _run_gemini_schema(pdf_bytes: bytes, schema_prompt: str) -> dict:
     return parse_json(raw)
 
 
-def _get_pdf_page_count(pdf_bytes: bytes) -> int | None:
-    """Best-effort PDF page count for validator's PAGE_OUT_OF_BOUNDS rule.
-
-    Returns None on any failure — validator skips the bounds check
-    when None. Standalone here so build_schema doesn't need to wire
-    the full preflight service yet (that lands Day 6).
-    """
-    try:
-        import pymupdf
-        with pymupdf.open(stream=pdf_bytes, filetype="pdf") as doc:
-            return doc.page_count or None
-    except Exception:
-        return None
-
-
 def build_schema(pdf_bytes: bytes, *, is_multi_column: bool = False) -> BookSchema:
     """Generate a structural schema from PDF bytes using Gemini 2.5 Pro.
 
@@ -178,7 +166,10 @@ def build_schema(pdf_bytes: bytes, *, is_multi_column: bool = False) -> BookSche
 
     When ``is_multi_column`` is True (user-flagged at upload time for
     MHT-CET / JEE / NEET prep books with dense 2-column layouts), the
-    multi-column-aware prompt is loaded.
+    multi-column-aware prompt is loaded. SCHEMA Day 12: if the user did
+    NOT flag multi-column but the layout detector confidently says
+    otherwise on a digital PDF, we auto-route to the multicolumn prompt.
+    User's explicit flag always wins.
 
     Retry behaviour (SCHEMA Week 1 Day 3):
       Attempt 1: standard prompt
@@ -191,13 +182,50 @@ def build_schema(pdf_bytes: bytes, *, is_multi_column: bool = False) -> BookSche
       receives targeted feedback and re-emits with fixes applied.
     """
     _ensure_event_loop()
+
+    # SCHEMA Day 12 — preflight FIRST. Fails fast on encrypted/empty/
+    # corrupt PDFs before burning a 3-5 minute Gemini call. Also gives
+    # us total_pages (validator bounds rule) and a per-PDF-type Gemini
+    # timeout (digital: 180s, scanned: 600s).
+    from app.services.pdf_preflight import run_preflight
+    preflight = run_preflight(pdf_bytes)
+    if not preflight.ok:
+        raise ValueError(f"PDF preflight failed: {preflight.error}")
+    pdf_total_pages = preflight.total_pages
+    gemini_timeout_s = preflight.recommended_timeout_s
+
+    # SCHEMA Day 12 — autodetect column layout. User's explicit
+    # upload-time flag ALWAYS wins; we only auto-route when the user
+    # did NOT flag multi-column AND the detector is confident on a
+    # digital PDF (scanned/image-only PDFs have no reliable text-block
+    # geometry, so detection is meaningless there).
+    effective_multi_column = is_multi_column
+    auto_routed = False
+    if not is_multi_column and preflight.pdf_type == "digital":
+        from app.services.pdf_layout_detector import detect_layout
+        layout = detect_layout(pdf_bytes)
+        if layout.layout == "multi" and layout.confidence >= 0.7:
+            effective_multi_column = True
+            auto_routed = True
+            logger.info(
+                "Schema layout autodetect: routing to multicolumn prompt "
+                "(layout=%s confidence=%.2f pages_sampled=%d) — user did "
+                "not flag is_multi_column at upload",
+                layout.layout, layout.confidence, layout.pages_sampled,
+            )
+
+    logger.info(
+        "Schema preflight: pdf_type=%s pages=%d timeout=%ds "
+        "multi_column=%s%s rotated_pages=%d",
+        preflight.pdf_type, preflight.total_pages, gemini_timeout_s,
+        effective_multi_column, " (auto)" if auto_routed else "",
+        len(preflight.rotation_pages),
+    )
+
     prompt_name = (
-        "schema_gemini_multicolumn" if is_multi_column else "schema_gemini"
+        "schema_gemini_multicolumn" if effective_multi_column else "schema_gemini"
     )
     base_prompt = load_raw(prompt_name)
-
-    # Get PDF page count once — feeds the validator's bounds rule.
-    pdf_total_pages = _get_pdf_page_count(pdf_bytes)
 
     # Track the previous attempt's validation errors so the next
     # attempt's prompt can include corrective instructions.
@@ -222,7 +250,7 @@ def build_schema(pdf_bytes: bytes, *, is_multi_column: bool = False) -> BookSche
                     attempt, len(last_errors),
                 )
 
-            data = _run_gemini_schema(pdf_bytes, prompt)
+            data = _run_gemini_schema(pdf_bytes, prompt, timeout_s=gemini_timeout_s)
             # SCHEMA Day 14: sanitizer DELETED. Validator + corrective
             # retry handle all the cases sanitizer previously masked.
             data = assign_uuids_to_schema(data)
