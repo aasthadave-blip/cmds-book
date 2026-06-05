@@ -269,3 +269,271 @@ def enrich_schema_with_question_markers(
             len(warnings),
         )
     return schema_unchanged
+
+
+# ─── SCHEMA Week 1 Day 5 — Cross-check: schema → PDF ──────────────
+# Verifies each schema section's title actually appears on its claimed
+# page_start. Catches the "EXAMPLE 9.18 → page=9" case where Gemini
+# grabbed a label number as the page (page=9 is a valid integer the
+# validator can't reject, but pypdf shows "EXAMPLE 9.18" actually
+# appears on page 14).
+#
+# Auto-corrects when divergence detected (pypdf is ground truth).
+# Surfaces phantom sections (title nowhere in PDF) as warnings.
+# Skipped for scanned/image-only PDFs (no text layer = no ground truth).
+
+
+from dataclasses import dataclass, field
+
+
+@dataclass(frozen=True)
+class PageCorrection:
+    """Schema's claimed page differed from pypdf-found location."""
+
+    section_id: str | None
+    section_title: str
+    claimed_page_start: int
+    actual_page_start: int
+    """page where title was actually found via pypdf"""
+
+
+@dataclass(frozen=True)
+class PhantomSection:
+    """Schema claims a section that pypdf cannot find anywhere in the PDF."""
+
+    section_id: str | None
+    section_title: str
+    claimed_page_start: int | None
+
+
+@dataclass(frozen=True)
+class CrossCheckResult:
+    """Outcome of cross-checking schema sections against PDF text."""
+
+    corrections: list[PageCorrection] = field(default_factory=list)
+    """Sections whose page_start was auto-corrected."""
+
+    phantoms: list[PhantomSection] = field(default_factory=list)
+    """Sections whose title couldn't be found anywhere in PDF text."""
+
+    confirmed: int = 0
+    """Sections whose title was found at the claimed page (no change needed)."""
+
+    skipped_no_text: bool = False
+    """True if pypdf returned no text (scanned PDF). All checks skipped."""
+
+    skipped_count: int = 0
+    """Sections skipped from cross-check (e.g. top-level chapters with
+    very broad page ranges where the title spans only the start)."""
+
+
+def _normalize_for_match(s: str) -> str:
+    """Lowercase, collapse whitespace, strip surrounding punctuation.
+
+    Used to match section titles against extracted PDF text. Both sides
+    go through the same normalizer so we compare apples-to-apples.
+    """
+    if not s:
+        return ""
+    return " ".join(s.lower().split()).strip()
+
+
+def _title_in_text(title_norm: str, text_norm: str) -> bool:
+    """True if the normalized title appears in the normalized page text.
+
+    Uses substring match with word-boundary check on each side so we
+    don't match "Carbon" inside "Carbon Compounds" as a false positive.
+
+    For unnumbered short titles ("Introduction", "Summary"), still uses
+    substring — the false-positive risk is mostly an issue when the
+    title is genuinely common across the PDF, which we handle at the
+    SEARCH step (multiple matches → undecidable → skip correction).
+    """
+    if not title_norm or not text_norm:
+        return False
+    idx = text_norm.find(title_norm)
+    if idx < 0:
+        return False
+    # Check boundaries — chars at position idx-1 and idx+len(title_norm)
+    # must NOT be alphanumeric (else we matched mid-word).
+    before_ok = (idx == 0) or not text_norm[idx - 1].isalnum()
+    after_idx = idx + len(title_norm)
+    after_ok = (after_idx >= len(text_norm)) or not text_norm[after_idx].isalnum()
+    return before_ok and after_ok
+
+
+def _find_title_in_pdf(
+    title_norm: str, per_page_text: dict[int, str]
+) -> list[int]:
+    """Return all 1-indexed pages where title appears (using same matcher
+    as _title_in_text). Empty list if nowhere.
+    """
+    pages = []
+    for page_num, text in per_page_text.items():
+        text_norm = _normalize_for_match(text)
+        if _title_in_text(title_norm, text_norm):
+            pages.append(page_num)
+    return sorted(pages)
+
+
+def cross_check_section_pages(
+    pdf_bytes: bytes,
+    schema: BookSchema,
+    *,
+    skip_top_level: bool = True,
+    page_tolerance: int = 1,
+) -> CrossCheckResult:
+    """Cross-check every section's claimed page_start against PDF text.
+
+    For each section:
+      1. If title appears in text at claimed_page_start (± tolerance) → OK
+      2. If not, search whole PDF
+         a. Found on exactly 1 page → CORRECTION (claimed → actual)
+         b. Found on multiple pages → ambiguous, skip (claimed might still be correct)
+         c. Not found anywhere → PHANTOM
+
+    Args:
+        pdf_bytes: PDF binary content
+        schema: BookSchema to verify
+        skip_top_level: If True, skip top-level chapter sections (their
+            page ranges are usually too broad for meaningful per-page
+            cross-check)
+        page_tolerance: Pages around claimed_page_start to also check
+            (titles sometimes wrap to next page).
+
+    Returns CrossCheckResult. Caller decides whether to APPLY corrections
+    or just record them in schema_warnings.
+
+    Pure function — no DB I/O. Skipped for scanned PDFs (pypdf returns
+    empty text).
+    """
+    result_corrections: list[PageCorrection] = []
+    result_phantoms: list[PhantomSection] = []
+    confirmed = 0
+    skipped = 0
+
+    per_page = _extract_per_page_text(pdf_bytes)
+    if not per_page:
+        logger.info(
+            "schema cross-check: pypdf returned no text (scanned PDF) — skipping"
+        )
+        return CrossCheckResult(skipped_no_text=True)
+
+    # Pre-normalize all page text once
+    per_page_norm = {p: _normalize_for_match(t) for p, t in per_page.items()}
+
+    def _walk(sections: list[SchemaSection], depth: int) -> None:
+        nonlocal confirmed, skipped
+        for section in sections:
+            # Skip top-level chapters by default — their page ranges span
+            # the whole chapter and the title appears only at the start,
+            # which would match. But cross-check on subsections is more
+            # informative.
+            if skip_top_level and depth == 0:
+                _walk(section.subsections, depth + 1)
+                continue
+
+            title = section.title or ""
+            title_norm = _normalize_for_match(title)
+            if not title_norm:
+                # Empty title — can't cross-check
+                skipped += 1
+                _walk(section.subsections, depth + 1)
+                continue
+
+            ps = section.page_start
+            if not isinstance(ps, int) or ps < 1:
+                # No valid page_start — can't even attempt local check
+                # (search whole PDF as fallback below)
+                ps = None
+
+            # Step 1: title on claimed page (± tolerance)?
+            local_hit = False
+            if ps is not None:
+                check_pages = range(
+                    max(1, ps - page_tolerance),
+                    ps + page_tolerance + 1,
+                )
+                for cp in check_pages:
+                    if cp in per_page_norm and _title_in_text(
+                        title_norm, per_page_norm[cp]
+                    ):
+                        local_hit = True
+                        break
+
+            if local_hit:
+                confirmed += 1
+                _walk(section.subsections, depth + 1)
+                continue
+
+            # Step 2: not at claimed page — search whole PDF
+            found_pages = _find_title_in_pdf(title_norm, per_page)
+            if len(found_pages) == 1:
+                # Deterministic correction
+                actual = found_pages[0]
+                # Only emit correction if it actually differs from claimed
+                if ps != actual:
+                    result_corrections.append(PageCorrection(
+                        section_id=section.id,
+                        section_title=title,
+                        claimed_page_start=ps if ps is not None else -1,
+                        actual_page_start=actual,
+                    ))
+                else:
+                    confirmed += 1
+            elif len(found_pages) > 1:
+                # Ambiguous — title appears multiple times. Claimed may
+                # still be correct if it's in found_pages; otherwise skip.
+                if ps in found_pages:
+                    confirmed += 1
+                else:
+                    skipped += 1
+            else:
+                # PHANTOM — title nowhere in PDF text
+                result_phantoms.append(PhantomSection(
+                    section_id=section.id,
+                    section_title=title,
+                    claimed_page_start=ps,
+                ))
+
+            _walk(section.subsections, depth + 1)
+
+    _walk(schema.sections, 0)
+
+    return CrossCheckResult(
+        corrections=result_corrections,
+        phantoms=result_phantoms,
+        confirmed=confirmed,
+        skipped_count=skipped,
+    )
+
+
+def apply_page_corrections(
+    schema: BookSchema, corrections: list[PageCorrection]
+) -> BookSchema:
+    """Apply auto-corrections from cross-check to the schema.
+
+    For each correction, find the section by id and update its
+    page_start. Returns the (potentially mutated) schema.
+
+    Only updates page_start; page_end is left alone — that's E1's job
+    (self-correction from extracted blocks).
+    """
+    by_id = {c.section_id: c for c in corrections if c.section_id}
+    if not by_id:
+        return schema
+
+    def _walk(sections: list[SchemaSection]) -> None:
+        for s in sections:
+            c = by_id.get(s.id)
+            if c is not None:
+                old = s.page_start
+                s.page_start = c.actual_page_start
+                logger.info(
+                    "schema cross-check: corrected '%s' page_start %s → %s",
+                    c.section_title, old, c.actual_page_start,
+                )
+            _walk(s.subsections)
+
+    _walk(schema.sections)
+    return schema

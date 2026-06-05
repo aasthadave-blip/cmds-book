@@ -385,11 +385,54 @@ def build_schema(pdf_bytes: bytes, *, is_multi_column: bool = False) -> BookSche
 
             schema = BookSchema(**data)
 
-            # Postpass verifier — logs warnings only (Day 9 makes it FIX).
+            # Postpass — two passes:
+            # Pass 1 (legacy): verify_schema_against_pdf_text — finds
+            #   labels in PDF that Gemini missed. Logs warnings only.
             try:
                 schema, _warnings = verify_schema_against_pdf_text(pdf_bytes, schema)
             except Exception as e:
                 logger.warning("schema verifier failed (continuing): %s", e)
+
+            # SCHEMA Day 5 — Pass 2: cross_check_section_pages.
+            # For each section, verify title actually appears on claimed
+            # page_start. If not, search PDF — if found exactly once
+            # elsewhere, AUTO-CORRECT the page. If nowhere, flag as
+            # phantom. Skipped for scanned PDFs.
+            # Catches the "EXAMPLE 9.18 → page_start=9" subtle case
+            # where the validator can't tell page=9 is wrong because
+            # 9 IS a valid integer.
+            try:
+                from app.services.schema_postpass import (
+                    cross_check_section_pages, apply_page_corrections,
+                )
+                cross_result = cross_check_section_pages(pdf_bytes, schema)
+                if cross_result.skipped_no_text:
+                    logger.info(
+                        "schema cross-check: skipped (no pypdf text — scanned PDF)"
+                    )
+                else:
+                    logger.info(
+                        "schema cross-check: confirmed=%d corrections=%d "
+                        "phantoms=%d skipped=%d",
+                        cross_result.confirmed,
+                        len(cross_result.corrections),
+                        len(cross_result.phantoms),
+                        cross_result.skipped_count,
+                    )
+                    if cross_result.corrections:
+                        schema = apply_page_corrections(
+                            schema, cross_result.corrections
+                        )
+                    if cross_result.phantoms:
+                        for p in cross_result.phantoms:
+                            logger.warning(
+                                "schema cross-check: PHANTOM section '%s' "
+                                "(claimed page=%s, not found in PDF text)",
+                                p.section_title, p.claimed_page_start,
+                            )
+            except Exception as e:
+                logger.warning("schema cross-check failed (continuing): %s", e)
+
             return schema
         except Exception as e:
             last_err = e
