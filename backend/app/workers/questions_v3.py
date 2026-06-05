@@ -1407,6 +1407,13 @@ def _persist_unit(
       (e.g. `_model_claimed_section`).
     """
     from app.models.rejected_question import RejectedQuestion
+    from app.services.section_identity import resolve_section_uuid
+
+    # Phase 2 of canonical identity migration (CONTRACT.md §1):
+    # resolve unit.id (slug) to Section UUID once, then stamp every
+    # Question we insert with the FK. Falls back to None if no Section
+    # row matches — backfill / Phase 3 reader handles that case.
+    section_uuid = resolve_section_uuid(session, book_id, unit.id)
 
     session.execute(
         delete(Question).where(
@@ -1452,6 +1459,7 @@ def _persist_unit(
             bank_id=bank_id,
             book_id=book_id,
             section_ref=unit.id,
+            section_uuid=section_uuid,  # Phase 2: canonical FK alongside slug
             section_title=unit.title,
             page_start=item.get("page") or unit.page_start,
             page_end=unit.page_end,

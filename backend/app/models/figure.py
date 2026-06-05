@@ -21,6 +21,15 @@ class Figure(Base):
         index=True,
     )
     section_id: Mapped[str] = mapped_column(sa.String(256), nullable=False, index=True)
+    # Phase 2 of canonical identity migration (CONTRACT.md §1). Nullable
+    # during migration; section_id (string slug, misleadingly named) is
+    # kept for legacy paths until Phase 5 cleanup renames/drops it.
+    section_uuid: Mapped[UUID | None] = mapped_column(
+        sa.Uuid(as_uuid=True),
+        sa.ForeignKey("sections.id", ondelete="SET NULL"),
+        nullable=True,
+        index=True,
+    )
     figure_number: Mapped[str | None] = mapped_column(sa.Text)
     caption: Mapped[str | None] = mapped_column(sa.Text)
     description: Mapped[str | None] = mapped_column(sa.Text)

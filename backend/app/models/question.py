@@ -27,6 +27,15 @@ class Question(Base):
         index=True,
     )
     section_ref: Mapped[str | None] = mapped_column(sa.String(256), nullable=True, index=True)
+    # Phase 2 of canonical identity migration (CONTRACT.md §1). Nullable
+    # during migration; Phase 4 will require it for new uploads. Joins
+    # use this UUID FK; section_ref is kept for legacy paths + display.
+    section_uuid: Mapped[UUID | None] = mapped_column(
+        sa.Uuid(as_uuid=True),
+        sa.ForeignKey("sections.id", ondelete="SET NULL"),
+        nullable=True,
+        index=True,
+    )
     section_title: Mapped[str | None] = mapped_column(sa.Text)
     page_start: Mapped[int | None] = mapped_column(sa.Integer)
     page_end: Mapped[int | None] = mapped_column(sa.Integer)

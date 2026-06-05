@@ -263,9 +263,20 @@ def _extract_figures_v2_impl(book_id: str, job_id: str) -> dict[str, Any]:
                     "anchor_position": head.get("anchor_position"),
                     "question_no": head.get("question_no"),
                 }
+            # Phase 2 of canonical identity migration (CONTRACT.md §1):
+            # resolve primary_section_ref (slug) → Section UUID once per
+            # figure. Used to stamp Figure.section_uuid AND every child
+            # FigureReference. None if slug doesn't match (e.g. "_orphan"
+            # placeholder); Phase 4 reader handles NULL gracefully.
+            from app.services.section_identity import resolve_section_uuid as _resolve_sid
+            primary_section_uuid = _resolve_sid(
+                session, book_uuid, primary_section_ref
+            ) if primary_section_ref else None
+
             fig_row = Figure(
                 book_id=book_uuid,
                 section_id=primary_section_ref or "_orphan",
+                section_uuid=primary_section_uuid,  # Phase 2: canonical FK
                 figure_number=head.get("placeholder_text"),
                 caption=head.get("caption"),
                 description=None,
@@ -290,10 +301,18 @@ def _extract_figures_v2_impl(book_id: str, job_id: str) -> dict[str, Any]:
             session.flush()  # need fig_row.id for refs
             inserted_figures += 1
             for c in cands:
+                # Each candidate may target a different section than the
+                # figure's primary one — resolve per-cand to be correct.
+                cand_slug = c.get("section_ref") or ""
+                cand_uuid = (
+                    _resolve_sid(session, book_uuid, cand_slug)
+                    if cand_slug else None
+                )
                 ref = FigureReference(
                     figure_id=fig_row.id,
                     book_id=book_uuid,
-                    section_ref=c.get("section_ref") or "",
+                    section_ref=cand_slug,
+                    section_uuid=cand_uuid,  # Phase 2: canonical FK
                     context=c.get("context") or "theory",
                     question_id=(
                         UUID(c["question_id"]) if c.get("question_id") else None

@@ -38,6 +38,16 @@ class FigureReference(Base):
         index=True,
     )
     section_ref: Mapped[str] = mapped_column(sa.String(255), nullable=False)
+    # Phase 2 of canonical identity migration (CONTRACT.md §1). The
+    # figure_embedder populates this from sections_by_id mapping after
+    # placement; questions-context refs derive it from question.section_uuid.
+    # Nullable during migration; Phase 4 reader prefers it over section_ref.
+    section_uuid: Mapped[UUID | None] = mapped_column(
+        sa.Uuid(as_uuid=True),
+        sa.ForeignKey("sections.id", ondelete="SET NULL"),
+        nullable=True,
+        index=True,
+    )
     # "theory" | "question"
     context: Mapped[str] = mapped_column(sa.String(32), nullable=False)
     question_id: Mapped[UUID | None] = mapped_column(

@@ -971,6 +971,22 @@ async def embed_figures_for_book(
         questions_by_section, label_index, book_id,
     )
 
+    # Phase 2 of canonical identity migration (CONTRACT.md §1):
+    # stamp every FigureReference with the canonical section UUID. Uses
+    # the same section_ref slug each ref already carries — resolved
+    # once via the in-memory sections_by_id map (no extra DB I/O).
+    # Question-context refs get the question's section_uuid when set
+    # (Phase 2 question writer populates it), otherwise fall back to
+    # the slug-map lookup.
+    section_uuid_by_slug = {slug: sec.id for slug, sec in sections_by_id.items()}
+    question_uuid_by_id = {q.id: q.section_uuid for q in questions if q.section_uuid}
+    for ref in refs:
+        if ref.question_id and ref.question_id in question_uuid_by_id:
+            ref.section_uuid = question_uuid_by_id[ref.question_id]
+        elif ref.section_ref and ref.section_ref in section_uuid_by_slug:
+            ref.section_uuid = section_uuid_by_slug[ref.section_ref]
+        # else: leave NULL; Phase 4 reader treats this as "unlinked"
+
     for ref in refs:
         session.add(ref)
     await session.flush()
@@ -1032,6 +1048,18 @@ def embed_figures_for_book_sync(session, book_id: UUID) -> dict[str, int]:
         figures, sections_by_id, questions,
         questions_by_section, label_index, book_id,
     )
+
+    # Phase 2 of canonical identity migration (CONTRACT.md §1):
+    # stamp every FigureReference with the canonical section UUID.
+    # Same logic as the async wrapper above — kept inline to avoid
+    # async/sync drift.
+    section_uuid_by_slug = {slug: sec.id for slug, sec in sections_by_id.items()}
+    question_uuid_by_id = {q.id: q.section_uuid for q in questions if q.section_uuid}
+    for ref in refs:
+        if ref.question_id and ref.question_id in question_uuid_by_id:
+            ref.section_uuid = question_uuid_by_id[ref.question_id]
+        elif ref.section_ref and ref.section_ref in section_uuid_by_slug:
+            ref.section_uuid = section_uuid_by_slug[ref.section_ref]
 
     for ref in refs:
         session.add(ref)
