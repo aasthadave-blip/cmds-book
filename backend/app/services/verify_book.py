@@ -149,7 +149,14 @@ async def verify_book(
             })
 
     theory_total = len(theory_schema_sections)
-    if theory_total == 0:
+    # Phase 5e respect: if a stage is currently running, don't label it
+    # failed/partial from content counts (stages mid-flight haven't
+    # finished writing yet). "pending" means worker hasn't started.
+    if book.theory_status == "running":
+        theory_status = "running"
+    elif book.theory_status == "pending" and theory_with == 0:
+        theory_status = "pending"
+    elif theory_total == 0:
         theory_status = "done" if book.schema else "pending"
     elif theory_with == theory_total:
         theory_status = "done"
@@ -204,7 +211,13 @@ async def verify_book(
             })
 
     q_total_schema = len(question_schema_sections)
-    if q_total_schema == 0:
+    # Phase 5e respect: running stages aren't failed; "pending" means
+    # the worker hasn't started yet (so 0 content is expected, not failed).
+    if book.questions_status == "running":
+        q_status = "running"
+    elif book.questions_status == "pending" and q_with == 0:
+        q_status = "pending"
+    elif q_total_schema == 0:
         q_status = "done" if book.schema else "pending"
     elif q_with == q_total_schema:
         q_status = "done"
@@ -248,9 +261,14 @@ async def verify_book(
     }
 
     # ─── Derived book status ──────────────────────────────────────
+    # Order matters: failed > running (in-flight) > partial > pending > done.
+    # "running" precedes "pending" so a mid-flight book reads as
+    # "processing" not "queued".
     statuses = [schema_status, theory_status, q_status, fig_status]
     if "failed" in statuses:
         derived = "failed"
+    elif "running" in statuses:
+        derived = "processing"
     elif "partial" in statuses:
         derived = "partial"
     elif all(s == "done" for s in statuses):
@@ -267,9 +285,19 @@ async def verify_book(
         if not book.schema:
             parts.append("schema not yet generated")
         else:
-            parts.append("extraction not yet started")
+            parts.append("extraction queued")
     elif derived == "processing":
-        parts.append("extraction in progress")
+        # More specific: which stage is running?
+        running_stages = [
+            name for name, st in [
+                ("schema", schema_status), ("theory", theory_status),
+                ("questions", q_status), ("figures", fig_status),
+            ] if st == "running"
+        ]
+        if running_stages:
+            parts.append(f"{', '.join(running_stages)} in progress")
+        else:
+            parts.append("extraction in progress")
     else:
         if theory_empty:
             parts.append(f"{len(theory_empty)} theory sections empty")
