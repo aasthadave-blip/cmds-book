@@ -1,16 +1,30 @@
-"""P2 Schema Generator — uses Gemini 2.5 Pro for native PDF understanding.
+"""Schema Generator — Gemini 2.5 Pro for native PDF understanding.
 
-Uses the new google-genai SDK (google.genai), not the deprecated
-google-generativeai package.
+Uses the google-genai SDK (NOT the deprecated google-generativeai
+package). Routes to schema_gemini.txt (single-column) or
+schema_gemini_multicolumn.txt based on the upload-time is_multi_column
+flag (autodetection lands in SCHEMA Week 1).
 
-build_schema() is intentionally SYNCHRONOUS. The worker (extract.py) runs
-in a plain daemon thread with no event loop, so async/asyncio.run() causes
-"no current event loop" errors from google-genai's internals.
+build_schema() is intentionally SYNCHRONOUS. The Celery worker thread
+(extract.py:analyse_book_task) runs without an event loop, so async
+calls cause "no current event loop" errors from google-genai's httpx
+internals. We ensure a loop exists for the thread, then call Gemini
+synchronously.
 
-We ensure an event loop exists for the thread (google-genai needs one for
-its httpx internals), then call Gemini synchronously.
+Retry behaviour (today, pre-Week-2):
+- Up to MAX_ATTEMPTS (3) attempts
+- Retries on ANY exception (Gemini error, JSON parse failure, pydantic
+  validation failure, sanitizer crash) — same prompt each time
+- _sanitize_schema patches Gemini output (silently drops malformed
+  sections, coerces types, nulls invalid pages)
 
-Retries up to MAX_ATTEMPTS times on JSON parse error.
+SCHEMA Week 1 status (in progress):
+- ✅ Dead prompt files deleted
+- ✅ schema_warnings + schema_quality_score columns added (this commit)
+- ⏳ UUID at creation, /quality wiring, preflight, layout detector
+
+SCHEMA Week 2+ will replace _sanitize_schema with a hard validator +
+corrective retries. See SCHEMA_FINAL_PLAN.md.
 """
 
 from __future__ import annotations

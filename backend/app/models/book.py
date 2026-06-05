@@ -50,6 +50,19 @@ class Book(Base):
     # Last verify_book() report — populated by the quality endpoint.
     # Shape documented in app/services/verify_book.py.
     verification_log: Mapped[dict | None] = mapped_column(sa.JSON, nullable=True)
+
+    # SCHEMA Week 1 — observability for schema generation issues.
+    # schema_warnings: list of structured warnings the schema generator
+    # hit (sanitizer drops, validator violations, postpass-added sections,
+    # corrective-retry triggers). Populated by schema_builder during
+    # generation. Shape: [{type, section_id, reason, severity}, ...]
+    schema_warnings: Mapped[list | None] = mapped_column(sa.JSON, nullable=True)
+    # schema_quality_score: 0-100. Computed by the schema validator
+    # (lands in Week 2). 90+ good, 70-89 has warnings, <70 schema
+    # is rejected outright and surfaced to the user.
+    schema_quality_score: Mapped[int | None] = mapped_column(
+        sa.Integer, nullable=True,
+    )
     created_at: Mapped[datetime] = mapped_column(
         DateTime(timezone=True), server_default=func.now(), nullable=False
     )
