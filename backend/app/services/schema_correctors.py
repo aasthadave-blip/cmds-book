@@ -206,6 +206,79 @@ def _fragment_missing_leaf_page(
     )
 
 
+def _fragment_invalid_content_types(
+    err: ValidationError, _total_pages: int | None
+) -> str:
+    """INVALID_CONTENT_TYPES — content_types is malformed or uses unknown values."""
+    title = err.section_title or "<unknown section>"
+    value = err.context.get("value")
+    return (
+        f'- Section "{title}" has content_types={value!r}. Valid '
+        f"content_types arrays (lowercase, order-independent):\n"
+        f"    [\"theory\"]\n"
+        f"    [\"questions\"]\n"
+        f"    [\"theory\", \"questions\"]   (mixed — preserve when "
+        f"both theory prose AND inline questions appear in same section)\n"
+        f"    [\"theory\", \"figures\"]\n"
+        f"    [\"questions\", \"figures\"]\n"
+        f"    [\"theory\", \"questions\", \"figures\"]\n"
+        f"Use only \"theory\", \"questions\", and optionally "
+        f"\"figures\". All lowercase. NEVER collapse Mixed "
+        f"[\"theory\", \"questions\"] to [\"theory\"] alone — "
+        f"the question pipeline needs to know about inline questions."
+    )
+
+
+def _fragment_cat_a_at_end_not_excluded(
+    err: ValidationError, _total_pages: int | None
+) -> str:
+    """CAT_A_AT_END_NOT_EXCLUDED — chapter-end Cat A bank wrongly nested
+    in main sections tree instead of excluded_sections."""
+    title = err.section_title or "<unknown section>"
+    reason = err.context.get("reason", "")
+    parent = err.context.get("parent_title", "")
+
+    if reason == "standalone_help":
+        return (
+            f'- Section "{title}" is a standalone help-section title '
+            f"(hints, solutions, answer keys, answers). These ALWAYS "
+            f"belong in the schema's excluded_sections array (flat "
+            f"top-level list), never nested as a subsection of any "
+            f"theory parent. Move \"{title}\" out of the sections "
+            f"tree and into excluded_sections with content_types="
+            f"[\"questions\"]."
+        )
+    # Positional case
+    parent_hint = f' (currently nested under "{parent}")' if parent else ""
+    return (
+        f'- Section "{title}" is a Cat A bank at the END of its chapter'
+        f"{parent_hint} — no theory section follows it at the same "
+        f"level. End-of-chapter banks belong in excluded_sections "
+        f"(flat top-level array), not nested in the main sections "
+        f"tree. Move \"{title}\" to excluded_sections with "
+        f"content_types=[\"questions\"]. Inline numbered items "
+        f"(Example 1.1, Exercise 8.3, Problem 5.1 — anything with "
+        f"X.Y decimal) stay inline in their parent's subsections."
+    )
+
+
+def _fragment_empty_placeholder(
+    err: ValidationError, _total_pages: int | None
+) -> str:
+    """EMPTY_PLACEHOLDER — schema is empty but PDF has content."""
+    total = err.context.get("pdf_total_pages", "?")
+    return (
+        f"- The schema you returned is COMPLETELY EMPTY (zero "
+        f"sections AND zero excluded_sections), but the PDF has "
+        f"{total} pages of content. This is forbidden. Re-emit "
+        f"the schema with at least one section. If the PDF truly "
+        f"has no instructional content (covers, blanks only), "
+        f"populate extraction_notes explaining why. Otherwise, "
+        f"identify the chapter / sections / banks present and "
+        f"emit them."
+    )
+
+
 # ─── DISPATCH TABLE ────────────────────────────────────────────────
 
 # Adding a new ErrorType requires adding a matching fragment here.
@@ -224,8 +297,10 @@ _FRAGMENT_BUILDERS = {
     ErrorType.PAGE_COVERAGE_GAP: _fragment_page_coverage_gap,
     ErrorType.INVALID_TYPE: _fragment_invalid_type,
     ErrorType.MISSING_LEAF_PAGE: _fragment_missing_leaf_page,
-    # Day 7+ entries pending: INVALID_CONTENT_TYPES, CAT_A_NESTED_IN_CAT_B,
-    # EMPTY_PLACEHOLDER
+    # Day 7 — validator now feature-complete (12 rules total)
+    ErrorType.INVALID_CONTENT_TYPES: _fragment_invalid_content_types,
+    ErrorType.CAT_A_AT_END_NOT_EXCLUDED: _fragment_cat_a_at_end_not_excluded,
+    ErrorType.EMPTY_PLACEHOLDER: _fragment_empty_placeholder,
 }
 
 

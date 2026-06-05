@@ -49,15 +49,47 @@ class ErrorType(str, Enum):
     PAGE_COVERAGE_GAP = "page_coverage_gap"
     INVALID_TYPE = "invalid_type"
     MISSING_LEAF_PAGE = "missing_leaf_page"
-    # Day 7+ (planned):
+    # Day 7 (implemented):
     INVALID_CONTENT_TYPES = "invalid_content_types"
-    CAT_A_NESTED_IN_CAT_B = "cat_a_nested_in_cat_b"
+    CAT_A_AT_END_NOT_EXCLUDED = "cat_a_at_end_not_excluded"
     EMPTY_PLACEHOLDER = "empty_placeholder"
 
 
 # Canonical set — used by Rule 7 and others.
 _VALID_SECTION_TYPES = frozenset({
     "chapter", "section", "subsection", "excluded",
+})
+
+# Rule 10 — canonical content_types vocabulary.
+# Sections describe what they CONTAIN: theory prose, questions, figures
+# (or some combination). Order doesn't matter; we treat as sets.
+_VALID_CONTENT_TYPE_VALUES = frozenset({
+    "theory", "questions", "figures",
+})
+
+# Allowed COMBINATIONS (as frozensets — order-independent).
+# Mixed ("theory" + "questions") IS allowed — represents sections where
+# theory prose contains inline numbered questions/exercises. Today's
+# sanitizer collapses this to ["theory"] only; Rule 10 enforces preservation
+# once sanitizer is deleted Day 14.
+_VALID_CONTENT_TYPE_COMBOS = frozenset({
+    frozenset({"theory"}),
+    frozenset({"questions"}),
+    frozenset({"theory", "questions"}),
+    frozenset({"theory", "figures"}),
+    frozenset({"questions", "figures"}),
+    frozenset({"theory", "questions", "figures"}),
+})
+
+# Rule 11 — standalone help-section titles that ALWAYS belong in
+# excluded_sections regardless of position. These are typically
+# chapter-end aids that don't fit the inline numbered pattern.
+# Matched as exact phrase (case-insensitive) — substring matching
+# would false-positive on titles like "Worked Solutions to Example 8.1".
+_END_OF_CHAPTER_HELP_TITLES = frozenset({
+    "hints", "solutions", "answers",
+    "answer key", "answer keys",
+    "key to exercises", "key to problems",
 })
 
 
@@ -586,6 +618,315 @@ def _check_invalid_type(
     return []
 
 
+def _check_invalid_content_types(
+    section: dict, _parents: list[str]
+) -> list[ValidationError]:
+    """Rule 10: content_types must be a valid combination from a strict vocabulary.
+
+    Allowed values per element: {"theory", "questions", "figures"}.
+    Allowed combinations:
+        ["theory"]
+        ["questions"]
+        ["theory", "questions"]    ← Mixed (today silently collapsed by sanitizer)
+        ["theory", "figures"]
+        ["questions", "figures"]
+        ["theory", "questions", "figures"]
+
+    Normalization rules (per user spec):
+      - Duplicates allowed in raw input; we dedupe before comparison
+      - Order doesn't matter (set-based)
+      - Case STRICT: only lowercase accepted (so "Theory" → error)
+      - Empty list → error (must specify at least one)
+      - None → error (must be specified)
+    """
+    ct = section.get("content_types")
+    if ct is None:
+        return [ValidationError(
+            type=ErrorType.INVALID_CONTENT_TYPES,
+            section_id=section.get("id"),
+            section_title=section.get("title"),
+            severity="error",
+            message=(
+                f'Section "{section.get("title")}" has no content_types. '
+                f"Required: one of theory/questions/mixed plus optional figures."
+            ),
+            context={"value": None},
+        )]
+    if not isinstance(ct, list):
+        return [ValidationError(
+            type=ErrorType.INVALID_CONTENT_TYPES,
+            section_id=section.get("id"),
+            section_title=section.get("title"),
+            severity="error",
+            message=(
+                f'Section "{section.get("title")}" has content_types '
+                f"of type {type(ct).__name__}, expected list."
+            ),
+            context={"value": ct, "value_type": type(ct).__name__},
+        )]
+    if not ct:
+        return [ValidationError(
+            type=ErrorType.INVALID_CONTENT_TYPES,
+            section_id=section.get("id"),
+            section_title=section.get("title"),
+            severity="error",
+            message=(
+                f'Section "{section.get("title")}" has empty content_types '
+                f"list. Must specify at least one of theory/questions."
+            ),
+            context={"value": []},
+        )]
+
+    # Check all elements are strings + lowercase + in valid vocabulary
+    for v in ct:
+        if not isinstance(v, str):
+            return [ValidationError(
+                type=ErrorType.INVALID_CONTENT_TYPES,
+                section_id=section.get("id"),
+                section_title=section.get("title"),
+                severity="error",
+                message=(
+                    f'Section "{section.get("title")}" content_types '
+                    f"contains non-string: {v!r}. Expected: lowercase strings."
+                ),
+                context={"value": ct, "bad_element": v},
+            )]
+        if v != v.lower():
+            return [ValidationError(
+                type=ErrorType.INVALID_CONTENT_TYPES,
+                section_id=section.get("id"),
+                section_title=section.get("title"),
+                severity="error",
+                message=(
+                    f'Section "{section.get("title")}" content_types '
+                    f'contains "{v}" (mixed case). Must be lowercase '
+                    f'(e.g. "theory" not "Theory").'
+                ),
+                context={"value": ct, "bad_element": v},
+            )]
+        if v not in _VALID_CONTENT_TYPE_VALUES:
+            return [ValidationError(
+                type=ErrorType.INVALID_CONTENT_TYPES,
+                section_id=section.get("id"),
+                section_title=section.get("title"),
+                severity="error",
+                message=(
+                    f'Section "{section.get("title")}" content_types '
+                    f'contains "{v}". Valid values: '
+                    f"{sorted(_VALID_CONTENT_TYPE_VALUES)}."
+                ),
+                context={"value": ct, "bad_element": v},
+            )]
+
+    # Dedupe and compare as set (order/duplicates don't matter)
+    normalized = frozenset(ct)
+    if normalized not in _VALID_CONTENT_TYPE_COMBOS:
+        return [ValidationError(
+            type=ErrorType.INVALID_CONTENT_TYPES,
+            section_id=section.get("id"),
+            section_title=section.get("title"),
+            severity="error",
+            message=(
+                f'Section "{section.get("title")}" content_types {ct} '
+                f"is not a valid combination. Allowed: each set must "
+                f"contain at least one of theory/questions, optionally figures."
+            ),
+            context={"value": ct, "normalized": sorted(normalized)},
+        )]
+    return []
+
+
+def _has_inline_decimal_pattern(title: str | None) -> bool:
+    """True if title contains a X.Y decimal pattern (Example 1.1, Exercise 8.3).
+
+    Used to whitelist inline Cat A items from Rule 11. Per user spec:
+    Cat A items with decimal numbering are INLINE; without decimal
+    they may be chapter-end banks.
+
+    Matches digit.digit anywhere in the title (also handles X.Y.Z, e.g. 1.2.3).
+    """
+    if not title:
+        return False
+    import re
+    return bool(re.search(r"\d+\.\d+", title))
+
+
+def _is_standalone_help_title(title: str | None) -> bool:
+    """True if title is a standalone end-of-chapter help section.
+
+    Hints/Solutions/Answer Keys/Answers when used as a section heading
+    (not part of a longer descriptive title like "Worked Solutions to
+    Example 8.1") signal a chapter-end aid that belongs in
+    excluded_sections.
+
+    Match logic: title's normalized form is exactly equal to one of
+    the help phrases (or differs only by trailing punctuation/colon).
+    """
+    if not title:
+        return False
+    import re
+    # Strip surrounding whitespace, lowercase, drop trailing punct/colons
+    t = re.sub(r"[\s:.,;!\-]+$", "", title.strip().lower())
+    return t in _END_OF_CHAPTER_HELP_TITLES
+
+
+def _check_cat_a_at_end_not_excluded(
+    section: dict,
+    parent: dict | None,
+    siblings: list[dict],
+) -> list[ValidationError]:
+    """Rule 11: Cat A sections at end of chapter belong in excluded_sections.
+
+    Per user spec:
+      - Cat A items with X.Y decimal pattern (Example 1.1, Exercise 8.3)
+        are INLINE — nested under Cat B parent regardless of position
+      - Cat A bank-style sections (Practice Questions, MCQs, Hints, etc.)
+        at the END of a chapter belong in excluded_sections (flat array)
+      - "End of chapter" = no Cat B (theory) sibling AFTER this section
+        in the parent's children list
+      - Standalone "Hints", "Solutions", "Answer Keys", "Answers" titles
+        ALWAYS belong in excluded_sections (titles signal chapter-end aid)
+
+    Fires when ALL true:
+      1. Section is Cat A (content_types includes "questions")
+      2. Title does NOT have X.Y decimal pattern (inline whitelist)
+      3. EITHER:
+         a. No Cat B section appears AFTER it in parent's subsections
+         b. OR title is a standalone help-section name (always excluded)
+
+    Returns ERROR with suggested move to excluded_sections.
+
+    Skip cases:
+      - Section is in excluded_sections (no parent in main tree, won't fire)
+      - Section is a top-level chapter (parent is None — not "in a chapter")
+      - X.Y decimal title → whitelist, never flag
+    """
+    # Must be Cat A
+    ct = section.get("content_types") or []
+    if not isinstance(ct, list) or "questions" not in ct:
+        return []
+
+    # Title-based whitelist: inline decimal pattern → always inline, never flag
+    title = section.get("title") or ""
+    if _has_inline_decimal_pattern(title):
+        return []
+
+    # Skip Cat A nested inside another Cat A — only flag the TOP-MOST
+    # bank. If parent is also Cat A (e.g. "Very Short Answer Type" inside
+    # "CLASSROOM WING" inside "Practice Questions"), the parent will be
+    # flagged and its children move with it structurally. Flagging every
+    # descendant would be noisy and redundant.
+    if parent is not None:
+        parent_ct = parent.get("content_types") or []
+        if isinstance(parent_ct, list) and "questions" in parent_ct:
+            return []
+
+    # Standalone help title → ALWAYS flag regardless of position
+    # (still only fires for top-most, since nested Cat A skipped above)
+    if _is_standalone_help_title(title):
+        return [ValidationError(
+            type=ErrorType.CAT_A_AT_END_NOT_EXCLUDED,
+            section_id=section.get("id"),
+            section_title=title,
+            severity="error",
+            message=(
+                f'Section "{title}" is a standalone help section '
+                f"(hints/solutions/answer keys) — these belong in "
+                f"excluded_sections (flat top-level array), not nested "
+                f"in the main sections tree."
+            ),
+            context={
+                "title": title,
+                "reason": "standalone_help",
+            },
+        )]
+
+    # Positional check: skip top-level chapters (no parent in main tree)
+    if parent is None:
+        return []
+
+    # Position check: no Cat B sibling AFTER this section?
+    if section not in siblings:
+        # Defensive — shouldn't happen, walker yields (section, parent, siblings)
+        return []
+    try:
+        idx = siblings.index(section)
+    except ValueError:
+        return []
+
+    # Look at siblings AFTER this section in the parent's children list
+    has_cat_b_after = False
+    for sib in siblings[idx + 1:]:
+        sib_ct = sib.get("content_types") or []
+        if isinstance(sib_ct, list) and "theory" in sib_ct:
+            has_cat_b_after = True
+            break
+
+    if has_cat_b_after:
+        # Cat B follows → this is NOT end-of-chapter → inline OK
+        return []
+
+    # We're a Cat A section with no Cat B after us in parent's children → end-of-chapter bank
+    return [ValidationError(
+        type=ErrorType.CAT_A_AT_END_NOT_EXCLUDED,
+        section_id=section.get("id"),
+        section_title=title,
+        severity="error",
+        message=(
+            f'Section "{title}" is a Cat A bank at end of its chapter '
+            f"(no theory section follows it). End-of-chapter banks "
+            f"belong in excluded_sections (flat top-level array), "
+            f"not nested as a subsection of a theory parent."
+        ),
+        context={
+            "title": title,
+            "reason": "end_of_chapter_position",
+            "parent_title": parent.get("title"),
+        },
+    )]
+
+
+def _check_empty_placeholder(
+    data: dict, pdf_total_pages: int | None
+) -> list[ValidationError]:
+    """Rule 12: catastrophic schema (empty sections + excluded) on a non-blank PDF.
+
+    Fires when:
+      - data["sections"] is empty/missing
+      - AND data["excluded_sections"] is empty/missing
+      - AND pdf_total_pages > 1 (cover-only PDFs allowed)
+
+    This catches the worst-case Gemini failure where it returns
+    {"sections": [], "excluded_sections": []} on a PDF that clearly
+    has content. The prompt already has anti-placeholder guards, but
+    Gemini sometimes ignores them.
+    """
+    sections = data.get("sections") or []
+    excluded = data.get("excluded_sections") or []
+    if sections or excluded:
+        return []
+    # Empty schema — only flag if PDF has more than trivial content
+    if pdf_total_pages is None or pdf_total_pages <= 1:
+        return []
+    return [ValidationError(
+        type=ErrorType.EMPTY_PLACEHOLDER,
+        section_id=None,
+        section_title=None,
+        severity="error",
+        message=(
+            f"Schema is empty (zero sections, zero excluded_sections) "
+            f"but the PDF has {pdf_total_pages} pages. Cannot proceed "
+            f"with an empty schema. Re-extract with anti-placeholder "
+            f"guard active."
+        ),
+        context={
+            "sections_count": 0,
+            "excluded_count": 0,
+            "pdf_total_pages": pdf_total_pages,
+        },
+    )]
+
+
 def _check_missing_leaf_page(
     section: dict, _parents: list[str]
 ) -> list[ValidationError]:
@@ -719,6 +1060,12 @@ def validate_schema(
         # Day 6 — leaf page presence
         for err in _check_missing_leaf_page(section, []):
             (errors if err.severity == "error" else warnings).append(err)
+        # Day 7 — content_types vocabulary + Mixed preservation
+        for err in _check_invalid_content_types(section, []):
+            (errors if err.severity == "error" else warnings).append(err)
+        # Day 7 — Cat A at end belongs in excluded_sections
+        for err in _check_cat_a_at_end_not_excluded(section, parent, siblings):
+            (errors if err.severity == "error" else warnings).append(err)
 
         # Sibling-pair rule: check ONCE per sibling list (not once per
         # section in the list).
@@ -728,9 +1075,12 @@ def validate_schema(
             for err in _check_sibling_page_overlap(siblings):
                 (errors if err.severity == "error" else warnings).append(err)
 
-    # Whole-schema rule (runs once, not per section)
+    # Whole-schema rules (run once, not per section)
     # Day 6 — page coverage gap (warning)
     for err in _check_page_coverage_gap(data, pdf_total_pages):
+        (errors if err.severity == "error" else warnings).append(err)
+    # Day 7 — catastrophic empty schema
+    for err in _check_empty_placeholder(data, pdf_total_pages):
         (errors if err.severity == "error" else warnings).append(err)
 
     return ValidationResult(
