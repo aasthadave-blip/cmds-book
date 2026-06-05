@@ -466,6 +466,23 @@ async def re_extract_book(
     if not book.schema:
         raise HTTPException(400, detail="Book has no schema — run /analyse first")
 
+    # Phase 7 (CONTRACT.md §5): refuse if another extract is in flight.
+    in_flight = (await session.execute(
+        select(Job).where(
+            Job.book_id == book_id,
+            Job.status.in_(["queued", "running"]),
+        ).limit(1)
+    )).scalars().first()
+    if in_flight is not None:
+        raise HTTPException(
+            status.HTTP_409_CONFLICT,
+            detail=(
+                f"Book has an in-flight task (job_id={in_flight.id}, "
+                f"status={in_flight.status!r}). Wait for it to finish or "
+                "cancel before re-extracting."
+            ),
+        )
+
     # Reset all existing sections to pending so they get re-extracted
     from sqlalchemy import update
     from app.models.section import Section
@@ -480,6 +497,10 @@ async def re_extract_book(
     await session.flush()
 
     book.status = "extracting"
+    # Phase 5d/7: reset per-stage status for the new extract cycle
+    book.theory_status = "pending"
+    book.questions_status = "pending"
+    book.figures_status = "pending"
 
     # Commit before dispatch so worker thread sees the new Job row.
     await session.commit()

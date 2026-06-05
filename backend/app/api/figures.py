@@ -124,9 +124,27 @@ async def extract_figures_v2(
     if not book.pdf_url:
         raise HTTPException(400, detail="Book has no uploaded PDF")
 
+    # Phase 7 (CONTRACT.md §5): refuse if another task is in flight.
+    from sqlalchemy import select as _select
+    in_flight = (await session.execute(
+        _select(Job).where(
+            Job.book_id == book_id,
+            Job.status.in_(["queued", "running"]),
+        ).limit(1)
+    )).scalars().first()
+    if in_flight is not None:
+        raise HTTPException(
+            status.HTTP_409_CONFLICT,
+            detail=(
+                f"Book has an in-flight task (job_id={in_flight.id}, "
+                f"status={in_flight.status!r}). Wait or cancel first."
+            ),
+        )
+
     job = Job(book_id=book.id, type="extract_figures_v2", status="queued", progress=0)
     session.add(job)
     await session.flush()
+    book.figures_status = "pending"  # reset for fresh run
     await session.commit()
 
     # Lazy import + dispatch
