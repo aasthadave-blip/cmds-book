@@ -79,6 +79,31 @@ def _fragment_page_out_of_bounds(err: ValidationError, total_pages: int | None) 
     )
 
 
+def _fragment_individual_question_as_section(
+    err: ValidationError, _total_pages: int | None
+) -> str:
+    """INDIVIDUAL_QUESTION_AS_SECTION — Gemini wrongly promoted a single
+    numbered MCQ/question into its own schema entry."""
+    title = err.section_title or "<unknown section>"
+    page = err.context.get("page_start")
+    page_hint = (
+        f" (with page_start={page}, which is likely the question's "
+        f"NUMBER not its page)" if page is not None else ""
+    )
+    return (
+        f'- Section "{title}" looks like an individual numbered '
+        f"question wrongly emitted as a standalone schema section"
+        f"{page_hint}. "
+        f"Individual questions inside a question bank are NOT "
+        f"separate schema entries — they're counted in the parent "
+        f"bank's `expected_question_count` field. "
+        f"REMOVE this section entirely. Increment the parent question "
+        f"bank's expected_question_count instead. "
+        f"NEVER emit ids like 'practice-q-4' or titles like 'Question 4' "
+        f"or '4' for individual questions."
+    )
+
+
 # ─── DISPATCH TABLE ────────────────────────────────────────────────
 
 # Adding a new ErrorType requires adding a matching fragment here.
@@ -88,9 +113,10 @@ _FRAGMENT_BUILDERS = {
     ErrorType.NON_INTEGER_PAGE: _fragment_non_integer_page,
     ErrorType.INVERTED_RANGE: _fragment_inverted_range,
     ErrorType.PAGE_OUT_OF_BOUNDS: _fragment_page_out_of_bounds,
-    # Day 4-5 entries pending: PAGE_OUTSIDE_PARENT, SIBLING_PAGE_OVERLAP,
+    ErrorType.INDIVIDUAL_QUESTION_AS_SECTION: _fragment_individual_question_as_section,
+    # Day 5+ entries pending: PAGE_OUTSIDE_PARENT, SIBLING_PAGE_OVERLAP,
     # PAGE_COVERAGE_GAP, INVALID_TYPE, INVALID_CONTENT_TYPES,
-    # CAT_A_IN_CAT_B, EMPTY_PLACEHOLDER
+    # CAT_A_NESTED_IN_CAT_B, EMPTY_PLACEHOLDER
 }
 
 

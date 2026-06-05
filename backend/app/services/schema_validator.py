@@ -37,17 +37,19 @@ class ErrorType(str, Enum):
     schema_correctors.py. Adding a new error type requires adding a
     matching corrective."""
 
+    # Day 3 (implemented):
     NON_INTEGER_PAGE = "non_integer_page"
     INVERTED_RANGE = "inverted_range"
     PAGE_OUT_OF_BOUNDS = "page_out_of_bounds"
-    # Day 4 (planned):
+    # Day 4 (implemented — your Q4 case):
+    INDIVIDUAL_QUESTION_AS_SECTION = "individual_question_as_section"
+    # Day 5+ (planned):
     PAGE_OUTSIDE_PARENT = "page_outside_parent"
     SIBLING_PAGE_OVERLAP = "sibling_page_overlap"
     PAGE_COVERAGE_GAP = "page_coverage_gap"
     INVALID_TYPE = "invalid_type"
-    # Day 5 (planned):
     INVALID_CONTENT_TYPES = "invalid_content_types"
-    CAT_A_IN_CAT_B = "cat_a_in_cat_b"
+    CAT_A_NESTED_IN_CAT_B = "cat_a_nested_in_cat_b"
     EMPTY_PLACEHOLDER = "empty_placeholder"
 
 
@@ -197,6 +199,94 @@ def _check_inverted_range(
     return []
 
 
+def _is_individual_question_title(title: str | None) -> bool:
+    """Detect titles that look like individual question identifiers.
+
+    Patterns matched (case-insensitive):
+      "4"           — bare number
+      "4."          — number with period
+      "Q4" / "Q.4"  — Q-prefixed
+      "Question 4"  — long form
+      "(4)" / "(iv)" — parenthesized
+      "MCQ 4"       — MCQ-prefixed
+      "Problem 4"   — problem-prefixed
+
+    These are wrongly-promoted individual questions. They should live
+    inside the parent Cat A bank's expected_question_count, not as
+    standalone schema entries.
+
+    Distinguished from LEGITIMATE Cat A section titles like
+    "EXAMPLE 9.1" (worked example with explanation), "Exercise 8.3"
+    (named exercise block), or "Practice Questions" (bank heading) —
+    those have descriptive words and ARE valid Cat A sections.
+    """
+    if not title:
+        return False
+    import re
+    t = title.strip().lower()
+    patterns = [
+        r"^q?\.?\s*\d+\.?$",         # "4", "4.", "q4", "q.4", "q 4"
+        r"^question\s+\d+\.?$",       # "Question 4"
+        r"^\(\s*\d+\s*\)$",           # "(4)"
+        r"^\(\s*[ivxlcdm]+\s*\)$",   # "(iv)", "(ix)"  Roman lower
+        r"^mcq\s+\d+\.?$",            # "MCQ 4"
+        r"^problem\s+\d+\.?$",        # "Problem 4" (without theory context)
+        r"^prob\.?\s*\d+\.?$",        # "Prob 4", "Prob.4"
+    ]
+    return any(re.match(p, t) for p in patterns)
+
+
+def _check_individual_question_as_section(
+    section: dict, _parents: list[str]
+) -> list[ValidationError]:
+    """Rule 9: Individual numbered questions wrongly promoted as schema sections.
+
+    Catches the user's "Q4 on page 6 wrongly emitted as section" case.
+
+    Triggers when:
+      - section is Cat A (content_types includes "questions")
+      - title matches individual-question pattern (see
+        _is_individual_question_title)
+
+    These should live inside the parent bank's
+    `expected_question_count`, NOT as separate schema entries.
+
+    Page-number-as-question-number side effect (e.g. Gemini set
+    page_start=4 because it grabbed the "4" from "Question 4") is
+    automatically prevented when this rule fires — corrective retry
+    removes the section entirely.
+    """
+    title = section.get("title")
+    if not _is_individual_question_title(title):
+        return []
+
+    content_types = section.get("content_types") or []
+    if not isinstance(content_types, list):
+        content_types = [content_types]
+    is_cat_a = "questions" in content_types
+    if not is_cat_a:
+        # If it's tagged as theory with a number-only title, it's
+        # probably TOC bullet noise — caught by a different rule. Skip.
+        return []
+
+    return [ValidationError(
+        type=ErrorType.INDIVIDUAL_QUESTION_AS_SECTION,
+        section_id=section.get("id"),
+        section_title=title,
+        severity="error",
+        message=(
+            f'Section "{title}" appears to be an individual numbered '
+            f"question wrongly promoted to a standalone schema entry. "
+            f"Individual questions belong inside their parent bank's "
+            f"expected_question_count, not as separate schema sections."
+        ),
+        context={
+            "title_pattern": "individual_question",
+            "page_start": section.get("page_start"),
+        },
+    )]
+
+
 def _check_page_out_of_bounds(
     section: dict, _parents: list[str], *, pdf_total_pages: int | None
 ) -> list[ValidationError]:
@@ -269,6 +359,9 @@ def validate_schema(
         for err in _check_page_out_of_bounds(
             section, parents, pdf_total_pages=pdf_total_pages
         ):
+            (errors if err.severity == "error" else warnings).append(err)
+        # Day 4: catches user's Q4-as-section case
+        for err in _check_individual_question_as_section(section, parents):
             (errors if err.severity == "error" else warnings).append(err)
 
     return ValidationResult(
