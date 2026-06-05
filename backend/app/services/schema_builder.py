@@ -297,6 +297,21 @@ def _run_gemini_schema(pdf_bytes: bytes, schema_prompt: str) -> dict:
     return parse_json(raw)
 
 
+def _get_pdf_page_count(pdf_bytes: bytes) -> int | None:
+    """Best-effort PDF page count for validator's PAGE_OUT_OF_BOUNDS rule.
+
+    Returns None on any failure — validator skips the bounds check
+    when None. Standalone here so build_schema doesn't need to wire
+    the full preflight service yet (that lands Day 6).
+    """
+    try:
+        import pymupdf
+        with pymupdf.open(stream=pdf_bytes, filetype="pdf") as doc:
+            return doc.page_count or None
+    except Exception:
+        return None
+
+
 def build_schema(pdf_bytes: bytes, *, is_multi_column: bool = False) -> BookSchema:
     """Generate a structural schema from PDF bytes using Gemini 2.5 Pro.
 
@@ -304,35 +319,73 @@ def build_schema(pdf_bytes: bytes, *, is_multi_column: bool = False) -> BookSche
 
     When ``is_multi_column`` is True (user-flagged at upload time for
     MHT-CET / JEE / NEET prep books with dense 2-column layouts), the
-    multi-column-aware prompt is loaded. That prompt enforces per-column
-    reading order and per-heading classification so dense MCQ + brief-
-    explanation pages don't get mis-tagged as "all explanations" and
-    silently dropped into excluded_sections. Single-column books use the
-    default prompt and behave identically to before.
+    multi-column-aware prompt is loaded.
+
+    Retry behaviour (SCHEMA Week 1 Day 3):
+      Attempt 1: standard prompt
+      Attempt 2+: corrective prompt — if attempt N's response failed
+                  validation (e.g. NON_INTEGER_PAGE), attempt N+1
+                  appends specific fix instructions for those errors
+                  via schema_correctors.build_corrective_prompt().
+
+      Each retry is no longer identical to the previous — Gemini
+      receives targeted feedback and re-emits with fixes applied.
     """
     _ensure_event_loop()
     prompt_name = (
         "schema_gemini_multicolumn" if is_multi_column else "schema_gemini"
     )
-    schema_prompt = load_raw(prompt_name)
+    base_prompt = load_raw(prompt_name)
 
+    # Get PDF page count once — feeds the validator's bounds rule.
+    pdf_total_pages = _get_pdf_page_count(pdf_bytes)
+
+    # Track the previous attempt's validation errors so the next
+    # attempt's prompt can include corrective instructions.
+    last_errors: list = []
     last_err: Exception | None = None
+
     for attempt in range(1, MAX_ATTEMPTS + 1):
         try:
-            data = _run_gemini_schema(pdf_bytes, schema_prompt)
-            data = _sanitize_schema(data)
-            # SCHEMA Week 1 Day 2 — assign canonical UUIDs BEFORE pydantic
-            # validation so the BookSchema model carries them through.
-            # First-analyse path: every section gets a fresh uuid.
-            # Re-analyse path: caller will pass existing UUID map in a
-            # future signature change (SCHEMA Week 3 Celery wiring).
+            # SCHEMA Day 3: corrective retry — each attempt after the
+            # first appends specific fix instructions from prior errors.
+            if attempt == 1 or not last_errors:
+                prompt = base_prompt
+            else:
+                from app.services.schema_correctors import build_corrective_prompt
+                prompt = build_corrective_prompt(
+                    base_prompt,
+                    last_errors,
+                    pdf_total_pages=pdf_total_pages,
+                )
+                logger.info(
+                    "Schema attempt %s — using corrective prompt for %d errors",
+                    attempt, len(last_errors),
+                )
+
+            data = _run_gemini_schema(pdf_bytes, prompt)
+            data = _sanitize_schema(data)  # kept until Day 14 cleanup
             data = assign_uuids_to_schema(data)
+
+            # SCHEMA Day 3: hard validation BEFORE accepting the schema.
+            # If errors found, save them for the next attempt's corrective
+            # prompt and retry.
+            from app.services.schema_validator import validate_schema
+            validation = validate_schema(data, pdf_total_pages=pdf_total_pages)
+            if not validation.is_valid:
+                last_errors = validation.errors
+                logger.warning(
+                    "Schema attempt %s failed validation: %d errors, %d warnings",
+                    attempt, validation.error_count, validation.warning_count,
+                )
+                # Trigger next attempt with corrective prompt
+                raise ValueError(
+                    f"validation failed: {validation.error_count} errors"
+                )
+
             schema = BookSchema(**data)
-            # Deterministic post-pass — VERIFIER ONLY (no injection).
-            # Cross-checks pypdf-extracted labels against the Gemini schema
-            # and logs any candidate misses as warnings. The schema is NEVER
-            # mutated here. Gemini's strict OCR-ONLY Pass 3.5 is the single
-            # source of truth.
+
+            # Postpass verifier — logs warnings only (Day 9 makes it FIX).
             try:
                 schema, _warnings = verify_schema_against_pdf_text(pdf_bytes, schema)
             except Exception as e:
