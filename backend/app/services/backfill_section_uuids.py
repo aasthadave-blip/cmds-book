@@ -189,6 +189,62 @@ def _backfill_figures(
     return dict(counts)
 
 
+def _backfill_figure_references(
+    engine: Engine,
+    section_map: dict[tuple[str, str], str],
+    book_id: str | None,
+    dry_run: bool,
+) -> dict[str, int]:
+    """Resolve figure_references.section_ref (string slug) → section_uuid."""
+    sql = (
+        "SELECT id, book_id, section_ref FROM figure_references "
+        "WHERE section_uuid IS NULL"
+    )
+    params: dict = {}
+    if book_id:
+        sql += " AND book_id = :book_id"
+        params["book_id"] = book_id
+
+    counts = Counter()
+    updates: list[tuple[str, str]] = []
+    orphans: list[tuple[str, str, str]] = []
+
+    with engine.connect() as conn:
+        rows = conn.execute(text(sql), params).fetchall()
+
+    for fr_id, bk_id, sec_ref in rows:
+        counts["total"] += 1
+        if not sec_ref:
+            counts["null_section_ref"] += 1
+            orphans.append((str(bk_id), str(fr_id), "<null section_ref>"))
+            continue
+        match = section_map.get((str(bk_id), sec_ref))
+        if match:
+            counts["resolved"] += 1
+            updates.append((match, str(fr_id)))
+        else:
+            counts["orphan"] += 1
+            orphans.append((str(bk_id), str(fr_id), sec_ref))
+
+    if updates and not dry_run:
+        with engine.begin() as conn:
+            for sec_uuid, fr_id in updates:
+                conn.execute(
+                    text(
+                        "UPDATE figure_references SET section_uuid = :s WHERE id = :f"
+                    ),
+                    {"s": sec_uuid, "f": fr_id},
+                )
+
+    if orphans:
+        logger.warning(
+            "figure_references: %d orphans (section_ref does not match)",
+            len(orphans),
+        )
+
+    return dict(counts)
+
+
 def run(database_url: str, *, book_id: str | None, dry_run: bool) -> None:
     engine = create_engine(database_url, future=True)
 
@@ -199,6 +255,7 @@ def run(database_url: str, *, book_id: str | None, dry_run: bool) -> None:
 
     q_counts = _backfill_questions(engine, section_map, book_id, dry_run)
     f_counts = _backfill_figures(engine, section_map, book_id, dry_run)
+    fr_counts = _backfill_figure_references(engine, section_map, book_id, dry_run)
 
     mode = "DRY RUN" if dry_run else "APPLIED"
     logger.info(
@@ -211,9 +268,18 @@ def run(database_url: str, *, book_id: str | None, dry_run: bool) -> None:
         mode,
         ", ".join(f"{k}={v}" for k, v in sorted(f_counts.items())),
     )
+    logger.info(
+        "=== %s — figure_references: %s ===",
+        mode,
+        ", ".join(f"{k}={v}" for k, v in sorted(fr_counts.items())),
+    )
 
     # Exit non-zero on orphans so CI / scripts can flag attention needed.
-    orphan_total = q_counts.get("orphan", 0) + f_counts.get("orphan", 0)
+    orphan_total = (
+        q_counts.get("orphan", 0)
+        + f_counts.get("orphan", 0)
+        + fr_counts.get("orphan", 0)
+    )
     if orphan_total:
         logger.warning("TOTAL ORPHANS: %d (these rows could not be resolved)", orphan_total)
 
