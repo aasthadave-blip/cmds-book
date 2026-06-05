@@ -43,14 +43,22 @@ class ErrorType(str, Enum):
     PAGE_OUT_OF_BOUNDS = "page_out_of_bounds"
     # Day 4 (implemented — your Q4 case):
     INDIVIDUAL_QUESTION_AS_SECTION = "individual_question_as_section"
-    # Day 5+ (planned):
+    # Day 6 (implemented — structural integrity):
     PAGE_OUTSIDE_PARENT = "page_outside_parent"
     SIBLING_PAGE_OVERLAP = "sibling_page_overlap"
     PAGE_COVERAGE_GAP = "page_coverage_gap"
     INVALID_TYPE = "invalid_type"
+    MISSING_LEAF_PAGE = "missing_leaf_page"
+    # Day 7+ (planned):
     INVALID_CONTENT_TYPES = "invalid_content_types"
     CAT_A_NESTED_IN_CAT_B = "cat_a_nested_in_cat_b"
     EMPTY_PLACEHOLDER = "empty_placeholder"
+
+
+# Canonical set — used by Rule 7 and others.
+_VALID_SECTION_TYPES = frozenset({
+    "chapter", "section", "subsection", "excluded",
+})
 
 
 @dataclass(frozen=True)
@@ -119,6 +127,28 @@ def _iter_all_sections(data: dict) -> Iterator[tuple[dict, list[str]]]:
     yield from walk(data.get("sections") or [], [])
     # excluded_sections too — they have page_start/page_end and matter
     yield from walk(data.get("excluded_sections") or [], ["<excluded>"])
+
+
+def _iter_with_parent(data: dict) -> Iterator[tuple[dict, dict | None, list[dict]]]:
+    """Walk every section yielding (section, parent, siblings).
+
+    `parent` is None for top-level sections (no parent in schema).
+    `siblings` is the list this section is part of (so we can pair-check
+    sibling overlaps). For top-level sections, siblings == data["sections"].
+
+    excluded_sections also yielded (with parent=None, siblings=data["excluded_sections"]).
+    """
+    sections = data.get("sections") or []
+
+    def walk(siblings, parent):
+        for s in siblings or []:
+            if not isinstance(s, dict):
+                continue
+            yield s, parent, siblings
+            yield from walk(s.get("subsections") or [], s)
+
+    yield from walk(sections, None)
+    yield from walk(data.get("excluded_sections") or [], None)
 
 
 def _check_non_integer_page(
@@ -287,6 +317,319 @@ def _check_individual_question_as_section(
     )]
 
 
+def _check_page_outside_parent(
+    child: dict, parent: dict | None
+) -> list[ValidationError]:
+    """Rule 4: child's page range must be ⊂ parent's range.
+
+    Catches cross-section bleed: child claims pages outside what its
+    parent says it covers. Either child is wrong or parent's range is
+    too narrow — corrective asks Gemini to reconcile.
+
+    Skipped if:
+      - No parent (top-level chapter)
+      - Either parent or child has None for the relevant page
+    """
+    if parent is None:
+        return []
+
+    out = []
+    c_start = child.get("page_start")
+    c_end = child.get("page_end")
+    p_start = parent.get("page_start")
+    p_end = parent.get("page_end")
+
+    # Only validate when both sides have integer pages — rule 1 catches None/strings.
+    def _is_int(v):
+        return isinstance(v, int) and not isinstance(v, bool)
+
+    if _is_int(c_start) and _is_int(p_start) and c_start < p_start:
+        out.append(ValidationError(
+            type=ErrorType.PAGE_OUTSIDE_PARENT,
+            section_id=child.get("id"),
+            section_title=child.get("title"),
+            severity="error",
+            message=(
+                f'Child page_start={c_start} is before parent '
+                f'"{parent.get("title")}" page_start={p_start}. '
+                f"Children must start at or after their parent."
+            ),
+            context={
+                "child_start": c_start,
+                "parent_start": p_start,
+                "parent_title": parent.get("title"),
+            },
+        ))
+    if _is_int(c_end) and _is_int(p_end) and c_end > p_end:
+        out.append(ValidationError(
+            type=ErrorType.PAGE_OUTSIDE_PARENT,
+            section_id=child.get("id"),
+            section_title=child.get("title"),
+            severity="error",
+            message=(
+                f'Child page_end={c_end} exceeds parent '
+                f'"{parent.get("title")}" page_end={p_end}. '
+                f"Children must end at or before their parent."
+            ),
+            context={
+                "child_end": c_end,
+                "parent_end": p_end,
+                "parent_title": parent.get("title"),
+            },
+        ))
+    return out
+
+
+def _check_sibling_page_overlap(
+    siblings: list[dict],
+) -> list[ValidationError]:
+    """Rule 5: among siblings, no two should overlap by 2+ pages.
+
+    Boundary share (1 page common — section A ends where B starts)
+    is allowed. Deep overlap (2+ shared pages) signals two sections
+    fighting over the same content.
+
+    Edge cases handled:
+      - Either page None → skip the pair
+      - Single sibling → no overlap possible
+      - Self-comparison → skipped (i != j)
+    """
+    out = []
+
+    def _is_int(v):
+        return isinstance(v, int) and not isinstance(v, bool)
+
+    # Pair-wise check; we report each conflict once (i < j)
+    for i, a in enumerate(siblings):
+        if not isinstance(a, dict):
+            continue
+        a_start = a.get("page_start")
+        a_end = a.get("page_end")
+        if not (_is_int(a_start) and _is_int(a_end)):
+            continue
+        for j in range(i + 1, len(siblings)):
+            b = siblings[j]
+            if not isinstance(b, dict):
+                continue
+            b_start = b.get("page_start")
+            b_end = b.get("page_end")
+            if not (_is_int(b_start) and _is_int(b_end)):
+                continue
+            # Compute overlap range
+            overlap_start = max(a_start, b_start)
+            overlap_end = min(a_end, b_end)
+            if overlap_end < overlap_start:
+                continue  # no overlap
+            overlap_pages = overlap_end - overlap_start + 1
+            if overlap_pages >= 2:
+                out.append(ValidationError(
+                    type=ErrorType.SIBLING_PAGE_OVERLAP,
+                    section_id=a.get("id"),
+                    section_title=a.get("title"),
+                    severity="error",
+                    message=(
+                        f'Section "{a.get("title")}" (pages {a_start}-{a_end}) '
+                        f'and "{b.get("title")}" (pages {b_start}-{b_end}) '
+                        f"both claim pages {overlap_start}-{overlap_end} "
+                        f"({overlap_pages} pages of overlap). Sections "
+                        f"shouldn't cover the same content."
+                    ),
+                    context={
+                        "section_a_title": a.get("title"),
+                        "section_a_pages": [a_start, a_end],
+                        "section_b_title": b.get("title"),
+                        "section_b_pages": [b_start, b_end],
+                        "overlap": [overlap_start, overlap_end],
+                    },
+                ))
+    return out
+
+
+def _check_page_coverage_gap(
+    data: dict, pdf_total_pages: int | None
+) -> list[ValidationError]:
+    """Rule 6: every PDF page should be in ≥1 leaf section (including
+    excluded_sections). Severity = WARNING, not error.
+
+    Gaps are informational — some PDFs legitimately have unannotated
+    pages (covers, blanks, copyright). User reviews warnings via
+    schema_warnings field; not blocking.
+
+    Edge cases:
+      - pdf_total_pages None → skip (no way to compute gaps)
+      - Container sections contribute pages via their children's coverage
+      - Excluded sections (terminal banks) DO count toward coverage
+      - Gaps grouped into ranges (page 5-7 instead of 5, 6, 7)
+    """
+    if pdf_total_pages is None or pdf_total_pages <= 0:
+        return []
+
+    def _is_int(v):
+        return isinstance(v, int) and not isinstance(v, bool)
+
+    covered: set[int] = set()
+
+    def _collect(sections):
+        for s in sections or []:
+            if not isinstance(s, dict):
+                continue
+            # A section is a "leaf" for coverage purposes if it has no
+            # subsections. Container pages come from descendants.
+            kids = s.get("subsections") or []
+            ps = s.get("page_start")
+            pe = s.get("page_end")
+            if not kids and _is_int(ps) and _is_int(pe) and ps <= pe:
+                for p in range(ps, pe + 1):
+                    if 1 <= p <= pdf_total_pages:
+                        covered.add(p)
+            _collect(kids)
+
+    _collect(data.get("sections") or [])
+    # Excluded sections also count
+    for ex in data.get("excluded_sections") or []:
+        if not isinstance(ex, dict):
+            continue
+        ps = ex.get("page_start")
+        pe = ex.get("page_end")
+        if _is_int(ps) and _is_int(pe) and ps <= pe:
+            for p in range(ps, pe + 1):
+                if 1 <= p <= pdf_total_pages:
+                    covered.add(p)
+
+    all_pages = set(range(1, pdf_total_pages + 1))
+    missing = sorted(all_pages - covered)
+    if not missing:
+        return []
+
+    # Group consecutive missing pages into ranges for cleaner messages
+    ranges = []
+    if missing:
+        run_start = missing[0]
+        run_end = missing[0]
+        for p in missing[1:]:
+            if p == run_end + 1:
+                run_end = p
+            else:
+                ranges.append((run_start, run_end))
+                run_start = run_end = p
+        ranges.append((run_start, run_end))
+
+    range_strs = [f"{a}" if a == b else f"{a}-{b}" for a, b in ranges]
+    return [ValidationError(
+        type=ErrorType.PAGE_COVERAGE_GAP,
+        section_id=None,
+        section_title=None,
+        severity="warning",
+        message=(
+            f"Pages not covered by any leaf section: "
+            f"{', '.join(range_strs)}. "
+            f"If these pages have content (theory or questions), add a "
+            f"section to cover them. Cover pages and blanks may be "
+            f"legitimately uncovered."
+        ),
+        context={
+            "missing_ranges": [list(r) for r in ranges],
+            "total_missing": len(missing),
+            "pdf_total_pages": pdf_total_pages,
+        },
+    )]
+
+
+def _check_invalid_type(
+    section: dict, _parents: list[str]
+) -> list[ValidationError]:
+    """Rule 7: section.type must be in canonical enum.
+
+    Catches Gemini emitting non-standard types like 'unit',
+    'subsubsection', 'sub-section', 'topic'. Today these are silently
+    remapped by _sanitize_schema._TYPE_MAP; once that's deleted (Day 14)
+    this rule becomes the sole enforcement.
+    """
+    t = section.get("type")
+    if t is None:
+        return [ValidationError(
+            type=ErrorType.INVALID_TYPE,
+            section_id=section.get("id"),
+            section_title=section.get("title"),
+            severity="error",
+            message=(
+                f'Section "{section.get("title")}" has no type. '
+                f"Required: one of {sorted(_VALID_SECTION_TYPES)}."
+            ),
+            context={"value": None, "valid_types": sorted(_VALID_SECTION_TYPES)},
+        )]
+    if not isinstance(t, str):
+        return [ValidationError(
+            type=ErrorType.INVALID_TYPE,
+            section_id=section.get("id"),
+            section_title=section.get("title"),
+            severity="error",
+            message=(
+                f'Section "{section.get("title")}" has type={t!r} '
+                f"({type(t).__name__}). Type must be a string from: "
+                f"{sorted(_VALID_SECTION_TYPES)}."
+            ),
+            context={"value": t, "valid_types": sorted(_VALID_SECTION_TYPES)},
+        )]
+    if t not in _VALID_SECTION_TYPES:
+        return [ValidationError(
+            type=ErrorType.INVALID_TYPE,
+            section_id=section.get("id"),
+            section_title=section.get("title"),
+            severity="error",
+            message=(
+                f'Section "{section.get("title")}" has type="{t}". '
+                f"Valid types: {sorted(_VALID_SECTION_TYPES)}."
+            ),
+            context={"value": t, "valid_types": sorted(_VALID_SECTION_TYPES)},
+        )]
+    return []
+
+
+def _check_missing_leaf_page(
+    section: dict, _parents: list[str]
+) -> list[ValidationError]:
+    """Rule 8: leaf sections MUST have page_start.
+
+    Critical for extraction contract: a leaf section's content is
+    extracted from EXACTLY its own page range. If page_start is None,
+    extraction has nothing to slice — silent extraction failure.
+
+    Container sections (with subsections) MAY have None page_start
+    (derivable from min(children's page_start)). True placeholders
+    (no children AND no pages) are flagged.
+
+    page_end can be None on leaves (extractor derives from next
+    section's start or chapter end — but page_start is mandatory).
+    """
+    subs = section.get("subsections") or []
+    is_leaf = len(subs) == 0
+    if not is_leaf:
+        return []
+
+    page_start = section.get("page_start")
+    if isinstance(page_start, int) and not isinstance(page_start, bool):
+        return []  # has a valid integer page_start
+
+    return [ValidationError(
+        type=ErrorType.MISSING_LEAF_PAGE,
+        section_id=section.get("id"),
+        section_title=section.get("title"),
+        severity="error",
+        message=(
+            f'Leaf section "{section.get("title")}" has no valid '
+            f"page_start. Leaf sections (no subsections) require a "
+            f"physical page number — extraction CANNOT fall back to "
+            f"parent's range. Either add page_start or make it a "
+            f"container with subsections."
+        ),
+        context={
+            "is_leaf": True,
+            "page_start_value": page_start,
+        },
+    )]
+
+
 def _check_page_out_of_bounds(
     section: dict, _parents: list[str], *, pdf_total_pages: int | None
 ) -> list[ValidationError]:
@@ -350,19 +693,45 @@ def validate_schema(
     errors: list[ValidationError] = []
     warnings: list[ValidationError] = []
 
-    for section, parents in _iter_all_sections(data):
-        # Each rule returns a list of ValidationError; consolidate.
-        for err in _check_non_integer_page(section, parents):
+    # Track which sibling-lists we've checked for overlap so we don't
+    # re-check the same siblings once per section in that group.
+    seen_sibling_lists: set[int] = set()
+
+    for section, parent, siblings in _iter_with_parent(data):
+        # Per-section rules (called for every section)
+        for err in _check_non_integer_page(section, []):
             (errors if err.severity == "error" else warnings).append(err)
-        for err in _check_inverted_range(section, parents):
+        for err in _check_inverted_range(section, []):
             (errors if err.severity == "error" else warnings).append(err)
         for err in _check_page_out_of_bounds(
-            section, parents, pdf_total_pages=pdf_total_pages
+            section, [], pdf_total_pages=pdf_total_pages
         ):
             (errors if err.severity == "error" else warnings).append(err)
-        # Day 4: catches user's Q4-as-section case
-        for err in _check_individual_question_as_section(section, parents):
+        # Day 4 — Q4-as-section
+        for err in _check_individual_question_as_section(section, []):
             (errors if err.severity == "error" else warnings).append(err)
+        # Day 6 — parent containment
+        for err in _check_page_outside_parent(section, parent):
+            (errors if err.severity == "error" else warnings).append(err)
+        # Day 6 — type enum
+        for err in _check_invalid_type(section, []):
+            (errors if err.severity == "error" else warnings).append(err)
+        # Day 6 — leaf page presence
+        for err in _check_missing_leaf_page(section, []):
+            (errors if err.severity == "error" else warnings).append(err)
+
+        # Sibling-pair rule: check ONCE per sibling list (not once per
+        # section in the list).
+        siblings_id = id(siblings)
+        if siblings_id not in seen_sibling_lists:
+            seen_sibling_lists.add(siblings_id)
+            for err in _check_sibling_page_overlap(siblings):
+                (errors if err.severity == "error" else warnings).append(err)
+
+    # Whole-schema rule (runs once, not per section)
+    # Day 6 — page coverage gap (warning)
+    for err in _check_page_coverage_gap(data, pdf_total_pages):
+        (errors if err.severity == "error" else warnings).append(err)
 
     return ValidationResult(
         is_valid=not errors,
