@@ -261,16 +261,24 @@ async def verify_book(
         derived = "processing"
     report["derived_status"] = derived
 
-    # Human summary
+    # Human summary — be honest about pending/processing books
     parts = []
-    if theory_empty:
-        parts.append(f"{len(theory_empty)} theory sections empty")
-    if q_empty:
-        parts.append(f"{len(q_empty)} question sections empty")
-    if unattached:
-        parts.append(f"{unattached} unattached figures")
-    if not parts:
-        parts.append("all stages verified complete")
+    if derived == "queued":
+        if not book.schema:
+            parts.append("schema not yet generated")
+        else:
+            parts.append("extraction not yet started")
+    elif derived == "processing":
+        parts.append("extraction in progress")
+    else:
+        if theory_empty:
+            parts.append(f"{len(theory_empty)} theory sections empty")
+        if q_empty:
+            parts.append(f"{len(q_empty)} question sections empty")
+        if unattached:
+            parts.append(f"{unattached} unattached figures")
+        if not parts:
+            parts.append("all stages verified complete")
     report["summary"] = "; ".join(parts)
     report["book_status_field"] = book.status  # what book.status currently says
     report["lies"] = (book.status == "ready" and derived != "ready")
