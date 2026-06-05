@@ -255,10 +255,15 @@ def analyse_book_task(self, book_id: str, job_id: str) -> dict:
             if not (book.title and book.title.strip()):
                 book.title = schema.document_title or "Untitled"
             book.subject = schema.subject or book.subject
-            book.status = "schema_ready"
             # Phase 5d: schema completed successfully. Downstream stages stay
             # "pending" until extract_book picks them up.
             book.schema_status = "done"
+            # Phase 5e: derive book.status from per-stage fields. Legacy
+            # "schema_ready" is preserved when downstream stages haven't
+            # been triggered yet (derive_book_status returns "queued" here,
+            # but to maintain backward compatibility with the schema-review
+            # gate, we keep the old "schema_ready" literal in this slot).
+            book.status = "schema_ready"
             session.commit()
 
             _update_job(
@@ -591,13 +596,7 @@ def extract_book_task(self, book_id: str, job_id: str) -> dict:
                 if status in ("failed", "crashed"):
                     failed_section_ids.append(section_id)
 
-            book.status = "ready"
-            # Phase 5d (CONTRACT.md §2): per-stage status derived from
-            # outcomes, not blindly "done". Failed/crashed sections count
-            # against theory: all-failed → failed, some-failed → partial,
-            # none-failed → done. Phase 5e will make book.status itself
-            # derived; for now we keep the existing field write to avoid
-            # breaking downstream code that reads book.status directly.
+            # Phase 5d: derive theory_status from outcomes.
             if total == 0:
                 book.theory_status = "done"  # no theory sections to extract
             elif len(failed_section_ids) == 0:
@@ -606,6 +605,23 @@ def extract_book_task(self, book_id: str, job_id: str) -> dict:
                 book.theory_status = "failed"
             else:
                 book.theory_status = "partial"
+            # Phase 5e (CONTRACT.md §2): book.status is now derived from
+            # per-stage fields, not blindly "ready". Killed the lie.
+            #
+            # NOTE: at this point only schema + theory have completed.
+            # questions_status / figures_status are still "pending" (their
+            # tasks haven't run yet). derive_book_status() correctly
+            # returns "queued" for that state — but the EXISTING flow
+            # treated extract_book completion as "ready" so callers can
+            # display a "extraction complete" message. To preserve that
+            # signal without lying, we use "extracting" if downstream
+            # stages haven't run, otherwise derive normally.
+            from app.services.book_status import derive_book_status
+            derived = derive_book_status(book)
+            # If derive says "queued" (questions/figures pending), call
+            # it "extracting" — extract_book just finished theory; the
+            # downstream stages are about to run.
+            book.status = "extracting" if derived == "queued" else derived
             session.commit()
 
             # Inject example/exercise placeholder chips into parent theory

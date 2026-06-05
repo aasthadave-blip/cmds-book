@@ -2293,6 +2293,12 @@ def _extract_questions_v3(book_id: str, bank_id: str, job_id: str) -> dict[str, 
                     b.questions_status = "partial"
                 else:  # "ready" or anything else clean
                     b.questions_status = "done"
+                # Phase 5e: re-derive book.status now that questions stage
+                # completed. If figures still pending, status stays
+                # "extracting"; if all done, finally flips to "ready".
+                from app.services.book_status import derive_book_status
+                derived = derive_book_status(b)
+                b.status = "extracting" if derived == "queued" else derived
                 session.commit()
         return result
     except Exception as e:

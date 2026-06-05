@@ -374,6 +374,12 @@ def _extract_figures_v2_impl(book_id: str, job_id: str) -> dict[str, Any]:
                 book_row.figures_status = "done"
             else:
                 book_row.figures_status = "failed"
+            # Phase 5e: re-derive book.status. Figures is often the last
+            # stage to complete; this is where the book finally flips to
+            # "ready" (or "partial" if anything failed/empty).
+            from app.services.book_status import derive_book_status
+            derived = derive_book_status(book_row)
+            book_row.status = "extracting" if derived == "queued" else derived
             session.commit()
         _update_job(
             session, job_uuid,
