@@ -3,7 +3,7 @@
 Uses the google-genai SDK (NOT the deprecated google-generativeai
 package). Routes to schema_gemini.txt (single-column) or
 schema_gemini_multicolumn.txt based on the upload-time is_multi_column
-flag (autodetection lands in SCHEMA Week 1).
+flag.
 
 build_schema() is intentionally SYNCHRONOUS. The Celery worker thread
 (extract.py:analyse_book_task) runs without an event loop, so async
@@ -11,20 +11,25 @@ calls cause "no current event loop" errors from google-genai's httpx
 internals. We ensure a loop exists for the thread, then call Gemini
 synchronously.
 
-Retry behaviour (today, pre-Week-2):
-- Up to MAX_ATTEMPTS (3) attempts
-- Retries on ANY exception (Gemini error, JSON parse failure, pydantic
-  validation failure, sanitizer crash) — same prompt each time
-- _sanitize_schema patches Gemini output (silently drops malformed
-  sections, coerces types, nulls invalid pages)
+Pipeline (after SCHEMA Week 1 completion):
 
-SCHEMA Week 1 status (in progress):
-- ✅ Dead prompt files deleted
-- ✅ schema_warnings + schema_quality_score columns added (this commit)
-- ⏳ UUID at creation, /quality wiring, preflight, layout detector
+    Gemini call (one of 3 attempts, attempt 2+ uses corrective prompt)
+        ↓
+    assign_uuids_to_schema()  — stable section identity
+        ↓
+    validate_schema()  — 12 hard rules; failure → corrective retry
+        ↓
+    BookSchema(**data)  — pydantic construction
+        ↓
+    verify_schema_against_pdf_text()  — pypdf cross-check (missing labels)
+        ↓
+    cross_check_section_pages()  — pypdf page verification + auto-correct
+        ↓
+    return validated schema
 
-SCHEMA Week 2+ will replace _sanitize_schema with a hard validator +
-corrective retries. See SCHEMA_FINAL_PLAN.md.
+NO SILENT FIXES. Every issue is either auto-corrected via Gemini retry
+with structured feedback, OR auto-corrected via pypdf ground truth, OR
+surfaced as a validation error to the user.
 """
 
 from __future__ import annotations
@@ -55,15 +60,6 @@ def _ensure_event_loop() -> None:
     except RuntimeError:
         loop = asyncio.new_event_loop()
         asyncio.set_event_loop(loop)
-
-
-_VALID_TYPES = {"chapter", "section", "subsection", "excluded"}
-_TYPE_MAP = {
-    "subsubsection": "subsection",
-    "topic": "subsection",
-    "sub-section": "subsection",
-    "sub_section": "subsection",
-}
 
 
 def assign_uuids_to_schema(
@@ -121,152 +117,15 @@ def assign_uuids_to_schema(
     return data
 
 
-def _sanitize_schema(data) -> dict:
-    """Normalize Gemini output to valid BookSchema fields.
-
-    - Maps unknown section types (e.g. 'subsubsection') to valid Literal values
-    - Bridges excluded_sections → exclusion_summary for UI compatibility
-
-    Top-level shape recovery: Gemini occasionally returns a JSON array
-    (e.g. ``[{...sections...}]``) at the root instead of the expected
-    object. If we receive a list, try the first dict inside it as the
-    real payload; otherwise return an empty schema shell so pydantic
-    can surface a precise validation error rather than a Python
-    AttributeError.
-    """
-    if not isinstance(data, dict):
-        logger.warning(
-            "schema sanitize: top-level payload is %s, not dict — attempting recovery",
-            type(data).__name__,
-        )
-        if isinstance(data, list):
-            inner = next((x for x in data if isinstance(x, dict)), None)
-            if inner is not None:
-                data = inner
-            else:
-                logger.warning(
-                    "schema sanitize: no dict found inside top-level list — returning empty"
-                )
-                return {"sections": [], "excluded_sections": [], "exclusion_summary": []}
-        else:
-            return {"sections": [], "excluded_sections": [], "exclusion_summary": []}
-
-    excluded_titles: list[str] = []
-
-    excluded_raw = data.get("excluded_sections") or []
-    if not isinstance(excluded_raw, list):
-        logger.warning(
-            "schema sanitize: excluded_sections is %s, not list — ignoring",
-            type(excluded_raw).__name__,
-        )
-        excluded_raw = []
-    for ex in excluded_raw:
-        t = ex.get("title", "") if isinstance(ex, dict) else str(ex)
-        if t and t not in excluded_titles:
-            excluded_titles.append(t)
-
-    def _fix_sections(sections) -> list:
-        """Walk a sections list, normalizing in place AND filtering out
-        any non-dict elements.
-
-        Gemini occasionally emits malformed entries — a nested list, a
-        bare string, or null — instead of a proper section object. This
-        used to crash with ``'list' object has no attribute 'get'`` and
-        kill all 3 schema-generation retries identically. Now: log and
-        drop bad elements, keep the good ones, let pydantic validate
-        the rest. Worst case is a partial schema (better than no
-        schema at all)."""
-        if not isinstance(sections, list):
-            logger.warning(
-                "schema sanitize: expected list of sections, got %s — treating as empty",
-                type(sections).__name__,
-            )
-            return []
-        cleaned: list[dict] = []
-        for s in sections:
-            if not isinstance(s, dict):
-                logger.warning(
-                    "schema sanitize: dropping non-dict section element of type %s: %r",
-                    type(s).__name__, s,
-                )
-                continue
-            raw_type = s.get("type") or ""
-            if raw_type not in _VALID_TYPES:
-                mapped = _TYPE_MAP.get(raw_type, "subsection")
-                logger.debug("Normalizing section type %r → %r (id=%s)", raw_type, mapped, s.get("id"))
-                s["type"] = mapped
-            if s.get("type") == "excluded":
-                t = s.get("title", "")
-                if t and t not in excluded_titles:
-                    excluded_titles.append(t)
-            # Coerce page_start/page_end from string to int. Observed
-            # in prod: Gemini occasionally emits question identifiers
-            # like "9.18" / "9.22" / "9.26" as page values (confusion
-            # between question_no and page_no fields). Pydantic
-            # validation fails on these → entire schema attempt is
-            # discarded → all 3 retries fail identically → user sees
-            # "Schema Queued 0%" forever. Coerce safely:
-            #   - int already → keep
-            #   - string "N" or "N.M" → take int part if valid 1-9999
-            #   - anything else → set to None (let pydantic accept
-            #     null and we move on — better than crashing the
-            #     entire schema)
-            for _pf in ("page_start", "page_end"):
-                _pv = s.get(_pf)
-                if _pv is None:
-                    continue
-                if isinstance(_pv, int):
-                    continue
-                if isinstance(_pv, str):
-                    _ps = _pv.strip()
-                    # Clean integer string "5" → 5
-                    try:
-                        s[_pf] = int(_ps)
-                        continue
-                    except (TypeError, ValueError):
-                        pass
-                    # Values containing "." (like "9.18") are almost
-                    # certainly question identifiers Gemini put in the
-                    # wrong field. Do NOT coerce "9.18" → 9 — that would
-                    # be a wrong page number masquerading as a real one
-                    # and break downstream page-range overlap checks.
-                    # Null it instead so the embedder falls back to
-                    # anchor_text matching.
-                    if "." in _ps:
-                        logger.warning(
-                            "schema sanitize: nulling question-like page "
-                            "value %s=%r (id=%s)",
-                            _pf, _pv, s.get("id"),
-                        )
-                        s[_pf] = None
-                        continue
-                # Anything else → null it so pydantic accepts
-                logger.warning(
-                    "schema sanitize: nulling unparseable page %s=%r (id=%s)",
-                    _pf, _pv, s.get("id"),
-                )
-                s[_pf] = None
-
-            # Remove "Mixed" content_types — a section is EITHER theory OR
-            # questions, never both. If both are present, the section is
-            # theory-bearing (its Cat A items are nested subsections with
-            # their own ["questions"] content_types).
-            ct = s.get("content_types") or []
-            if isinstance(ct, list) and "theory" in ct and "questions" in ct:
-                new_ct = [c for c in ct if c != "questions"]
-                if "theory" not in new_ct:
-                    new_ct.insert(0, "theory")
-                logger.debug(
-                    "Normalizing Mixed content_types %r → %r (id=%s)",
-                    ct, new_ct, s.get("id"),
-                )
-                s["content_types"] = new_ct
-            s["subsections"] = _fix_sections(s.get("subsections") or [])
-            cleaned.append(s)
-        return cleaned
-
-    data["sections"] = _fix_sections(data.get("sections") or [])
-    return {**data, "exclusion_summary": excluded_titles}
+# SCHEMA Week 1 Day 14 — _sanitize_schema DELETED.
+# Replaced architecturally by:
+#   * services/schema_validator.py — 12 hard validation rules
+#   * services/schema_correctors.py — corrective prompts that drive
+#     Gemini to fix issues on retry
+#   * services/schema_postpass.cross_check_section_pages —
+#     pypdf-verified page correction
+# Total LOC removed: ~140. No silent fixes anywhere; every issue is
+# either auto-corrected via retry OR surfaced as a validation error.
 
 
 def _run_gemini_schema(pdf_bytes: bytes, schema_prompt: str) -> dict:
@@ -364,7 +223,8 @@ def build_schema(pdf_bytes: bytes, *, is_multi_column: bool = False) -> BookSche
                 )
 
             data = _run_gemini_schema(pdf_bytes, prompt)
-            data = _sanitize_schema(data)  # kept until Day 14 cleanup
+            # SCHEMA Day 14: sanitizer DELETED. Validator + corrective
+            # retry handle all the cases sanitizer previously masked.
             data = assign_uuids_to_schema(data)
 
             # SCHEMA Day 3: hard validation BEFORE accepting the schema.
