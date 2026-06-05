@@ -43,6 +43,18 @@ class SchemaSection(BaseModel):
     # Used by the v3 question worker as the ground-truth target for completeness
     # validation. None means schema didn't populate (older books / fallback).
     expected_question_count: int | None = None
+    # SCHEMA Week 1 Day 2 — canonical section UUID. Assigned by
+    # schema_builder.assign_uuids_to_schema() right after Gemini returns,
+    # before the schema is committed to book.schema. Stable across
+    # re-analyse (same UUID preserved when (title, page_start) matches
+    # an existing schema entry). Downstream Section row uses this as
+    # its primary-key UUID, replacing the schema_alignment patch.
+    #
+    # Currently OPTIONAL — populated for new uploads after this commit;
+    # legacy schemas have it as None. Both paths must be supported until
+    # SCHEMA Week 3 wires this into extract.py (after explicit Celery
+    # touch approval).
+    uuid: str | None = None
 
     model_config = {"extra": "ignore"}
 

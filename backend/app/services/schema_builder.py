@@ -66,6 +66,61 @@ _TYPE_MAP = {
 }
 
 
+def assign_uuids_to_schema(
+    data: dict,
+    *,
+    existing_uuid_by_key: dict[tuple[str, int | None], str] | None = None,
+) -> dict:
+    """Assign canonical UUIDs to every section in the parsed schema dict.
+
+    SCHEMA Week 1 Day 2 — adds `uuid` field to each section. The UUID
+    becomes the canonical identity used by Section rows downstream,
+    replacing the slug-based identity that schema_alignment.py tries
+    to repair on re-analyse.
+
+    Parameters
+    ----------
+    data : dict
+        Parsed schema dict (Gemini output after parse_json + sanitize).
+        Must have a 'sections' key; mutated in place.
+    existing_uuid_by_key : dict, optional
+        On re-analyse: map of (title, page_start) → uuid for previously
+        extracted sections. Matching schema sections preserve their old
+        UUID instead of getting a new one. None on first analyse.
+
+    Returns the same dict (mutated). Sections that already carry a
+    'uuid' field are left untouched (idempotent — safe to re-run).
+
+    Pure function — no DB I/O. Caller is responsible for providing
+    existing_uuid_by_key from the DB if re-analyse safety matters.
+    """
+    import uuid as _uuid
+
+    existing_uuid_by_key = existing_uuid_by_key or {}
+
+    def _walk(sections):
+        if not isinstance(sections, list):
+            return
+        for s in sections:
+            if not isinstance(s, dict):
+                continue
+            # Idempotent: skip if already assigned
+            if s.get("uuid"):
+                _walk(s.get("subsections") or [])
+                continue
+            # Try to preserve existing UUID via (title, page_start) match
+            key = (
+                (s.get("title") or "").strip().lower(),
+                s.get("page_start"),
+            )
+            preserved = existing_uuid_by_key.get(key)
+            s["uuid"] = preserved or str(_uuid.uuid4())
+            _walk(s.get("subsections") or [])
+
+    _walk(data.get("sections") or [])
+    return data
+
+
 def _sanitize_schema(data) -> dict:
     """Normalize Gemini output to valid BookSchema fields.
 
@@ -266,6 +321,12 @@ def build_schema(pdf_bytes: bytes, *, is_multi_column: bool = False) -> BookSche
         try:
             data = _run_gemini_schema(pdf_bytes, schema_prompt)
             data = _sanitize_schema(data)
+            # SCHEMA Week 1 Day 2 — assign canonical UUIDs BEFORE pydantic
+            # validation so the BookSchema model carries them through.
+            # First-analyse path: every section gets a fresh uuid.
+            # Re-analyse path: caller will pass existing UUID map in a
+            # future signature change (SCHEMA Week 3 Celery wiring).
+            data = assign_uuids_to_schema(data)
             schema = BookSchema(**data)
             # Deterministic post-pass — VERIFIER ONLY (no injection).
             # Cross-checks pypdf-extracted labels against the Gemini schema
