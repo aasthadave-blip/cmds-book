@@ -587,7 +587,11 @@ def _check_invalid_type(
                 f'Section "{section.get("title")}" has no type. '
                 f"Required: one of {sorted(_VALID_SECTION_TYPES)}."
             ),
-            context={"value": None, "valid_types": sorted(_VALID_SECTION_TYPES)},
+            context={
+                "value": None,
+                "valid_types": sorted(_VALID_SECTION_TYPES),
+                "level": section.get("level"),
+            },
         )]
     if not isinstance(t, str):
         return [ValidationError(

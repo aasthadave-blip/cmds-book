@@ -177,16 +177,40 @@ def _fragment_page_coverage_gap(
 def _fragment_invalid_type(
     err: ValidationError, _total_pages: int | None
 ) -> str:
-    """INVALID_TYPE — section type not in canonical enum."""
+    """INVALID_TYPE — section type not in canonical enum (or MISSING)."""
     title = err.section_title or "<unknown section>"
     bad = err.context.get("value")
-    valid = err.context.get("valid_types", [])
+    level = err.context.get("level")
+
+    # Special-case: missing `type` field — most common production failure.
+    # Use level (if known) to suggest the right canonical value.
+    if bad is None:
+        if level == 1:
+            suggested = "\"chapter\""
+        elif level == 2:
+            suggested = "\"section\""
+        elif level and level >= 3:
+            suggested = "\"subsection\""
+        else:
+            suggested = "\"subsection\" (or \"section\" / \"chapter\" by level)"
+        return (
+            f'- Section "{title}" is MISSING the `type` field entirely. '
+            f"This field is REQUIRED on every section node. "
+            f"Given level={level!r}, set `type`={suggested}. "
+            f"(Level 1 → \"chapter\"; level 2 → \"section\"; level 3+ → "
+            f"\"subsection\".) Re-emit this section with `type` populated."
+        )
+
     return (
-        f'- Section "{title}" has type={bad!r}. Valid types are exactly: '
-        f"{valid}. Re-emit with the correct canonical type. Common "
-        f"mappings: \"subsubsection\" → \"subsection\", \"unit\" → "
-        f"\"chapter\" (if it's a top-level division) or \"section\" "
-        f"(if it's a chapter subdivision)."
+        f'- Section "{title}" has type={bad!r}. The `type` field must be '
+        f"EXACTLY one of these three lowercase values: "
+        f"\"chapter\" | \"section\" | \"subsection\". Nothing else is "
+        f"accepted. FORBIDDEN values include: \"subsubsection\", "
+        f"\"topic\", \"subtopic\", \"unit\", \"part\", \"sub-section\", "
+        f"\"sub_section\", \"lesson\", \"module\", \"Chapter\" "
+        f"(capitalised). Re-emit with the correct canonical type "
+        f"(level 1 → \"chapter\"; level 2 → \"section\"; level 3+ → "
+        f"\"subsection\")."
     )
 
 
@@ -209,23 +233,51 @@ def _fragment_missing_leaf_page(
 def _fragment_invalid_content_types(
     err: ValidationError, _total_pages: int | None
 ) -> str:
-    """INVALID_CONTENT_TYPES — content_types is malformed or uses unknown values."""
+    """INVALID_CONTENT_TYPES — content_types is malformed, missing, or
+    uses unknown/forbidden values."""
     title = err.section_title or "<unknown section>"
     value = err.context.get("value")
+
+    # Special-case: missing field (None) — most common production failure.
+    # Tie the fix to the section's title so Gemini gets a concrete answer.
+    if value is None:
+        bank_keywords = (
+            "thinking", "practice", "mcq", "exercise", "drill",
+            "problem", "questions", "question bank", "assessment",
+            "test", "review", "level", "workout",
+        )
+        t_lower = (title or "").lower()
+        is_bank = any(k in t_lower for k in bank_keywords)
+        suggested = "[\"questions\"]" if is_bank else "[\"theory\"]"
+        return (
+            f'- Section "{title}" is MISSING the `content_types` field entirely. '
+            f"This field is REQUIRED on every section node. "
+            f"Given the title \"{title}\", set `content_types`={suggested}. "
+            f"(Question-bank style titles like Classical Thinking / Critical "
+            f"Thinking / Practice Questions / MCQ Bank / Exercise / Drill "
+            f"get `[\"questions\"]`. Theory titles get `[\"theory\"]`.) "
+            f"Re-emit this section with `content_types` populated."
+        )
+
     return (
-        f'- Section "{title}" has content_types={value!r}. Valid '
-        f"content_types arrays (lowercase, order-independent):\n"
-        f"    [\"theory\"]\n"
-        f"    [\"questions\"]\n"
-        f"    [\"theory\", \"questions\"]   (mixed — preserve when "
-        f"both theory prose AND inline questions appear in same section)\n"
-        f"    [\"theory\", \"figures\"]\n"
-        f"    [\"questions\", \"figures\"]\n"
-        f"    [\"theory\", \"questions\", \"figures\"]\n"
-        f"Use only \"theory\", \"questions\", and optionally "
-        f"\"figures\". All lowercase. NEVER collapse Mixed "
-        f"[\"theory\", \"questions\"] to [\"theory\"] alone — "
-        f"the question pipeline needs to know about inline questions."
+        f'- Section "{title}" has content_types={value!r}, which is invalid. '
+        f"Valid content_types arrays (lowercase, exactly one of these four):\n"
+        f"    [\"theory\"]            — pure theory section\n"
+        f"    [\"questions\"]         — pure question / exercise / example container\n"
+        f"    [\"theory\", \"figures\"]   — theory section that is image-heavy\n"
+        f"    [\"questions\", \"figures\"] — question section with images\n\n"
+        f"FORBIDDEN combinations (these will be rejected):\n"
+        f"    [\"theory\", \"questions\"]   — mixed; a section is EITHER\n"
+        f"        theory OR questions in its own content_types. If a theory\n"
+        f"        section contains Cat A items (Examples, Exercises) inside,\n"
+        f"        the parent stays [\"theory\"] and Cat A children carry\n"
+        f"        their own [\"questions\"] separately.\n"
+        f"    [\"theory\", \"questions\", \"figures\"]  — also forbidden mixed.\n\n"
+        f"FORBIDDEN tokens: `question` (singular — use `questions`), "
+        f"`examples` / `solved_examples` / `worked_examples` (all → `questions`), "
+        f"`tables` / `table` (→ `figures`), `summary` / `activity` / `biography` / "
+        f"`fun_fact` / `learning_objectives` / `note` / `exercise` (→ canonical "
+        f"`theory` or `questions`). Use only the 3 canonical lowercase tokens."
     )
 
 
@@ -361,6 +413,39 @@ def build_corrective_prompt(
         if remaining else ""
     )
 
+    # Global contract reminder — repeated on every retry so Gemini sees
+    # the most-violated rules again, not just the specific fragments. Each
+    # corrective fix can otherwise introduce a NEW violation of a rule
+    # Gemini "forgot" between attempts; this re-anchors all 5 core rules.
+    global_reminder = (
+        "\n\n"
+        "## REMINDER — CRITICAL CONTRACT (must hold for EVERY section)\n\n"
+        "While fixing the errors above, ALSO re-verify EVERY section in "
+        "your output against these 5 rules. Do NOT introduce new "
+        "violations while fixing the listed ones:\n\n"
+        "1. EVERY section node has ALL these fields populated, NEVER "
+        "omit any: `id`, `title`, `level`, `type`, `content_types`, "
+        "`page_start`, `page_end`, `is_numbered`, "
+        "`expected_question_count`, `subsections`. This applies even to "
+        "bank-style sections like Classical Thinking, Critical Thinking, "
+        "MCQ Bank, Practice Questions, Exercises.\n\n"
+        "2. `type` is EXACTLY one of: `\"chapter\"` | `\"section\"` | "
+        "`\"subsection\"`. Nothing else.\n\n"
+        "3. `content_types` is a non-empty array, EXACTLY one of: "
+        "`[\"theory\"]`, `[\"questions\"]`, `[\"theory\",\"figures\"]`, "
+        "`[\"questions\",\"figures\"]`. NEVER `[\"theory\",\"questions\"]` "
+        "(mixed). NEVER `[\"theory\",\"questions\",\"figures\"]` "
+        "(mixed-with-figures). A section is EITHER theory OR questions "
+        "in its OWN content_types — never both. Cat A children carry "
+        "their own `[\"questions\"]` separately.\n\n"
+        "4. End-of-chapter named question banks (Exercises, Practice "
+        "Questions, Classical Thinking, Critical Thinking, MCQ Bank, "
+        "Unit Exercise) go in `excluded_sections` (FLAT top-level "
+        "array), NEVER in `sections` tree.\n\n"
+        "5. `document_title` at root is the verbatim chapter/document "
+        "title from the PDF, never empty.\n"
+    )
+
     correction_block = (
         "\n\n"
         "## YOUR PREVIOUS ATTEMPT HAD ERRORS — FIX THESE\n\n"
@@ -369,6 +454,7 @@ def build_corrective_prompt(
         f"fixes applied:\n\n"
         + "\n\n".join(fragments)
         + truncation_note
+        + global_reminder
         + "\n\n"
         "Keep all OTHER sections unchanged unless they have the same "
         "issue pattern. Output the corrected JSON only — no commentary."

@@ -13,6 +13,21 @@ You are an OCR + structural-tagging engine, NOT a content generator. An item exi
 
 A downstream verifier cross-checks your output against printed PDF text. Be precise.
 
+## §0.5 CRITICAL CONTRACT — VIOLATING ANY OF THESE INVALIDATES YOUR OUTPUT
+
+These are the most-violated rules. Read them, internalize them, recheck them before emitting.
+
+1. **EVERY section node MUST have these fields populated, NEVER omit any:**
+   `id`, `title`, `level`, `type`, `content_types`, `page_start`, `page_end`, `is_numbered`, `expected_question_count`, `subsections`. This applies to EVERY section including bank-style sections like "Classical Thinking", "Critical Thinking", "MCQ Bank", "Practice Questions", "Exercises".
+
+2. **`type` is EXACTLY one of these three lowercase values:** `"chapter"` | `"section"` | `"subsection"`. Nothing else. Not `"subsubsection"`, not `"topic"`, not `"unit"`, not `"part"`, not `"Chapter"` (capitalized).
+
+3. **`content_types` is a non-empty lowercase array using ONLY these tokens:** `"theory"`, `"questions"`, `"figures"`. Valid arrays are EXACTLY one of: `["theory"]`, `["questions"]`, `["theory","figures"]`, `["questions","figures"]`. NEVER emit `["theory","questions"]` (mixed) or `["theory","questions","figures"]` (mixed-with-figures). A section is EITHER theory OR questions in its own content_types — never both. Cat A children carry their own `["questions"]` separately.
+
+4. **End-of-chapter named question banks** ("Exercises", "Practice Questions", "Classical Thinking", "Critical Thinking", "MCQs", "MCQ Bank", "Unit Exercise", "Question Bank") go in `excluded_sections` (a FLAT top-level array), NEVER nested in the `sections` tree.
+
+5. **`document_title`** at the root MUST be the chapter/document title verbatim from the PDF — never paraphrased, never empty.
+
 ## §1. OUTPUT CONTRACT
 
 Return VALID JSON ONLY — no markdown fences, no prose before/after. Schema is the structural map; theory and question text are extracted by separate pipelines. Read EVERY page. Preserve PDF reading order (multi-column order from §6.0).
@@ -40,6 +55,50 @@ FORBIDDEN tokens (common errors): `question` (singular, use `questions`); `examp
 
 ### §2.5 Top-level fields (root of output)
 `document_title` MUST be the verbatim chapter / document title from the PDF — never paraphrased, never empty. `subject`, `grade_level`, `board` filled from print if visible, else `null`. `total_pages` = highest printed page number observed.
+
+### §2.6 Concrete BAD vs GOOD examples (read these — they match real failure patterns)
+
+❌ INVALID — missing `type` and `content_types` (the #1 multicolumn failure on dense MCQ-bank pages):
+```
+{"id": "classical-thinking", "title": "Classical Thinking",
+ "level": 2, "page_start": 1, "page_end": 3,
+ "is_numbered": false, "expected_question_count": 30, "subsections": []}
+```
+
+✅ VALID — same section with ALL required fields:
+```
+{"id": "classical-thinking", "title": "Classical Thinking",
+ "level": 2, "type": "subsection", "content_types": ["questions"],
+ "page_start": 1, "page_end": 3, "is_numbered": false,
+ "expected_question_count": 30, "subsections": []}
+```
+
+❌ INVALID — mixed content_types on chapter wrapper:
+```
+{"type": "chapter", "content_types": ["theory", "questions", "figures"]}
+```
+
+✅ VALID — chapter wrapper stays `["theory"]` even when all content is questions:
+```
+{"type": "chapter", "content_types": ["theory"], "subsections": [...]}
+```
+
+❌ INVALID — end-of-chapter MCQ bank nested in sections tree:
+```
+"sections": [{"type": "chapter", "subsections": [
+  {"type": "subsection", "title": "Practice Questions", "content_types": ["questions"]}
+]}]
+```
+
+✅ VALID — end-of-chapter bank moved to excluded_sections (flat top-level array):
+```
+"sections": [{"type": "chapter", "subsections": []}],
+"excluded_sections": [
+  {"title": "Practice Questions", "page_start": 18, "page_end": 19,
+   "reason": "End-of-chapter question bank spanning both columns",
+   "is_numbered": false, "expected_question_count": 24}
+]
+```
 
 ## §3. WHAT IS A SECTION (include in schema)
 
@@ -239,6 +298,14 @@ Fix: emit ONE Cat A wrapper using chapter/document title with `expected_question
 
 ### §10.3 Anti-placeholder guard
 NEVER emit empty chapter wrapper (`content_types=[]`, `expected_question_count=0`, `subsections=[]`, no real content) when ANY printed instructional content exists. If truly no structure identifiable, populate `extraction_notes` AND emit the §10.1 fallback wrapper.
+
+### §10.4 Pure question-bank books (JEE / NEET / MHT-CET / CET prep style — common in multicolumn)
+If the entire PDF is question content with NO theory paragraphs (only named MCQ banks, Practice Questions, Classical Thinking, Critical Thinking, etc.) — typical of dense 2-col or 3-col prep books:
+- Emit ONE chapter wrapper section, `type="chapter"`, `content_types=["theory"]` (chapter wrappers always carry `["theory"]` even when all children are question banks).
+- ALL named question banks ("Classical Thinking", "Critical Thinking", "Practice Questions", etc.) go into `excluded_sections` (the flat top-level array), NOT inside the chapter's `subsections`.
+- The chapter wrapper's `subsections` is `[]` in this case.
+- For each excluded bank, count questions across ALL columns (§7.7 — one bank, not one per column).
+- `document_title` = the printed chapter / document title verbatim.
 
 ## §11. QUESTION CENSUS (`expected_question_count`)
 
