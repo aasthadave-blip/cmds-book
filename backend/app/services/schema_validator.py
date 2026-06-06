@@ -68,17 +68,16 @@ _VALID_CONTENT_TYPE_VALUES = frozenset({
 })
 
 # Allowed COMBINATIONS (as frozensets — order-independent).
-# Mixed ("theory" + "questions") IS allowed — represents sections where
-# theory prose contains inline numbered questions/exercises. Today's
-# sanitizer collapses this to ["theory"] only; Rule 10 enforces preservation
-# once sanitizer is deleted Day 14.
+# Mixed ["theory", "questions"] is FORBIDDEN per v2 architecture
+# (prompts/v2/schema_architecture.txt §2.2): a section's content_types
+# describes its OWN direct content, NOT what nested children contain.
+# Parent stays ["theory"]; Cat A children carry ["questions"] separately.
+# Downstream extractor walks children and reads each child's own tag.
 _VALID_CONTENT_TYPE_COMBOS = frozenset({
     frozenset({"theory"}),
     frozenset({"questions"}),
-    frozenset({"theory", "questions"}),
     frozenset({"theory", "figures"}),
     frozenset({"questions", "figures"}),
-    frozenset({"theory", "questions", "figures"}),
 })
 
 # Rule 11 — standalone help-section titles that ALWAYS belong in

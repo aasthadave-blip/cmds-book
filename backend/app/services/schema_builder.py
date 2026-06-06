@@ -1,9 +1,10 @@
 """Schema Generator — Gemini 2.5 Pro for native PDF understanding.
 
 Uses the google-genai SDK (NOT the deprecated google-generativeai
-package). Routes to schema_gemini.txt (single-column) or
-schema_gemini_multicolumn.txt based on the upload-time is_multi_column
-flag.
+package). Routes to prompts/v2/schema_architecture.txt (single-column)
+or prompts/v2/schema_architecture_multicolumn.txt (multi-column) based
+on the upload-time is_multi_column flag AND auto-detection via
+pdf_layout_detector (see Day 12 wiring below).
 
 build_schema() is intentionally SYNCHRONOUS. The Celery worker thread
 (extract.py:analyse_book_task) runs without an event loop, so async
@@ -223,9 +224,9 @@ def build_schema(pdf_bytes: bytes, *, is_multi_column: bool = False) -> BookSche
     )
 
     prompt_name = (
-        "schema_gemini_multicolumn" if effective_multi_column else "schema_gemini"
+        "schema_architecture_multicolumn" if effective_multi_column else "schema_architecture"
     )
-    base_prompt = load_raw(prompt_name)
+    base_prompt = load_raw(prompt_name, version="v2")
 
     # Track the previous attempt's validation errors so the next
     # attempt's prompt can include corrective instructions.
