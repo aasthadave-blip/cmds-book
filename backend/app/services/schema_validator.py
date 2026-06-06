@@ -160,26 +160,32 @@ def _iter_all_sections(data: dict) -> Iterator[tuple[dict, list[str]]]:
     yield from walk(data.get("excluded_sections") or [], ["<excluded>"])
 
 
-def _iter_with_parent(data: dict) -> Iterator[tuple[dict, dict | None, list[dict]]]:
-    """Walk every section yielding (section, parent, siblings).
+def _iter_with_parent(
+    data: dict,
+) -> Iterator[tuple[dict, dict | None, list[dict], bool]]:
+    """Walk every section yielding (section, parent, siblings, is_excluded).
 
     `parent` is None for top-level sections (no parent in schema).
     `siblings` is the list this section is part of (so we can pair-check
     sibling overlaps). For top-level sections, siblings == data["sections"].
+    `is_excluded` is True iff the section is in `excluded_sections` (or any
+    nested subsections inside excluded). Used by the main loop to skip
+    rules that don't apply to ExcludedSection's schema (no type/content_types
+    fields).
 
     excluded_sections also yielded (with parent=None, siblings=data["excluded_sections"]).
     """
     sections = data.get("sections") or []
 
-    def walk(siblings, parent):
+    def walk(siblings, parent, is_excluded):
         for s in siblings or []:
             if not isinstance(s, dict):
                 continue
-            yield s, parent, siblings
-            yield from walk(s.get("subsections") or [], s)
+            yield s, parent, siblings, is_excluded
+            yield from walk(s.get("subsections") or [], s, is_excluded)
 
-    yield from walk(sections, None)
-    yield from walk(data.get("excluded_sections") or [], None)
+    yield from walk(sections, None, False)
+    yield from walk(data.get("excluded_sections") or [], None, True)
 
 
 def _check_non_integer_page(
@@ -1041,8 +1047,10 @@ def validate_schema(
     # re-check the same siblings once per section in that group.
     seen_sibling_lists: set[int] = set()
 
-    for section, parent, siblings in _iter_with_parent(data):
-        # Per-section rules (called for every section)
+    for section, parent, siblings, is_excluded in _iter_with_parent(data):
+        # Rules that apply to BOTH sections and excluded entries
+        # (excluded_sections have page_start, page_end, expected_question_count,
+        # subsections — these page-shape rules are universal).
         for err in _check_non_integer_page(section, []):
             (errors if err.severity == "error" else warnings).append(err)
         for err in _check_inverted_range(section, []):
@@ -1051,24 +1059,31 @@ def validate_schema(
             section, [], pdf_total_pages=pdf_total_pages
         ):
             (errors if err.severity == "error" else warnings).append(err)
-        # Day 4 — Q4-as-section
-        for err in _check_individual_question_as_section(section, []):
-            (errors if err.severity == "error" else warnings).append(err)
-        # Day 6 — parent containment
+        # Day 6 — parent containment (applies within excluded subsections too)
         for err in _check_page_outside_parent(section, parent):
-            (errors if err.severity == "error" else warnings).append(err)
-        # Day 6 — type enum
-        for err in _check_invalid_type(section, []):
             (errors if err.severity == "error" else warnings).append(err)
         # Day 6 — leaf page presence
         for err in _check_missing_leaf_page(section, []):
             (errors if err.severity == "error" else warnings).append(err)
-        # Day 7 — content_types vocabulary + Mixed preservation
-        for err in _check_invalid_content_types(section, []):
-            (errors if err.severity == "error" else warnings).append(err)
-        # Day 7 — Cat A at end belongs in excluded_sections
-        for err in _check_cat_a_at_end_not_excluded(section, parent, siblings):
-            (errors if err.severity == "error" else warnings).append(err)
+
+        # Rules that apply ONLY to sections (skipped for excluded entries
+        # because ExcludedSection schema doesn't have type/content_types,
+        # and Cat A-end-of-chapter / individual-Q-as-section rules are
+        # meaningless once the section is already in excluded_sections).
+        if not is_excluded:
+            # Day 4 — Q4-as-section (only applies to inline sections)
+            for err in _check_individual_question_as_section(section, []):
+                (errors if err.severity == "error" else warnings).append(err)
+            # Day 6 — type enum (only Section objects have `type` field)
+            for err in _check_invalid_type(section, []):
+                (errors if err.severity == "error" else warnings).append(err)
+            # Day 7 — content_types vocabulary (only Section objects)
+            for err in _check_invalid_content_types(section, []):
+                (errors if err.severity == "error" else warnings).append(err)
+            # Day 7 — Cat A at end belongs in excluded_sections (only
+            # applies to inline sections; if already excluded, can't fire)
+            for err in _check_cat_a_at_end_not_excluded(section, parent, siblings):
+                (errors if err.severity == "error" else warnings).append(err)
 
         # Sibling-pair rule: check ONCE per sibling list (not once per
         # section in the list).
