@@ -435,7 +435,7 @@ Note: §8.1 ends p8 and §8.2 starts p8 — shared-boundary case (§9.2), both h
 5. `page_end ≥ page_start` everywhere; both integers.
 6. Child page range fits within parent (§9.4). No coverage gaps within chapter (§9.5).
 7. Siblings may share boundary page (§9.2); real overlap forbidden.
-8. End-of-chapter Q-banks in `excluded_sections`, NOT `sections`.
+8. NAMED end-of-chapter Q-banks WITHOUT numbered prefix (Classical Thinking, Critical Thinking, Practice Questions, MCQ Bank, etc.) in `excluded_sections`, NOT `sections`. NUMBERED chapter sections (X.Y format like 4.1, 4.2) stay INLINE Cat A under chapter, even when they contain only questions (per §10.4).
 9. Index / Bibliography / Glossary / Appendix / Summary in `sections` as Cat B theory, NOT excluded.
 10. JSON valid: no trailing commas, balanced brackets, no markdown fences.
 11. (Multi-column) Reading order applied: left col → (middle col) → right col, top-to-bottom each. Spanning headings respected as parents.
