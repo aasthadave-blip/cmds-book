@@ -19,6 +19,8 @@ export type SchemaNode = {
   type?: 'chapter' | 'section' | 'subsection' | 'excluded';
   content_types?: string[];
   expected_question_count?: number;
+  page_start?: number;
+  page_end?: number;
   subsections?: SchemaNode[];
 };
 
@@ -26,6 +28,7 @@ type Schema = {
   document_title?: string;
   subject?: string;
   sections?: SchemaNode[];
+  excluded_sections?: SchemaNode[];
   [k: string]: unknown;
 };
 
@@ -75,9 +78,9 @@ export function SchemaViewerModal({ bookId, open, onClose, onSaved }: Props) {
     };
   }, [open, bookId]);
 
-  // Aggregate stats over the schema tree.
+  // Aggregate stats over the schema tree + excluded_sections array.
   const stats = useMemo(() => {
-    if (!schema?.sections) return { chapters: 0, theory: 0, questions: 0, excluded: 0 };
+    if (!schema) return { chapters: 0, theory: 0, questions: 0, excluded: 0 };
     let chapters = 0, theory = 0, questions = 0, excluded = 0;
     const walk = (nodes: SchemaNode[]) => {
       for (const n of nodes) {
@@ -89,7 +92,14 @@ export function SchemaViewerModal({ bookId, open, onClose, onSaved }: Props) {
         if (n.subsections?.length) walk(n.subsections);
       }
     };
-    walk(schema.sections);
+    const walkExcluded = (nodes: SchemaNode[]) => {
+      for (const n of nodes) {
+        excluded++;
+        if (n.subsections?.length) walkExcluded(n.subsections);
+      }
+    };
+    walk(schema.sections ?? []);
+    walkExcluded(schema.excluded_sections ?? []);
     return { chapters, theory, questions, excluded };
   }, [schema]);
 
@@ -274,12 +284,51 @@ export function SchemaViewerModal({ bookId, open, onClose, onSaved }: Props) {
               {error}
             </div>
           )}
-          {schema?.sections && (
+          {schema?.sections && schema.sections.length > 0 && (
             <SchemaTree
               nodes={schema.sections}
               editing={editing}
               onChange={updateNode}
             />
+          )}
+
+          {schema?.excluded_sections && schema.excluded_sections.length > 0 && (
+            <div style={{ marginTop: 22 }}>
+              <div
+                style={{
+                  display: 'flex',
+                  alignItems: 'center',
+                  gap: 10,
+                  padding: '8px 4px',
+                  borderTop: '1px solid var(--line)',
+                  marginTop: 10,
+                  marginBottom: 12,
+                }}
+              >
+                <Icon name="layers" size={14} />
+                <h4
+                  style={{
+                    margin: 0,
+                    fontSize: 13,
+                    fontWeight: 700,
+                    color: 'var(--ink-700)',
+                    letterSpacing: '-0.005em',
+                  }}
+                >
+                  Excluded sections
+                </h4>
+                <span style={{ fontSize: 11, color: 'var(--ink-500)' }}>
+                  ({stats.excluded} item{stats.excluded === 1 ? '' : 's'} — end-of-chapter question banks,
+                  hints, answer keys)
+                </span>
+              </div>
+              <SchemaTree
+                nodes={schema.excluded_sections}
+                editing={editing}
+                onChange={() => {/* excluded edits read-only for now */}}
+                forceExcluded
+              />
+            </div>
           )}
         </div>
 
@@ -327,12 +376,16 @@ function SchemaTree({
   onChange,
   path = [],
   depth = 0,
+  forceExcluded = false,
 }: {
   nodes: SchemaNode[];
   editing: boolean;
   onChange: (path: number[], patch: Partial<SchemaNode>) => void;
   path?: number[];
   depth?: number;
+  /** True when rendering the excluded_sections branch — show the
+   *  Excluded badge regardless of the node's own type/content_types. */
+  forceExcluded?: boolean;
 }) {
   return (
     <div>
@@ -344,6 +397,7 @@ function SchemaTree({
           onChange={(patch) => onChange([...path, i], patch)}
           path={[...path, i]}
           depth={depth}
+          forceExcluded={forceExcluded}
         >
           {n.subsections && n.subsections.length > 0 && (
             <SchemaTree
@@ -352,6 +406,7 @@ function SchemaTree({
               onChange={onChange}
               path={[...path, i]}
               depth={depth + 1}
+              forceExcluded={forceExcluded}
             />
           )}
         </SchemaRow>
@@ -365,6 +420,7 @@ function SchemaRow({
   editing,
   onChange,
   depth,
+  forceExcluded = false,
   children,
 }: {
   node: SchemaNode;
@@ -372,11 +428,12 @@ function SchemaRow({
   onChange: (patch: Partial<SchemaNode>) => void;
   path: number[];
   depth: number;
+  forceExcluded?: boolean;
   children?: React.ReactNode;
 }) {
   const indent = depth * 18;
   const ct = (node.content_types ?? []).map((c) => String(c).toLowerCase());
-  const isExcluded = node.type === 'excluded';
+  const isExcluded = forceExcluded || node.type === 'excluded';
   const hasTheory = ct.includes('theory');
   const hasQuestions = ct.includes('questions');
   const isMixed = hasTheory && hasQuestions;

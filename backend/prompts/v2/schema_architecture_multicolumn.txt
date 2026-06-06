@@ -264,8 +264,28 @@ Index, Bibliography, References, Glossary, Appendix A/B/C, Summary, Recap, Quick
 ### §8.3 Mixed-position Cat A rule
 A chapter can have BOTH inline Cat A AND end-of-chapter banks. Inline Cat A (between theory sections, BEFORE last theory heading) → nested under immediate parent in `sections`. End-of-chapter banks (AFTER last theory heading) → `excluded_sections`. Example: Exercise 1.1 inline (under §1.2) AND "Exercises" block at end → BOTH emitted, in different arrays.
 
-### §8.4 Excluded entry shape
-`title=verbatim`, `page_start`/`page_end`, `reason=short string`, `is_numbered=bool`, `expected_question_count=count`.
+### §8.4 Excluded entry shape (SUPPORTS NESTED SUBSECTIONS — same structure as inline sections)
+`title=verbatim`, `page_start`/`page_end`, `reason=short string`, `is_numbered=bool`, `expected_question_count=count`, `subsections=[]` (array, can contain nested ExcludedSection entries).
+
+**Excluded entries CAN and SHOULD have nested subsections when the bank itself has sub-categories.** Example: "Practice Questions" excluded bank with printed sub-categories ("Very Short Answer Type", "Short Answer Type", "MCQs", "Numerical Problems", "Assertion-Reason"):
+
+```
+{
+  "title": "Practice Questions",
+  "page_start": 18, "page_end": 25,
+  "reason": "End-of-chapter practice block",
+  "is_numbered": false,
+  "expected_question_count": 60,
+  "subsections": [
+    {"title": "Very Short Answer Type", "page_start": 18, "page_end": 19,
+     "is_numbered": false, "expected_question_count": 15, "subsections": []},
+    {"title": "MCQs", "page_start": 23, "page_end": 25,
+     "is_numbered": false, "expected_question_count": 25, "subsections": []}
+  ]
+}
+```
+
+Each subsection inside excluded entries uses ExcludedSection shape — NO `type`, NO `content_types`. Preserve printed sub-bank order. Parent's `expected_question_count` = sum of subsection counts. In multi-column layouts, count questions across all columns per §7.7.
 
 ## §9. PAGE RANGES
 
@@ -300,12 +320,39 @@ Fix: emit ONE Cat A wrapper using chapter/document title with `expected_question
 NEVER emit empty chapter wrapper (`content_types=[]`, `expected_question_count=0`, `subsections=[]`, no real content) when ANY printed instructional content exists. If truly no structure identifiable, populate `extraction_notes` AND emit the §10.1 fallback wrapper.
 
 ### §10.4 Pure question-bank books (JEE / NEET / MHT-CET / CET prep style — common in multicolumn)
-If the entire PDF is question content with NO theory paragraphs (only named MCQ banks, Practice Questions, Classical Thinking, Critical Thinking, etc.) — typical of dense 2-col or 3-col prep books:
-- Emit ONE chapter wrapper section, `type="chapter"`, `content_types=["theory"]` (chapter wrappers always carry `["theory"]` even when all children are question banks).
-- ALL named question banks ("Classical Thinking", "Critical Thinking", "Practice Questions", etc.) go into `excluded_sections` (the flat top-level array), NOT inside the chapter's `subsections`.
-- The chapter wrapper's `subsections` is `[]` in this case.
+Pure Q-bank books (dense 2-col or 3-col prep books) typically mix:
+(a) Numbered chapter sections (e.g. `4.1`, `4.2`, `4.3 Properties`) — real chapter sections with only questions
+(b) Named end-of-chapter banks ("Classical Thinking", "Critical Thinking", "Practice Questions") — assessment blocks
+
+Route DIFFERENTLY (NOT all to excluded):
+
+- **Numbered chapter sections with X.Y pattern** → INLINE Cat A under chapter wrapper. `type="section"`, `content_types=["questions"]`. Preserves chapter structure.
+
+- **Named end-of-chapter banks WITHOUT numbered prefix** → `excluded_sections` flat top-level array.
+
+- Chapter wrapper carries `type="chapter"`, `content_types=["theory"]` (always theory for wrappers).
+
+- If a named bank has sub-categories printed inside (e.g. Classical Thinking → Very Short Answer / MCQs), capture as nested subsections per §8.4.
+
 - For each excluded bank, count questions across ALL columns (§7.7 — one bank, not one per column).
+
 - `document_title` = the printed chapter / document title verbatim.
+
+**Example structure:**
+```
+sections: [
+  {chapter wrapper "Chapter 4 Definite Integration", subsections: [
+    {Cat B: "Chapter Outline"},
+    {Cat B: "Quick Review"},
+    {Cat A: "4.2 Evaluation by parts rule", expected_question_count: 7},
+    {Cat A: "4.3 Properties", expected_question_count: 19}
+  ]}
+]
+excluded_sections: [
+  {Classical Thinking, expected_question_count: 22, subsections: [sub-banks]},
+  {Critical Thinking, expected_question_count: 26, subsections: [sub-banks]}
+]
+```
 
 ## §11. QUESTION CENSUS (`expected_question_count`)
 
