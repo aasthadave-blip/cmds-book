@@ -320,39 +320,59 @@ Fix: emit ONE Cat A wrapper using chapter/document title with `expected_question
 NEVER emit empty chapter wrapper (`content_types=[]`, `expected_question_count=0`, `subsections=[]`, no real content) when ANY printed instructional content exists. If truly no structure identifiable, populate `extraction_notes` AND emit the §10.1 fallback wrapper.
 
 ### §10.4 Pure question-bank books (JEE / NEET / MHT-CET / CET prep style — common in multicolumn)
-Pure Q-bank books (dense 2-col or 3-col prep books) typically mix:
-(a) Numbered chapter sections (e.g. `4.1`, `4.2`, `4.3 Properties`) — real chapter sections with only questions
-(b) Named end-of-chapter banks ("Classical Thinking", "Critical Thinking", "Practice Questions") — assessment blocks
+Pure Q-bank books (dense 2-col or 3-col prep books) typically have:
+(a) Theory aids (Chapter Outline, Quick Review, Shortcuts) — Cat B inline
+(b) Numbered sections (`4.1`, `4.2`, `4.3 Properties`) — may appear at CHAPTER TOP-LEVEL OR as sub-headings INSIDE named banks
+(c) Named end-of-chapter banks ("Classical Thinking", "Critical Thinking", "Practice Questions") — assessment blocks
 
-Route DIFFERENTLY (NOT all to excluded):
+**Placement is determined by §6 (parent attribution = most recent heading before the item in reading order, accounting for column flow §6.0). DO NOT override §6 based on numbering format alone.**
 
-- **Numbered chapter sections with X.Y pattern** → INLINE Cat A under chapter wrapper. `type="section"`, `content_types=["questions"]`. Preserves chapter structure.
+Rules:
 
-- **Named end-of-chapter banks WITHOUT numbered prefix** → `excluded_sections` flat top-level array.
+- **Named end-of-chapter banks WITHOUT numbered prefix** → `excluded_sections` (FLAT top-level array).
 
-- Chapter wrapper carries `type="chapter"`, `content_types=["theory"]` (always theory for wrappers).
+- **Numbered sections (X.Y) → use §6 parent rule:**
+  - If X.Y's most recent preceding heading is the CHAPTER → INLINE Cat A under chapter wrapper.
+  - If X.Y's most recent preceding heading is a NAMED BANK → NESTED inside that bank's `excluded_sections` entry as an ExcludedSection subsection (no type, no content_types — §8.4 shape).
 
-- If a named bank has sub-categories printed inside (e.g. Classical Thinking → Very Short Answer / MCQs), capture as nested subsections per §8.4.
+- **CRITICAL — preserve PDF visual nesting.** If "4.2 Evaluation" appears UNDER "Classical Thinking" in the PDF (in column reading order), then 4.1, 4.2, 4.3 all stay NESTED inside Classical Thinking in excluded_sections. NEVER pull a numbered sub-heading out of its parent bank to inline.
 
-- For each excluded bank, count questions across ALL columns (§7.7 — one bank, not one per column).
+- Chapter wrapper: `type="chapter"`, `content_types=["theory"]` (always theory for wrappers).
 
-- `document_title` = the printed chapter / document title verbatim.
+- For each excluded bank (and its sub-banks), count questions across ALL columns (§7.7 — one bank, not one per column).
 
-**Example structure:**
+- `document_title` = printed chapter / document title verbatim.
+
+**Two example structures — same book type, different PDF layouts:**
+
+CASE A — Numbered sections at chapter top-level (siblings of named banks):
 ```
-sections: [
-  {chapter wrapper "Chapter 4 Definite Integration", subsections: [
-    {Cat B: "Chapter Outline"},
-    {Cat B: "Quick Review"},
-    {Cat A: "4.2 Evaluation by parts rule", expected_question_count: 7},
-    {Cat A: "4.3 Properties", expected_question_count: 19}
-  ]}
-]
+sections: [{chapter, subsections: [
+    {Cat B "Chapter Outline"}, {Cat B "Quick Review"},
+    {Cat A "4.2 Evaluation", eqc=7}, {Cat A "4.3 Properties", eqc=19}
+]}]
 excluded_sections: [
-  {Classical Thinking, expected_question_count: 22, subsections: [sub-banks]},
-  {Critical Thinking, expected_question_count: 26, subsections: [sub-banks]}
+    {Classical Thinking, eqc=22, subsections=[]},
+    {Critical Thinking, eqc=26, subsections=[]}
 ]
 ```
+
+CASE B — Numbered sections are sub-headings INSIDE named banks (the Indefinite Integrals case):
+```
+sections: [{chapter, subsections: [
+    {Cat B "Chapter Outline"}, {Cat B "Quick Review"}
+]}]
+excluded_sections: [
+    {Classical Thinking, eqc=48, subsections: [
+        {"4.1 Fundamental theorem", eqc=22, subsections=[]},
+        {"4.2 Evaluation", eqc=7, subsections=[]},
+        {"4.3 Properties", eqc=19, subsections=[]}
+    ]},
+    {Critical Thinking, eqc=26, subsections: [...]}
+]
+```
+
+The DIFFERENCE between Case A and Case B is decided by §6 (which heading precedes the numbered section in column reading order) — NOT by the numbering format itself.
 
 ## §11. QUESTION CENSUS (`expected_question_count`)
 
@@ -435,7 +455,7 @@ Note: §8.1 ends p8 and §8.2 starts p8 — shared-boundary case (§9.2), both h
 5. `page_end ≥ page_start` everywhere; both integers.
 6. Child page range fits within parent (§9.4). No coverage gaps within chapter (§9.5).
 7. Siblings may share boundary page (§9.2); real overlap forbidden.
-8. NAMED end-of-chapter Q-banks WITHOUT numbered prefix (Classical Thinking, Critical Thinking, Practice Questions, MCQ Bank, etc.) in `excluded_sections`, NOT `sections`. NUMBERED chapter sections (X.Y format like 4.1, 4.2) stay INLINE Cat A under chapter, even when they contain only questions (per §10.4).
+8. Named end-of-chapter Q-banks (Classical Thinking, Critical Thinking, Practice Questions, MCQ Bank, etc.) in `excluded_sections`. Numbered sections (X.Y) placed by §6 parent rule — INLINE if their preceding heading is the chapter; NESTED inside the bank's excluded entry if their preceding heading is a named bank. NEVER pull a numbered sub-heading out of its parent bank to inline (per §10.4 Case B).
 9. Index / Bibliography / Glossary / Appendix / Summary in `sections` as Cat B theory, NOT excluded.
 10. JSON valid: no trailing commas, balanced brackets, no markdown fences.
 11. (Multi-column) Reading order applied: left col → (middle col) → right col, top-to-bottom each. Spanning headings respected as parents.
