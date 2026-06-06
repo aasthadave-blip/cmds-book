@@ -516,8 +516,8 @@ def apply_page_corrections(
     For each correction, find the section by id and update its
     page_start. Returns the (potentially mutated) schema.
 
-    Only updates page_start; page_end is left alone — that's E1's job
-    (self-correction from extracted blocks).
+    Only updates page_start; page_end is corrected by the separate
+    cross_check_page_ends pass (Day 8 — pypdf-verified page_end).
     """
     by_id = {c.section_id: c for c in corrections if c.section_id}
     if not by_id:
@@ -532,6 +532,269 @@ def apply_page_corrections(
                 logger.info(
                     "schema cross-check: corrected '%s' page_start %s → %s",
                     c.section_title, old, c.actual_page_start,
+                )
+            _walk(s.subsections)
+
+    _walk(schema.sections)
+    return schema
+
+
+# ─── DAY 8 — page_end cross-check (pypdf-verified) ─────────────────
+
+
+@dataclass(frozen=True)
+class PageEndCorrection:
+    """Section's page_end claimed beyond where its successor actually starts."""
+
+    section_id: str | None
+    section_title: str
+    claimed_page_end: int
+    corrected_page_end: int
+    """Computed from where the NEXT heading actually appears in PDF text.
+    Shared-boundary aware: if next heading sits mid-page X, this section's
+    content can run to page X (corrected = X). If next heading sits at top
+    of page X, this section ends at page X-1 (corrected = X-1)."""
+    next_heading_title: str
+    """The heading used as the bound (next section in document order)."""
+
+
+# Fraction of page text length within which a heading is considered
+# "at top of page" (so the previous section ends at page-1, not page).
+# Page text from pypdf often begins with a running header / page number,
+# so 0.15 gives some grace for that prefix.
+_TOP_OF_PAGE_THRESHOLD = 0.15
+
+
+def _find_title_position_on_page(
+    title_norm: str, page_text_norm: str
+) -> int | None:
+    """Return character position where title_norm first appears on page text,
+    using the same word-boundary rule as _title_in_text. None if absent."""
+    if not title_norm or not page_text_norm:
+        return None
+    idx = page_text_norm.find(title_norm)
+    if idx < 0:
+        return None
+    before_ok = (idx == 0) or not page_text_norm[idx - 1].isalnum()
+    after_idx = idx + len(title_norm)
+    after_ok = (after_idx >= len(page_text_norm)) or not page_text_norm[after_idx].isalnum()
+    return idx if (before_ok and after_ok) else None
+
+
+def _next_bound_pairs(
+    schema: BookSchema,
+) -> list[tuple[SchemaSection, str]]:
+    """For each section, compute its NEXT-NON-DESCENDANT in document order.
+
+    A parent's page_end must cover all its descendants (per §9.4 child-
+    within-parent rule), so a CHILD cannot bound a parent's page_end.
+    The correct bound is the next section that is NOT a descendant of
+    the section being checked — typically its next sibling, or an
+    ancestor's next sibling, walking up the tree.
+
+    Pre-order DFS assigns each section a contiguous index range in the
+    flat list: [start, end_of_last_descendant]. The next-non-descendant
+    is at index (end + 1).
+
+    Returns: list of (section, next_heading_title) pairs. Sections whose
+    next-non-descendant cannot be determined (very last section in tree
+    with no excluded_sections fallback) are omitted.
+    """
+    flat: list[SchemaSection] = []
+    end_index_of: dict[int, int] = {}
+
+    def _walk(sections: list[SchemaSection]) -> None:
+        for s in sections:
+            flat.append(s)
+            start_after = len(flat) - 1
+            if s.subsections:
+                _walk(s.subsections)
+            end_index_of[id(s)] = len(flat) - 1
+            _ = start_after  # only kept for clarity
+
+    _walk(schema.sections)
+
+    pairs: list[tuple[SchemaSection, str]] = []
+    first_excluded_title = (
+        (schema.excluded_sections[0].title or "").strip()
+        if schema.excluded_sections else ""
+    )
+
+    for sec in flat:
+        end_idx = end_index_of.get(id(sec))
+        if end_idx is None:
+            continue
+        next_idx = end_idx + 1
+        if next_idx < len(flat):
+            next_title = (flat[next_idx].title or "").strip()
+        else:
+            # This section's subtree is the last in the sections tree —
+            # fall back to first excluded section as bound (typical:
+            # chapter ends, end-of-chapter banks follow).
+            next_title = first_excluded_title
+        if next_title:
+            pairs.append((sec, next_title))
+
+    return pairs
+
+
+def cross_check_page_ends(
+    pdf_bytes: bytes, schema: BookSchema
+) -> list[PageEndCorrection]:
+    """Verify every section's page_end against where the NEXT heading appears
+    in PDF text. Auto-correct (narrow only) when claimed page_end exceeds
+    the computed bound.
+
+    For each section A in document order (depth-first, pre-order across the
+    sections tree):
+      1. Identify B = next heading in document order (next section in flat
+         walk). If A is the last, also consider the first excluded_sections
+         entry's title as a bound — the chapter's question banks usually
+         follow theory and provide an end marker.
+      2. Locate B.title in PDF text via pypdf. Skip A if B's title is not
+         findable (phantom B / scanned PDF / duplicate match).
+      3. Determine B's position WITHIN its page:
+         - Position in first 15% of page text → B owns the top of that
+           page → A.page_end_bound = B.actual_page_start - 1
+         - Position later on the page → shared boundary (§9.2) → A may
+           have content on the same page → A.page_end_bound = B.actual_page_start
+      4. If A.page_end > A.page_end_bound → emit a PageEndCorrection
+         (narrowing only — never extend).
+
+    Skipped for scanned PDFs (pypdf returns empty text).
+    Skipped for the very last section in document order (no successor to
+    bound against).
+    Skipped when A.page_end is already None / invalid (different rule
+    catches that).
+
+    Pure function — no DB I/O.
+    """
+    per_page = _extract_per_page_text(pdf_bytes)
+    if not per_page:
+        logger.info(
+            "schema cross-check: pypdf returned no text — page_end check skipped"
+        )
+        return []
+
+    per_page_norm = {p: _normalize_for_match(t) for p, t in per_page.items()}
+    pairs = _next_bound_pairs(schema)
+    if not pairs:
+        return []
+
+    out: list[PageEndCorrection] = []
+    for sec, next_title in pairs:
+        # Must have a valid integer page_end to bound
+        pe = sec.page_end
+        if not isinstance(pe, int) or pe < 1:
+            continue
+
+        title_norm = _normalize_for_match(next_title)
+        if not title_norm:
+            continue
+
+        # Find all pages where next_title appears at or after this
+        # section's page_start (the next heading can't logically appear
+        # before this section began).
+        ps_floor = sec.page_start if isinstance(sec.page_start, int) else 1
+        candidate_pages: list[int] = []
+        for p in sorted(per_page_norm):
+            if p < ps_floor:
+                continue
+            if _title_in_text(title_norm, per_page_norm[p]):
+                candidate_pages.append(p)
+
+        if not candidate_pages:
+            # Next heading not findable in PDF text — can't bound this
+            # section's page_end (B may be a phantom or text was sliced
+            # out). Leave alone.
+            continue
+
+        # When next_title appears multiple times (e.g. generic words like
+        # "Activities", "Summary", "Solutions", or running-header
+        # echoes), prefer the candidate CLOSEST to this section's claimed
+        # page_end. That's our best bet for "the actual next heading"
+        # rather than an in-section duplicate or running header.
+        next_actual_page = min(
+            candidate_pages,
+            key=lambda p: abs(p - pe),
+        )
+
+        # Determine position of next_title within its page text
+        page_text = per_page_norm[next_actual_page]
+        pos = _find_title_position_on_page(title_norm, page_text) or 0
+        position_fraction = (pos / max(1, len(page_text))) if page_text else 1.0
+
+        if position_fraction <= _TOP_OF_PAGE_THRESHOLD:
+            # Next heading sits at top of page → it owns the page →
+            # this section ends one page earlier.
+            bound = next_actual_page - 1
+        else:
+            # Shared boundary — both A's tail content and B's heading
+            # share the same page. A can run to (but no further than)
+            # next_actual_page.
+            bound = next_actual_page
+
+        # Only emit a correction when narrowing (never extend).
+        # Skip degenerate cases: bound below this section's page_start
+        # would invert the range — leave for validator/retry instead.
+        if not (pe > bound and bound >= (sec.page_start or 1)):
+            continue
+
+        # Sanity guard: refuse over-aggressive corrections that would
+        # shrink the section's claimed length by more than 50%.
+        # Real-world cause: ambiguous generic title (e.g. "Activities")
+        # appearing inside the section as an inline heading too — the
+        # nearest-to-page_end heuristic above mitigates this, but as a
+        # belt-and-braces check, require the correction to keep at
+        # least half of the original claimed length.
+        ps = sec.page_start if isinstance(sec.page_start, int) else 1
+        original_length = max(1, pe - ps + 1)
+        new_length = max(0, bound - ps + 1)
+        if new_length * 2 < original_length:
+            # Too drastic — most likely a wrong-match. Skip.
+            logger.info(
+                "schema page_end check: skipping risky correction for "
+                "'%s' (claimed %d→%d via '%s' would cut from %d to %d pages)",
+                sec.title, pe, bound, next_title, original_length, new_length,
+            )
+            continue
+
+        out.append(PageEndCorrection(
+            section_id=sec.id,
+            section_title=(sec.title or ""),
+            claimed_page_end=pe,
+            corrected_page_end=bound,
+            next_heading_title=next_title,
+        ))
+
+    return out
+
+
+def apply_page_end_corrections(
+    schema: BookSchema, corrections: list[PageEndCorrection]
+) -> BookSchema:
+    """Apply page_end corrections from cross_check_page_ends to schema.
+
+    Find each section by id and narrow its page_end. Returns the
+    (potentially mutated) schema. Never extends page_end — corrections
+    are always narrowing per the function's guarantees.
+    """
+    by_id = {c.section_id: c for c in corrections if c.section_id}
+    if not by_id:
+        return schema
+
+    def _walk(sections: list[SchemaSection]) -> None:
+        for s in sections:
+            c = by_id.get(s.id)
+            if c is not None:
+                old = s.page_end
+                s.page_end = c.corrected_page_end
+                logger.info(
+                    "schema cross-check: corrected '%s' page_end %s → %s "
+                    "(next heading '%s' starts page %s)",
+                    c.section_title, old, c.corrected_page_end,
+                    c.next_heading_title,
+                    (c.corrected_page_end + 1) if old > c.corrected_page_end else c.corrected_page_end,
                 )
             _walk(s.subsections)
 

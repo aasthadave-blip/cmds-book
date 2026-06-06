@@ -322,6 +322,29 @@ def build_schema(pdf_bytes: bytes, *, is_multi_column: bool = False) -> BookSche
             except Exception as e:
                 logger.warning("schema cross-check failed (continuing): %s", e)
 
+            # SCHEMA Day 8 — Pass 3: cross_check_page_ends.
+            # For each section in document order, verify its claimed
+            # page_end against where the NEXT heading actually appears
+            # in PDF text (via pypdf). Auto-correct (narrow only) when
+            # Gemini over-reported page_end. Shared-boundary aware: if
+            # next heading sits mid-page, this section's page_end can
+            # legitimately equal that page. Skipped for scanned PDFs.
+            try:
+                from app.services.schema_postpass import (
+                    cross_check_page_ends, apply_page_end_corrections,
+                )
+                end_corrections = cross_check_page_ends(pdf_bytes, schema)
+                if end_corrections:
+                    logger.info(
+                        "schema page_end cross-check: %d correction(s)",
+                        len(end_corrections),
+                    )
+                    schema = apply_page_end_corrections(schema, end_corrections)
+                else:
+                    logger.info("schema page_end cross-check: all clean")
+            except Exception as e:
+                logger.warning("schema page_end cross-check failed (continuing): %s", e)
+
             return schema
         except Exception as e:
             last_err = e
