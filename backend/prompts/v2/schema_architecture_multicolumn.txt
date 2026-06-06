@@ -149,6 +149,8 @@ Activity Steps ("Step 1", "Step 2", "Step 3") → inline content of the Activity
 ### §4.5 Page furniture (NEVER captured)
 Page headers / running banners (e.g. "Chapter 8: Cell" repeated atop every page → ONE chapter entry, not nineteen). Page numbers, footnotes, margin annotations, column footers (shared below all columns). Cross-references mid-paragraph like "see Section 5.2", "(refer to 8.1.3)" → inline mentions, NOT new sections.
 
+Front-matter and back-matter housekeeping pages — copyright, ISBN, publisher info, author/editor bios, edition/printing info, dedication, foreword (when purely ceremonial), acknowledgements, errata-corrigenda lists, blank pages → DO NOT emit as sections. Note the page range briefly in `extraction_notes` (e.g. "pages 1-3 are publisher/copyright; chapter content starts page 4"). If foreword/preface contains real teaching prose, treat it as theory (§3.5) instead.
+
 ### §4.6 MCQ options
 `(A)`, `(B)`, `(C)`, `(D)` or `(1)`, `(2)`, `(3)`, `(4)` IMMEDIATELY following a question stem are answer options — NEVER sections. In multi-column layouts options may sit beside the stem (same column or adjacent) — still options.
 
@@ -234,10 +236,13 @@ Column reading order: LEFT column first (EXAMPLE 3.2, 3.3) — these come BEFORE
 ### §7.2 Fallback for unmatched labels
 Asks reader to do/solve/answer → Cat A. Worked walk-through, multi-step aid, biographical → Cat B. One-line aside / fact / decorative callout → Cat C. Use printed wording verbatim as `title`.
 
-### §7.3 In-text Questions tiebreaker
-- Box with multi-sentence teaching explanations alongside Qs → Cat B `["theory"]`.
-- Box with heading naming it + numbered Qs only → Cat A `["questions"]`.
-- Box with NO heading + only numbered Qs → use §10 headerless fallback (NEVER excluded).
+### §7.3 In-text Questions routing
+Any box that contains numbered questions is Cat A `["questions"]` — ALWAYS — regardless of whether solutions, step-by-step explanations, or multi-sentence answer prose appear alongside. Solution material printed next to questions is attached to those questions (captured downstream as solution body of the Cat A entry), NOT a reason to reclassify the box as theory.
+
+- Box with heading naming it + numbered Qs → Cat A `["questions"]` section (e.g. "In-text Questions", "Worked Solutions", "Solved Examples", "Try Yourself").
+- Box with NO heading + only numbered Qs → §10 headerless fallback (NEVER excluded).
+
+The §8.1 "Hints / Solutions / Answer Keys → excluded" rule applies ONLY to STANDALONE solution / answer dumps with no live questions present (typically at chapter end, separate from the question banks they answer). When solutions appear alongside their own questions in the same box, the whole thing is Cat A.
 
 ### §7.4 Biographical sidebars (Scientific Crypt, About <Person>)
 SINGLE LEAF Cat B section. Heading + subtitle like `A Tribute to <Name> (<years>)` — subtitle is BODY, NOT a nested subsection. Schema: ONE node, `type="subsection"`, `content_types=["theory"]`, `subsections=[]`.
@@ -286,6 +291,8 @@ A chapter can have BOTH inline Cat A AND end-of-chapter banks. Inline Cat A (bet
 ```
 
 Each subsection inside excluded entries uses ExcludedSection shape — NO `type`, NO `content_types`. Preserve printed sub-bank order. Parent's `expected_question_count` = sum of subsection counts. In multi-column layouts, count questions across all columns per §7.7.
+
+**Nesting depth is UNLIMITED.** Excluded entries can have N levels of nested subsections if the PDF shows them. Example chain: `Practice Questions → Section A → 4.1 → MCQs → individual questions printed below`. Each level uses the ExcludedSection shape (no type, no content_types) and has its own `subsections` array. Preserve every printed level — do NOT flatten or collapse. At every level, parent's `expected_question_count` ≥ sum of children's counts.
 
 ## §9. PAGE RANGES
 
@@ -401,6 +408,9 @@ Use section number as id, no "Chapter" prefix: Chapter 8 → `"8"`; Section 8.4.
 ### §13.3 Uniqueness
 IDs MUST be unique across entire document. If a slug could collide, prefix with parent id: `"8.4-didyouknow"`.
 
+### §13.4 Duplicate-named sections
+If the SAME heading appears multiple times in the PDF (e.g. "Quick Recap" at both chapter start AND chapter end; "Activity 1" appearing 3 times across a lab manual; "Try It" repeating in every section), each instance is its OWN section with distinct page ranges — NEVER merged into one. Use contextual suffixes to keep ids unique: `quick-recap-intro` and `quick-recap-summary`; `activity-1-experiment` / `activity-1-observation` / `activity-1-conclusion`; `try-it-3.1` / `try-it-3.2`. Preserve their print order in the parent's `subsections` array (per §12). Per-instance ids must remain unique across the entire document.
+
 ## §14. OUTPUT JSON SHAPE (DO NOT emit `uuid` — code assigns it)
 
 ```json
@@ -457,8 +467,9 @@ Note: §8.1 ends p8 and §8.2 starts p8 — shared-boundary case (§9.2), both h
 7. Siblings may share boundary page (§9.2); real overlap forbidden.
 8. Named end-of-chapter Q-banks (Classical Thinking, Critical Thinking, Practice Questions, MCQ Bank, etc.) in `excluded_sections`. Numbered sections (X.Y) placed by §6 parent rule — INLINE if their preceding heading is the chapter; NESTED inside the bank's excluded entry if their preceding heading is a named bank. NEVER pull a numbered sub-heading out of its parent bank to inline (per §10.4 Case B).
 9. Index / Bibliography / Glossary / Appendix / Summary in `sections` as Cat B theory, NOT excluded.
-10. JSON valid: no trailing commas, balanced brackets, no markdown fences.
-11. (Multi-column) Reading order applied: left col → (middle col) → right col, top-to-bottom each. Spanning headings respected as parents.
-12. (Multi-column) Question banks crossing columns counted as ONE bank with combined `expected_question_count`.
+10. Question count consistency: at every level (inline sections AND excluded entries), if a node has subsections that count questions, parent's `expected_question_count` ≥ sum of subsections' counts. Parent's count CAN be higher (when parent has questions printed directly under it but not under any subsection). Parent's count must NEVER be less than the sum.
+11. JSON valid: no trailing commas, balanced brackets, no markdown fences.
+12. (Multi-column) Reading order applied: left col → (middle col) → right col, top-to-bottom each. Spanning headings respected as parents.
+13. (Multi-column) Question banks crossing columns counted as ONE bank with combined `expected_question_count`.
 
 Return only the JSON.
