@@ -202,14 +202,53 @@ def _dispatch_theory(session, book: Book) -> None:
 
 
 def _dispatch_questions(session, book: Book) -> None:
+    """Dispatch the questions worker.
+
+    The questions worker takes 3 args: (book_id, bank_id, job_id). We
+    have to create a QuestionBank row first — this mirrors the
+    /question-banks API endpoint's pattern (see api/question_banks.py).
+
+    Prior pending/extracting banks for this book are marked failed
+    ("Superseded") so the bank list stays clean across retries.
+    """
+    from app.models.question_bank import QuestionBank
+
+    # Supersede any prior pending/extracting banks (orphans from
+    # earlier retries that never finished).
+    session.execute(
+        sa.update(QuestionBank)
+        .where(QuestionBank.book_id == book.id)
+        .where(QuestionBank.status.in_(["pending", "extracting"]))
+        .values(
+            status="failed",
+            last_error="Superseded by orchestrator re-dispatch",
+        )
+    )
+
+    # Create the new QuestionBank row the worker writes into.
+    bank = QuestionBank(
+        book_id=book.id,
+        title=book.title,
+        subject=book.subject,
+        status="pending",
+    )
+    session.add(bank)
+    session.flush()
+    bank_id = bank.id
+
     job_id = _new_job(session, book.id, "extract_questions")
     book.status = "extracting"
     session.commit()
+
     from app.workers.runner import dispatch
-    dispatch("extract_questions_v3", str(book.id), str(job_id))
+    dispatch(
+        "extract_questions_v3",
+        str(book.id), str(bank_id), str(job_id),
+    )
     logger.info(
-        "orchestrator: dispatched extract_questions_v3 for book=%s job=%s",
-        book.id, job_id,
+        "orchestrator: dispatched extract_questions_v3 for book=%s "
+        "bank=%s job=%s",
+        book.id, bank_id, job_id,
     )
 
 
