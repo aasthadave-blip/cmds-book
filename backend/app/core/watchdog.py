@@ -36,6 +36,12 @@ CHECK_INTERVAL_S = 60
 # 30+ missed heartbeats — a confident "this is stuck", not a slow call.
 STALE_AFTER_S = 300
 
+# ORCH Day 11 — how long to wait before force-releasing an
+# extraction_lock_at. Matches MAX orchestrator lock timeout
+# (workers/orchestrator.py:LOCK_TIMEOUT_MIN). 5 min after watchdog
+# kills stale Jobs, so Job cleanup happens first, then locks release.
+ORCH_LOCK_TIMEOUT_MIN = 10
+
 
 _engine = create_engine(settings.SYNC_DATABASE_URL, pool_pre_ping=True)
 _WatchdogSession = sessionmaker(bind=_engine, class_=Session, autoflush=False)
@@ -122,6 +128,49 @@ def _scan_once() -> int:
                     killed += 1
             book.status = derive_book_status(book)
             session.commit()
+
+        # ORCH Day 11 — force-release stale orchestrator locks.
+        # The coordinator normally holds extraction_lock_at only during
+        # its own execution and releases it in a finally block. If the
+        # coordinator process is killed before reaching finally (OOM,
+        # container restart, SIGKILL), the lock stays set and the book
+        # is stuck — the next dispatch sees the lock held and exits.
+        # Force-release locks older than this threshold and re-dispatch
+        # the coordinator so the state machine can advance.
+        lock_cutoff = datetime.now(timezone.utc) - timedelta(
+            minutes=ORCH_LOCK_TIMEOUT_MIN,
+        )
+        stale_locked = session.execute(
+            select(Book).where(
+                Book.extraction_lock_at.is_not(None),
+                Book.extraction_lock_at < lock_cutoff,
+            )
+        ).scalars().all()
+        for book in stale_locked:
+            ref = book.extraction_lock_at
+            if ref is not None and ref.tzinfo is None:
+                ref = ref.replace(tzinfo=timezone.utc)
+            age_s = int((datetime.now(timezone.utc) - ref).total_seconds()) if ref else -1
+            logger.warning(
+                "watchdog: force-releasing stale orchestrator lock "
+                "(book=%s, age=%ss, threshold=%dmin) + re-dispatching "
+                "coordinator",
+                book.id, age_s, ORCH_LOCK_TIMEOUT_MIN,
+            )
+            book.extraction_lock_at = None
+            session.commit()
+            # Re-fire the coordinator so the state machine moves forward.
+            # Idempotent — the coordinator will re-acquire the lock,
+            # check current state, and either dispatch or no-op.
+            try:
+                from app.workers.runner import dispatch
+                dispatch("coordinate_extraction", str(book.id))
+            except Exception as e:
+                logger.warning(
+                    "watchdog: coordinator re-dispatch failed for book=%s: %s",
+                    book.id, e,
+                )
+            killed += 1
     return killed
 
 
