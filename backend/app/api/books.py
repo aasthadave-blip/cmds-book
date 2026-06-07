@@ -423,26 +423,49 @@ async def approve_schema(
     book_id: UUID,
     session: AsyncSession = Depends(get_session),
 ) -> BookUploadResponse:
-    """Approve the schema and kick off the full extraction pipeline."""
+    """Approve the schema and kick off extraction via the orchestrator.
+
+    ORCH Day 8 — was: directly dispatched extract_book and created a
+    Job for it; now: dispatches the post-schema coordinator, which
+    decides what to run next based on current book state. The
+    coordinator is idempotent — if analyse_book already fired it
+    (Day 3), this second call either no-ops (theory already running)
+    or advances the state machine. Race-free either way.
+
+    Backward-compat: frontend still receives {book_id, job_id, status}
+    so polling continues to work. The Job row is logged as
+    "succeeded" because the approval action itself is just a routing
+    decision — the actual extraction Jobs are created by the
+    coordinator per worker it dispatches.
+    """
     book = await session.get(Book, book_id)
     if book is None:
         raise HTTPException(404, detail="Book not found")
     if not book.schema:
         raise HTTPException(400, detail="Book has no schema — run /analyse first")
 
-    job = Job(book_id=book.id, type="extract", status="queued", progress=0)
+    # Approval marker Job — completes immediately. The actual extraction
+    # Jobs are created by the orchestrator's dispatcher functions.
+    job = Job(
+        book_id=book.id,
+        type="extract",
+        status="succeeded",
+        progress=100,
+        message="Approval routed to orchestrator",
+    )
     session.add(job)
     await session.flush()
 
     book.status = "extracting"
-
-    # Commit before dispatch so worker thread sees the new Job row.
     await session.commit()
 
-    import app.workers.extract  # noqa: F401
+    import app.workers.orchestrator  # noqa: F401 — ensure inline registration
     from app.workers.runner import dispatch
 
-    dispatch("extract_book", str(book.id), str(job.id))
+    # Idempotent — coordinator's lock + state machine handle the case
+    # where analyse_book_task already dispatched the coordinator on
+    # schema completion.
+    dispatch("coordinate_extraction", str(book.id))
     return BookUploadResponse(book_id=book.id, job_id=job.id, status="extracting")
 
 
