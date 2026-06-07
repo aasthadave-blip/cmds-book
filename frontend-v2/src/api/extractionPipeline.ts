@@ -669,32 +669,81 @@ export function useExtractionPipeline(): UseExtractionPipeline {
         },
       );
 
-      // If theory has no jobId but is marked 'running' (e.g. attached to a
-      // pre-existing backend worker), poll the BOOK to detect terminal
-      // transition. book.status flips to 'ready' or 'failed' when the
-      // worker finishes.
+      // ORCH Day 12.5 — sync per-stage status from book whenever any
+      // stage still has no jobId. Backend orchestrator (Days 1-12)
+      // creates jobs for Q+Fig WITHOUT going through the frontend, so
+      // the frontend never gets those job IDs. We use book.<stage>_status
+      // (now exposed by BookOut after Day 12.5) as the source of truth.
       const needsBookPoll =
-        s.theory.status === 'running' && !s.theory.jobId && s.bookId;
+        s.bookId && (
+          // legacy case — theory running with no jobId (attached to backend run)
+          (s.theory.status === 'running' && !s.theory.jobId) ||
+          // ORCH 12.5 — Q or Fig without a job ID means backend dispatched
+          // them and we need to discover their state from book.<stage>_status
+          (!s.questions.jobId && s.questions.status !== 'done' && s.questions.status !== 'failed') ||
+          (!s.figures.jobId && s.figures.status !== 'done' && s.figures.status !== 'failed')
+        );
       if (needsBookPoll) {
         try {
           const book = await getBook(s.bookId!);
-          if (book.status === 'ready' || book.status === 'extracted') {
-            apply((prev) => ({
-              theory: { ...prev.theory, status: 'done', progress: 100 },
-              bookStatus: book.status,
-            }));
-          } else if (book.status === 'failed') {
-            apply((prev) => ({
-              theory: {
+          // Map backend per-stage status string → frontend JobStatus
+          // (running/done/failed/queued/unknown). Same logic as
+          // normalizeStatus but for the per-stage fields.
+          const mapStage = (raw: string | undefined | null): JobStatus => {
+            if (!raw) return 'unknown';
+            if (raw === 'done' || raw === 'partial') return 'done';
+            if (raw === 'failed') return 'failed';
+            if (raw === 'running' || raw === 'extracting') return 'running';
+            if (raw === 'pending' || raw === 'queued') return 'queued';
+            return 'unknown';
+          };
+          const bk = book as BackendBookOut & {
+            theory_status?: string;
+            questions_status?: string;
+            figures_status?: string;
+          };
+
+          apply((prev) => {
+            const patch: Partial<ExtractionState> = { bookStatus: book.status };
+            // Theory — keep existing job-poll behavior for backwards
+            // compat (legacy attached-run case). When mapped status is
+            // terminal, force the theory stage forward too.
+            const tStatus = mapStage(bk.theory_status);
+            if (tStatus === 'done' && prev.theory.status !== 'done') {
+              patch.theory = { ...prev.theory, status: 'done', progress: 100 };
+            } else if (tStatus === 'failed' && prev.theory.status !== 'failed') {
+              patch.theory = {
                 ...prev.theory,
                 status: 'failed',
-                error: 'Theory worker failed (book.status=failed)',
-              },
-              bookStatus: book.status,
-            }));
-          } else {
-            apply(() => ({ bookStatus: book.status }));
-          }
+                error: 'Theory worker failed',
+              };
+            }
+            // Questions — driven entirely by book.questions_status now
+            // (backend creates the bank + job; we have no jobId).
+            const qStatus = mapStage(bk.questions_status);
+            if (!prev.questions.jobId) {
+              if (qStatus === 'done') {
+                patch.questions = { ...prev.questions, status: 'done', progress: 100, message: 'Questions extracted' };
+              } else if (qStatus === 'failed') {
+                patch.questions = { ...prev.questions, status: 'failed', error: 'Questions extraction failed' };
+              } else if (qStatus === 'running') {
+                patch.questions = { ...prev.questions, status: 'running', message: 'Extracting questions...', lastProgressAt: Date.now() };
+              }
+              // 'queued' / 'unknown' → leave alone, keeps "waiting for theory" placeholder.
+            }
+            // Figures — same pattern.
+            const fStatus = mapStage(bk.figures_status);
+            if (!prev.figures.jobId) {
+              if (fStatus === 'done') {
+                patch.figures = { ...prev.figures, status: 'done', progress: 100, message: 'Figures extracted' };
+              } else if (fStatus === 'failed') {
+                patch.figures = { ...prev.figures, status: 'failed', error: 'Figures extraction failed' };
+              } else if (fStatus === 'running') {
+                patch.figures = { ...prev.figures, status: 'running', message: 'Extracting figures...', lastProgressAt: Date.now() };
+              }
+            }
+            return patch;
+          });
         } catch (e) {
           dbg('book poll failed', e);
         }
