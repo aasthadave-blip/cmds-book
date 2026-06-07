@@ -554,6 +554,144 @@ async def re_extract_book(
     return BookUploadResponse(book_id=book.id, job_id=job.id, status="extracting")
 
 
+# ─── Day 10 — Per-stage retry endpoints ─────────────────────────────
+#
+# When ONE extraction stage fails (e.g. figures only), these endpoints
+# retry just that stage without wiping the others. Section data from
+# successful stages is preserved. The coordinator's lock + state
+# machine deduplicate against any concurrent dispatch.
+
+
+async def _dispatch_stage_retry(
+    book: Book,
+    stage: str,
+    session: AsyncSession,
+) -> BookUploadResponse:
+    """Reset a single stage to pending + clear orchestrator state for it,
+    then route through the coordinator. Shared helper for the 3 stage
+    retry endpoints below.
+
+    `stage` is one of 'theory', 'questions', 'figures'.
+
+    Caller has already validated the book exists, has a schema, and
+    that the given stage is in 'failed' state.
+    """
+    # Reset just this stage
+    if stage == "theory":
+        book.theory_status = "pending"
+        book.theory_retries = 0
+        book.theory_finalized_at = None
+    elif stage == "questions":
+        book.questions_status = "pending"
+        book.questions_retries = 0
+    elif stage == "figures":
+        book.figures_status = "pending"
+        book.figures_retries = 0
+    else:  # pragma: no cover — kept for completeness
+        raise ValueError(f"unknown stage: {stage!r}")
+
+    # Force-release any stale lock so the coordinator can step the
+    # state machine. Watchdog should have done this already after
+    # 10 min, but the user-initiated retry shouldn't have to wait.
+    book.extraction_lock_at = None
+    book.status = "extracting"
+
+    # Approval-marker Job (same pattern as /approve and /re-extract).
+    job = Job(
+        book_id=book.id, type=f"retry_{stage}",
+        status="succeeded", progress=100,
+        message=f"Retry {stage} routed to orchestrator",
+    )
+    session.add(job)
+    await session.flush()
+    await session.commit()
+
+    import app.workers.orchestrator  # noqa: F401 — ensure inline registration
+    from app.workers.runner import dispatch
+
+    dispatch("coordinate_extraction", str(book.id))
+    return BookUploadResponse(book_id=book.id, job_id=job.id, status="extracting")
+
+
+async def _retry_stage_endpoint(
+    book_id: UUID,
+    stage: str,
+    session: AsyncSession,
+) -> BookUploadResponse:
+    """Shared validation + dispatch path for the 3 stage retry endpoints."""
+    book = await session.get(Book, book_id)
+    if book is None:
+        raise HTTPException(404, detail="Book not found")
+    if not book.schema:
+        raise HTTPException(400, detail="Book has no schema — run /analyse first")
+
+    current = getattr(book, f"{stage}_status", None)
+    if current != "failed":
+        raise HTTPException(
+            status.HTTP_409_CONFLICT,
+            detail=(
+                f"{stage}_status is {current!r}, not 'failed' — nothing "
+                f"to retry. Use /re-extract for a full reset."
+            ),
+        )
+
+    return await _dispatch_stage_retry(book, stage, session)
+
+
+@router.post(
+    "/{book_id}/retry-theory",
+    response_model=BookUploadResponse,
+    dependencies=[Depends(extraction_limit)],
+)
+async def retry_theory(
+    book_id: UUID,
+    session: AsyncSession = Depends(get_session),
+) -> BookUploadResponse:
+    """Retry just theory extraction, preserving questions + figures data.
+
+    409 if theory_status is not 'failed'. Resets theory_status, clears
+    theory_finalized_at, zeros theory_retries (so auto-retry budget is
+    fresh), then dispatches the coordinator.
+    """
+    return await _retry_stage_endpoint(book_id, "theory", session)
+
+
+@router.post(
+    "/{book_id}/retry-questions",
+    response_model=BookUploadResponse,
+    dependencies=[Depends(extraction_limit)],
+)
+async def retry_questions(
+    book_id: UUID,
+    session: AsyncSession = Depends(get_session),
+) -> BookUploadResponse:
+    """Retry just questions extraction, preserving theory + figures data.
+
+    409 if questions_status is not 'failed'. Resets questions_status,
+    zeros questions_retries, dispatches coordinator. The coordinator's
+    _dispatch_questions handler creates a fresh QuestionBank row +
+    supersedes prior pending banks.
+    """
+    return await _retry_stage_endpoint(book_id, "questions", session)
+
+
+@router.post(
+    "/{book_id}/retry-figures",
+    response_model=BookUploadResponse,
+    dependencies=[Depends(extraction_limit)],
+)
+async def retry_figures(
+    book_id: UUID,
+    session: AsyncSession = Depends(get_session),
+) -> BookUploadResponse:
+    """Retry just figure extraction, preserving theory + questions data.
+
+    409 if figures_status is not 'failed'. Resets figures_status, zeros
+    figures_retries, dispatches coordinator.
+    """
+    return await _retry_stage_endpoint(book_id, "figures", session)
+
+
 async def _load_export_context(
     book_id: UUID,
     regen_id: UUID | None,
