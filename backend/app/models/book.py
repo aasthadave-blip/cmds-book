@@ -47,6 +47,23 @@ class Book(Base):
     figures_status: Mapped[str] = mapped_column(
         String(32), default="pending", nullable=False, server_default="pending",
     )
+    # Phase 6 (architecture-v2 — post-schema orchestrator).
+    # extraction_lock_at: held by the coordinate_extraction Celery task
+    # while it's stepping a book's state machine. Prevents duplicate
+    # dispatches. Watchdog force-releases stale locks after 10 minutes
+    # of inactivity. NULL when no extraction lifecycle is in progress.
+    extraction_lock_at: Mapped[datetime | None] = mapped_column(
+        DateTime(timezone=True), nullable=True,
+    )
+    # theory_finalized_at: set AFTER theory extraction PLUS its tail
+    # work (example_linker + figure_embedder) all complete. The
+    # coordinator gates questions+figures dispatch on THIS field, not
+    # on theory_status (which today is set mid-task before linker
+    # runs — causing the embedder-double-run race condition). NULL
+    # until theory's full tail has flushed.
+    theory_finalized_at: Mapped[datetime | None] = mapped_column(
+        DateTime(timezone=True), nullable=True,
+    )
     # Last verify_book() report — populated by the quality endpoint.
     # Shape documented in app/services/verify_book.py.
     verification_log: Mapped[dict | None] = mapped_column(sa.JSON, nullable=True)
