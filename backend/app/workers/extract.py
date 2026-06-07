@@ -184,7 +184,11 @@ def analyse_book_task(self, book_id: str, job_id: str) -> dict:
                 base_msg=f"Running Gemini schema ({layout_tag} PDF)",
                 progress=30,
             ):
-                schema = build_schema(pdf_bytes, is_multi_column=is_multi_column)
+                schema = build_schema(
+                    pdf_bytes,
+                    is_multi_column=is_multi_column,
+                    pdf_title=(book.title or None),
+                )
 
             # Derive AnalyserResult: use pymupdf fast-path if available, otherwise
             # build it entirely from the Gemini schema output (no Claude P1 needed).

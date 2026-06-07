@@ -38,7 +38,7 @@ from __future__ import annotations
 import asyncio
 import logging
 
-from app.schemas.analyser import BookSchema
+from app.schemas.analyser import BookSchema, SchemaSection
 from app.services.prompt_loader import load_raw
 from app.services.schema_postpass import verify_schema_against_pdf_text
 from app.utils.json_parse import parse_json
@@ -160,7 +160,64 @@ def _run_gemini_schema(
     return parse_json(raw)
 
 
-def build_schema(pdf_bytes: bytes, *, is_multi_column: bool = False) -> BookSchema:
+def _build_image_only_template_schema(
+    total_pages: int, pdf_title: str | None
+) -> BookSchema:
+    """Generate a minimal valid schema for image-only PDFs.
+
+    Image-only PDFs (scanned without OCR, single-page graphics, etc.) have
+    no extractable text — pypdf returns nothing. Sending them to Gemini
+    yields incomplete output that the strict validator rejects, burning
+    3 retries (~$5 + 10 min wall time) before failing the upload.
+
+    This bypass generates a structurally valid minimal schema:
+      • Chapter wrapper at level 1 covering all pages
+      • content_types=["theory"] (chapter wrappers always carry theory)
+      • Empty subsections (no structure can be extracted from image-only PDF)
+      • extraction_notes explains the bypass to the user
+
+    The user can later use the schema editor UI to rename or add
+    structure manually — or re-upload an OCR'd version of the PDF.
+    """
+    import uuid as _uuid
+
+    title = (pdf_title or "").strip() or "Scanned Chapter"
+    chapter = SchemaSection(
+        id="ch1",
+        uuid=str(_uuid.uuid4()),
+        level=1,
+        title=title,
+        type="chapter",
+        page_start=1,
+        page_end=max(1, total_pages),
+        content_types=["theory"],
+        is_numbered=False,
+        expected_question_count=0,
+        subsections=[],
+    )
+    return BookSchema(
+        document_title=title,
+        subject="",
+        grade_level=None,
+        board=None,
+        total_pages=max(1, total_pages),
+        sections=[chapter],
+        excluded_sections=[],
+        exclusion_summary=[],
+        extraction_notes=(
+            "Image-only PDF detected by preflight — no text was extractable. "
+            "Schema generation was bypassed and a minimal placeholder created. "
+            "For full structural extraction, OCR the PDF and re-upload."
+        ),
+    )
+
+
+def build_schema(
+    pdf_bytes: bytes,
+    *,
+    is_multi_column: bool = False,
+    pdf_title: str | None = None,
+) -> BookSchema:
     """Generate a structural schema from PDF bytes using Gemini 2.5 Pro.
 
     SYNCHRONOUS — call directly, do NOT wrap in asyncio.run().
@@ -222,6 +279,25 @@ def build_schema(pdf_bytes: bytes, *, is_multi_column: bool = False) -> BookSche
         effective_multi_column, " (auto)" if auto_routed else "",
         len(preflight.rotation_pages),
     )
+
+    # SCHEMA Day 12.5 — image-only PDF bypass.
+    # When the preflight detector classifies the PDF as image-only
+    # (no extractable text via pypdf), Gemini consistently emits
+    # incomplete output that the strict validator rejects — burning 3
+    # retries and ~$5 of Gemini cost before failing the upload entirely.
+    # Generate a minimal valid template schema instead. The user can
+    # rename / restructure via the schema editor UI, or re-upload an
+    # OCR'd version for full structural extraction.
+    if preflight.pdf_type == "image_only":
+        logger.warning(
+            "Schema build: image-only PDF (%d page%s) — bypassing Gemini, "
+            "emitting minimal template schema (user can edit via UI)",
+            preflight.total_pages,
+            "" if preflight.total_pages == 1 else "s",
+        )
+        return _build_image_only_template_schema(
+            total_pages=preflight.total_pages, pdf_title=pdf_title,
+        )
 
     prompt_name = (
         "schema_architecture_multicolumn" if effective_multi_column else "schema_architecture"
