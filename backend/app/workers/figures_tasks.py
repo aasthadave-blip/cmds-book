@@ -77,6 +77,26 @@ from sqlalchemy.orm import Session, sessionmaker
 from app.core.config import settings
 from app.models import Book, Figure, FigureReference, FigureRegeneration, Job, Question
 from app.workers.celery_app import celery_app
+
+
+def _orch_dispatch(book_uuid: UUID) -> None:
+    """Fire the post-schema extraction coordinator (ORCH Day 6).
+
+    Called from every terminal status write in extract_figures_v2 so
+    the orchestrator's state machine can advance (finalize the book if
+    questions also done, retry if Day 7 logic applies, etc.). Idempotent
+    on the coordinator side. Failure here is non-fatal — frontend
+    polling still works as a fallback during the transition (until
+    Day 12 strips it).
+    """
+    try:
+        from app.workers.runner import dispatch
+        dispatch("coordinate_extraction", str(book_uuid))
+    except Exception as e:
+        logger.warning(
+            "extract_figures_v2: coordinator dispatch failed (continuing): %s",
+            e,
+        )
 from app.workers.runner import register as register_task
 
 logger = logging.getLogger(__name__)
@@ -154,6 +174,7 @@ def _extract_figures_v2_impl(book_id: str, job_id: str) -> dict[str, Any]:
             )
             book.figures_status = "failed"
             session.commit()
+            _orch_dispatch(book_uuid)  # ORCH Day 6
             return {"status": "failed", "error": "book has no pdf_url"}
         # Phase 5d (CONTRACT.md §2): mark figures stage as running. Watchdog
         # (Phase 7) will detect runs that stall past stale_after.
@@ -202,6 +223,7 @@ def _extract_figures_v2_impl(book_id: str, job_id: str) -> dict[str, Any]:
             if b is not None:
                 b.figures_status = "failed"
                 session.commit()
+        _orch_dispatch(book_uuid)  # ORCH Day 6
         return {"status": "failed", "error": str(e)}
 
     figures_raw = metadata.get("figures") or []
@@ -391,6 +413,7 @@ def _extract_figures_v2_impl(book_id: str, job_id: str) -> dict[str, Any]:
             ),
             finished_at=datetime.utcnow(),
         )
+        _orch_dispatch(book_uuid)  # ORCH Day 6
         return result
 
 
