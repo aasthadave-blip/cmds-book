@@ -278,6 +278,29 @@ def analyse_book_task(self, book_id: str, job_id: str) -> dict:
                 message="Schema ready for approval",
                 finished_at=datetime.utcnow(),
             )
+
+            # Phase 6 (ORCH Day 3) — auto-fire post-schema orchestrator.
+            # coordinate_extraction is idempotent and decides whether to
+            # actually kick off theory based on current state. Removes
+            # the dependency on a polling frontend to call /approve —
+            # schema completion now triggers downstream extraction
+            # without any UI interaction.
+            try:
+                from app.workers.runner import dispatch
+                dispatch("coordinate_extraction", str(book_uuid))
+                logger.info(
+                    "analyse_book: dispatched coordinator for book=%s",
+                    book_uuid,
+                )
+            except Exception as e:
+                # Coordinator dispatch failure should not fail the
+                # schema task — user can manually re-fire via /approve
+                # as a fallback.
+                logger.warning(
+                    "analyse_book: coordinator dispatch failed (continuing): %s",
+                    e,
+                )
+
             return {"ok": True, "book_id": str(book_uuid)}
 
         except Exception as e:
