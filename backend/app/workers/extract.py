@@ -623,33 +623,27 @@ def extract_book_task(self, book_id: str, job_id: str) -> dict:
                 if status in ("failed", "crashed"):
                     failed_section_ids.append(section_id)
 
-            # Phase 5d: derive theory_status from outcomes.
+            # Phase 5d / ORCH Day 4 — derive theory_status from outcomes
+            # but DEFER persisting it until after example_linker +
+            # figure_embedder finish their tail work. Today's race:
+            # theory_status="done" committed here → frontend polling sees
+            # "done" → fires kickRestParallel → questions+figures workers
+            # start while figure_embedder (in tail below) is still mid-
+            # run, causing two embedder passes to race on Section blocks.
+            # Strict ORCH design: theory_status remains "running" in DB
+            # until AFTER the tail completes, then committed together
+            # with theory_finalized_at — the coordinator gate field.
             if total == 0:
-                book.theory_status = "done"  # no theory sections to extract
+                _derived_theory_status = "done"
             elif len(failed_section_ids) == 0:
-                book.theory_status = "done"
+                _derived_theory_status = "done"
             elif len(failed_section_ids) == total:
-                book.theory_status = "failed"
+                _derived_theory_status = "failed"
             else:
-                book.theory_status = "partial"
-            # Phase 5e (CONTRACT.md §2): book.status is now derived from
-            # per-stage fields, not blindly "ready". Killed the lie.
-            #
-            # NOTE: at this point only schema + theory have completed.
-            # questions_status / figures_status are still "pending" (their
-            # tasks haven't run yet). derive_book_status() correctly
-            # returns "queued" for that state — but the EXISTING flow
-            # treated extract_book completion as "ready" so callers can
-            # display a "extraction complete" message. To preserve that
-            # signal without lying, we use "extracting" if downstream
-            # stages haven't run, otherwise derive normally.
-            from app.services.book_status import derive_book_status
-            derived = derive_book_status(book)
-            # If derive says "queued" (questions/figures pending), call
-            # it "extracting" — extract_book just finished theory; the
-            # downstream stages are about to run.
-            book.status = "extracting" if derived == "queued" else derived
-            session.commit()
+                _derived_theory_status = "partial"
+            # NB: book.theory_status NOT set here; book.status NOT updated
+            # here. Both deferred to the post-tail finalization block
+            # below (after example_linker + figure_embedder).
 
             # Inject example/exercise placeholder chips into parent theory
             # sections. Idempotent post-processing — does not modify
@@ -674,6 +668,35 @@ def extract_book_task(self, book_id: str, job_id: str) -> dict:
             except Exception as e:
                 logger.warning(
                     "figure_embedder failed post-theory (book=%s): %s", book_uuid, e
+                )
+
+            # Phase 6 (ORCH Day 4) — FINALIZE theory after tail completes.
+            # example_linker + figure_embedder have flushed; it's now
+            # safe to mark theory truly done. theory_finalized_at is the
+            # coordinator's gate field for dispatching questions+figures.
+            book.theory_status = _derived_theory_status
+            book.theory_finalized_at = datetime.utcnow()
+            from app.services.book_status import derive_book_status
+            derived = derive_book_status(book)
+            book.status = "extracting" if derived == "queued" else derived
+            session.commit()
+
+            # Step the state machine forward — coordinator typically
+            # dispatches extract_questions_v3 + extract_figures_v2 in
+            # parallel from here. Idempotent; safe even if frontend
+            # also polled and tried to fire kickRestParallel.
+            try:
+                from app.workers.runner import dispatch
+                dispatch("coordinate_extraction", str(book_uuid))
+                logger.info(
+                    "extract_book: theory finalized for book=%s status=%s "
+                    "— dispatched coordinator",
+                    book_uuid, _derived_theory_status,
+                )
+            except Exception as e:
+                logger.warning(
+                    "extract_book: coordinator dispatch failed (continuing): %s",
+                    e,
                 )
 
             _update_job(
