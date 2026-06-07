@@ -515,23 +515,42 @@ async def re_extract_book(
         .values(status="pending", blocks=[], attempts=0, qc_local=None)
     )
 
-    job = Job(book_id=book.id, type="extract", status="queued", progress=0)
+    # ORCH Day 9 — approval marker Job. Actual extraction Jobs are
+    # created by the coordinator's per-worker dispatchers. Matches the
+    # Day 8 /approve pattern: the API action itself completes
+    # immediately and the coordinator owns the rest.
+    job = Job(
+        book_id=book.id, type="extract",
+        status="succeeded", progress=100,
+        message="Re-extract routed to orchestrator",
+    )
     session.add(job)
     await session.flush()
 
     book.status = "extracting"
-    # Phase 5d/7: reset per-stage status for the new extract cycle
+    # Phase 5d/7 + ORCH Day 9 — full hard reset. Per-stage statuses go
+    # back to pending. Orchestrator state cleared (finalized marker,
+    # any leftover lock, retry counters) so the coordinator's state
+    # machine treats this as a brand-new run with a fresh retry budget.
     book.theory_status = "pending"
     book.questions_status = "pending"
     book.figures_status = "pending"
+    book.theory_finalized_at = None
+    book.extraction_lock_at = None
+    book.theory_retries = 0
+    book.questions_retries = 0
+    book.figures_retries = 0
 
-    # Commit before dispatch so worker thread sees the new Job row.
+    # Commit before dispatch so the coordinator sees the cleared state.
     await session.commit()
 
-    import app.workers.extract  # noqa: F401
+    import app.workers.orchestrator  # noqa: F401 — ensure registration
     from app.workers.runner import dispatch
 
-    dispatch("extract_book", str(book.id), str(job.id))
+    # Coordinator sees schema=done, theory=pending → fires extract_book.
+    # Idempotent + lock-protected — safe even if another coordinator
+    # dispatch was in flight from a different code path.
+    dispatch("coordinate_extraction", str(book.id))
     return BookUploadResponse(book_id=book.id, job_id=job.id, status="extracting")
 
 
