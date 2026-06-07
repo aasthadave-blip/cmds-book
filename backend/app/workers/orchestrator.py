@@ -55,6 +55,12 @@ SyncSession = sessionmaker(bind=_sync_engine, class_=Session, autoflush=False)
 # 5 min later as a safety net.
 LOCK_TIMEOUT_MIN = 10
 
+# ORCH Day 7 — auto-retry once per stage on failure. After this many
+# retries, the coordinator finalizes the book as failed/partial instead
+# of retrying further. Manual retry API endpoints (Day 10) reset the
+# per-stage counter so a user-initiated retry can again use the slot.
+MAX_AUTO_RETRIES = 1
+
 
 # Status sets — one source of truth.
 _PENDING = "pending"
@@ -76,6 +82,9 @@ def _decide_next_action(book: Book) -> str:
       "dispatch_questions"  — theory finalized, questions pending (alone)
       "dispatch_figures"    — theory finalized, figures pending (alone)
       "dispatch_both"       — theory finalized, both pending
+      "retry_theory"        — theory failed, retries available
+      "retry_questions"     — questions failed, retries available
+      "retry_figures"       — figures failed, retries available
       "finalize"            — all stages terminal, set book.status final
       "no_action"           — waiting for in-flight work to complete
     """
@@ -91,8 +100,10 @@ def _decide_next_action(book: Book) -> str:
     if book.theory_status == _RUNNING:
         return "no_action"
 
-    # Phase C — theory failed → no Q/Fig point, finalize
+    # Phase C — theory failed → retry once (Day 7) or finalize
     if book.theory_status == _FAILED:
+        if (book.theory_retries or 0) < MAX_AUTO_RETRIES:
+            return "retry_theory"
         return "finalize"
 
     # Phase D — theory done but tail (linker+embedder) not yet finished
@@ -103,6 +114,15 @@ def _decide_next_action(book: Book) -> str:
     if book.theory_finalized_at is not None:
         q_pending = book.questions_status == _PENDING
         f_pending = book.figures_status == _PENDING
+        q_failed = book.questions_status == _FAILED
+        f_failed = book.figures_status == _FAILED
+
+        # Retry failed stages first (one at a time so we don't compound
+        # transient errors). Day 7 budget: MAX_AUTO_RETRIES per stage.
+        if q_failed and (book.questions_retries or 0) < MAX_AUTO_RETRIES:
+            return "retry_questions"
+        if f_failed and (book.figures_retries or 0) < MAX_AUTO_RETRIES:
+            return "retry_figures"
 
         if q_pending and f_pending:
             return "dispatch_both"
@@ -218,6 +238,51 @@ def _finalize(session, book: Book) -> None:
     )
 
 
+# ─── Retry handlers (ORCH Day 7) ──────────────────────────────────────
+
+
+def _retry_theory(session, book: Book) -> None:
+    """Auto-retry theory after a failed first attempt.
+
+    Reset theory_status to "pending", clear theory_finalized_at (so the
+    next coordinator pass doesn't skip retry to Q/Fig), bump the
+    counter, then dispatch extract_book again.
+    """
+    book.theory_retries = (book.theory_retries or 0) + 1
+    book.theory_status = _PENDING
+    book.theory_finalized_at = None
+    session.commit()
+    logger.warning(
+        "orchestrator: AUTO-RETRY theory (attempt %d of %d) for book=%s",
+        book.theory_retries + 1, MAX_AUTO_RETRIES + 1, book.id,
+    )
+    _dispatch_theory(session, book)
+
+
+def _retry_questions(session, book: Book) -> None:
+    """Auto-retry questions after a failed first attempt."""
+    book.questions_retries = (book.questions_retries or 0) + 1
+    book.questions_status = _PENDING
+    session.commit()
+    logger.warning(
+        "orchestrator: AUTO-RETRY questions (attempt %d of %d) for book=%s",
+        book.questions_retries + 1, MAX_AUTO_RETRIES + 1, book.id,
+    )
+    _dispatch_questions(session, book)
+
+
+def _retry_figures(session, book: Book) -> None:
+    """Auto-retry figures after a failed first attempt."""
+    book.figures_retries = (book.figures_retries or 0) + 1
+    book.figures_status = _PENDING
+    session.commit()
+    logger.warning(
+        "orchestrator: AUTO-RETRY figures (attempt %d of %d) for book=%s",
+        book.figures_retries + 1, MAX_AUTO_RETRIES + 1, book.id,
+    )
+    _dispatch_figures(session, book)
+
+
 # ─── Public task ──────────────────────────────────────────────────────
 
 
@@ -270,6 +335,12 @@ def coordinate_extraction_task(self, book_id: str) -> dict:
             elif action == "dispatch_both":
                 _dispatch_questions(session, book)
                 _dispatch_figures(session, book)
+            elif action == "retry_theory":
+                _retry_theory(session, book)
+            elif action == "retry_questions":
+                _retry_questions(session, book)
+            elif action == "retry_figures":
+                _retry_figures(session, book)
             elif action == "finalize":
                 _finalize(session, book)
             # action == "no_action" → no-op

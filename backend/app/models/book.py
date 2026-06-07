@@ -64,6 +64,21 @@ class Book(Base):
     theory_finalized_at: Mapped[datetime | None] = mapped_column(
         DateTime(timezone=True), nullable=True,
     )
+    # ORCH Day 7 — per-stage auto-retry counters. The coordinator allows
+    # ONE automatic retry on stage failure (transient Gemini error /
+    # network blip). After retry=1, the next failure finalizes the book
+    # as failed/partial. Manual retry API endpoints (Day 10) reset the
+    # counter to 0 so a user-initiated retry can again use the auto-retry
+    # slot.
+    theory_retries: Mapped[int] = mapped_column(
+        sa.Integer, nullable=False, default=0, server_default="0",
+    )
+    questions_retries: Mapped[int] = mapped_column(
+        sa.Integer, nullable=False, default=0, server_default="0",
+    )
+    figures_retries: Mapped[int] = mapped_column(
+        sa.Integer, nullable=False, default=0, server_default="0",
+    )
     # Last verify_book() report — populated by the quality endpoint.
     # Shape documented in app/services/verify_book.py.
     verification_log: Mapped[dict | None] = mapped_column(sa.JSON, nullable=True)
