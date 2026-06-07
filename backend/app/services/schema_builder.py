@@ -46,7 +46,7 @@ from app.utils.json_parse import parse_json
 logger = logging.getLogger(__name__)
 
 MAX_ATTEMPTS = 3
-GEMINI_MODEL = "gemini-2.5-pro"
+GEMINI_MODEL = "gemini-2.5-flash"
 
 
 def _ensure_event_loop() -> None:
