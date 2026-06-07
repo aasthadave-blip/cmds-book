@@ -286,8 +286,7 @@ def _retry_figures(session, book: Book) -> None:
 # ─── Public task ──────────────────────────────────────────────────────
 
 
-@celery_app.task(name="coordinate_extraction", bind=True)
-def coordinate_extraction_task(self, book_id: str) -> dict:
+def _coordinate_extraction(book_id: str) -> dict:
     """Step the post-schema extraction state machine forward by ONE transition.
 
     Idempotent. Safe to dispatch repeatedly. Worker tails of
@@ -295,6 +294,9 @@ def coordinate_extraction_task(self, book_id: str) -> dict:
     this task at their completion to step the state forward.
 
     No LLM calls. Pure DB state inspection + Celery dispatch.
+
+    Sync entrypoint registered with both the inline dispatch table
+    (workers/runner.py) and the Celery task wrapper below.
     """
     try:
         book_uuid = UUID(book_id)
@@ -352,3 +354,22 @@ def coordinate_extraction_task(self, book_id: str) -> dict:
         finally:
             # Always release the lock so retries can proceed
             _release_lock(session, book_uuid)
+
+
+# ─── Task wiring ──────────────────────────────────────────────────────
+
+
+# Celery wrapper — Celery binds `self` as first arg. Delegates to the
+# plain sync function so inline mode and Celery mode share one
+# implementation (matches the pattern in extract.py / questions_v3.py).
+@celery_app.task(name="coordinate_extraction", bind=True)
+def coordinate_extraction_task(self, book_id: str) -> dict:
+    return _coordinate_extraction(book_id)
+
+
+# Inline-mode registration — runner.dispatch("coordinate_extraction", ...)
+# resolves to this. Without it, inline mode (default when Redis is a
+# stub) raises "Inline task not registered".
+from app.workers.runner import register as register_task  # noqa: E402
+
+register_task("coordinate_extraction", _coordinate_extraction)

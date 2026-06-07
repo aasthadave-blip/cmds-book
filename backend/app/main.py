@@ -107,6 +107,7 @@ from app.workers import questions_v2 as _question_v2_tasks  # noqa: E402, F401
 from app.workers import questions_v3 as _question_v3_tasks  # noqa: E402, F401
 from app.workers import qa as _qa_tasks  # noqa: E402, F401
 from app.workers import figures_tasks as _figures_v2_tasks  # noqa: E402, F401
+from app.workers import orchestrator as _orchestrator_tasks  # noqa: E402, F401
 
 
 _watchdog_task: "asyncio.Task[None] | None" = None
