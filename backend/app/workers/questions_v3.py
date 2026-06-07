@@ -2300,6 +2300,18 @@ def _extract_questions_v3(book_id: str, bank_id: str, job_id: str) -> dict[str, 
                 derived = derive_book_status(b)
                 b.status = "extracting" if derived == "queued" else derived
                 session.commit()
+
+        # ORCH Day 5 — step the state machine forward. Coordinator
+        # checks whether figures is also done and finalizes the book,
+        # OR no-ops if figures still running. Idempotent.
+        try:
+            from app.workers.runner import dispatch
+            dispatch("coordinate_extraction", str(book_uuid))
+        except Exception as e:
+            logger.warning(
+                "extract_questions_v3: coordinator dispatch failed "
+                "(continuing): %s", e,
+            )
         return result
     except Exception as e:
         logger.exception("extract_questions_v3 crashed")
@@ -2317,6 +2329,16 @@ def _extract_questions_v3(book_id: str, bank_id: str, job_id: str) -> dict[str, 
             if b is not None:
                 b.questions_status = "failed"
                 session.commit()
+        # ORCH Day 5 — fire coordinator even on failure so it can
+        # decide to retry (Day 7) or finalize the book as partial/failed.
+        try:
+            from app.workers.runner import dispatch
+            dispatch("coordinate_extraction", str(book_uuid))
+        except Exception as e2:
+            logger.warning(
+                "extract_questions_v3: coordinator dispatch (on-failure) "
+                "failed: %s", e2,
+            )
         return {"ok": False, "error": str(e)}
 
 
