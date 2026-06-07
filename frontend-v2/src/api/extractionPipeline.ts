@@ -278,16 +278,20 @@ const postAnalyse = (bookId: string) =>
 const postApprove = (bookId: string) =>
   req<{ job_id: string }>(`/api/books/${bookId}/approve`, { method: 'POST' });
 
-const postQuestionBank = (bookId: string) =>
-  req<{ bank_id: string; job_id: string }>(
-    `/api/books/${bookId}/question-banks`,
-    { method: 'POST' },
-  );
+// ORCH Day 12 — per-stage retry endpoints (Day 10 backend).
+// The frontend used to call /question-banks and /extract-figures-v2
+// directly, racing with the backend orchestrator. Those raw worker
+// dispatches are gone; user-initiated retries now go through these
+// orchestrator-mediated endpoints which surgically reset just that
+// stage and let the coordinator's state machine dispatch the worker.
+const postRetryTheory = (bookId: string) =>
+  req<{ job_id: string }>(`/api/books/${bookId}/retry-theory`, { method: 'POST' });
 
-const postExtractFigures = (bookId: string) =>
-  req<{ job_id: string }>(`/api/books/${bookId}/extract-figures-v2`, {
-    method: 'POST',
-  });
+const postRetryQuestions = (bookId: string) =>
+  req<{ job_id: string }>(`/api/books/${bookId}/retry-questions`, { method: 'POST' });
+
+const postRetryFigures = (bookId: string) =>
+  req<{ job_id: string }>(`/api/books/${bookId}/retry-figures`, { method: 'POST' });
 
 const postReExtractSection = (sectionRowId: string) =>
   req<{ job_id: string }>(`/api/sections/${sectionRowId}/re-extract`, {
@@ -477,60 +481,15 @@ export function useExtractionPipeline(): UseExtractionPipeline {
     [apply],
   );
 
-  // ─── Phase 2: kick questions + figures in parallel ───────────────
-  //
-  // Called once theory hits 'done'. Q + figures are both lighter stages
-  // and run safely side-by-side without contention.
-  const kickRestParallel = useCallback(
-    async (bookId: string) => {
-      dbg('kicking Q + figures in parallel for', bookId);
-      apply(() => ({
-        questions: { ...initialStage(), inflight: true },
-        figures: { ...initialStage(), inflight: true },
-      }));
-
-      const [questionsRes, figuresRes] = await Promise.allSettled([
-        postQuestionBank(bookId),
-        postExtractFigures(bookId),
-      ]);
-
-      apply(() => {
-        const patch: Partial<ExtractionState> = {};
-        if (questionsRes.status === 'fulfilled') {
-          patch.questions = {
-            ...initialStage(),
-            jobId: questionsRes.value.job_id,
-            status: 'queued',
-            lastProgressAt: Date.now(),
-          };
-        } else {
-          patch.questions = {
-            ...initialStage(),
-            status: 'failed',
-            error: explain(questionsRes.reason),
-          };
-          dbg('questions POST failed', questionsRes.reason);
-        }
-        if (figuresRes.status === 'fulfilled') {
-          patch.figures = {
-            ...initialStage(),
-            jobId: figuresRes.value.job_id,
-            status: 'queued',
-            lastProgressAt: Date.now(),
-          };
-        } else {
-          patch.figures = {
-            ...initialStage(),
-            status: 'failed',
-            error: explain(figuresRes.reason),
-          };
-          dbg('figures POST failed', figuresRes.reason);
-        }
-        return patch;
-      });
-    },
-    [apply],
-  );
+  // ORCH Day 12 — kickRestParallel REMOVED.
+  // The post-schema coordinator (workers/orchestrator.py) auto-fires
+  // questions + figures dispatch when extract_book finishes (theory
+  // tail → coordinator → dispatch_both). The previous frontend call
+  // to postQuestionBank + postExtractFigures raced with the backend
+  // orchestrator, causing 409 Conflict errors that the UI displayed
+  // as "Failed: Backend 409" even though the backend's dispatch had
+  // actually succeeded. Backend is now the sole orchestrator;
+  // frontend observes via polling.
 
   // Back-compat alias used by start() — calls the new theory-first path.
   const kickThreeParallel = kickTheoryAlone;
@@ -674,18 +633,16 @@ export function useExtractionPipeline(): UseExtractionPipeline {
 
   // ─── tick: poll active jobs, advance the state machine ─────────
   // Refs to break the tick → kick* → tick callback cycle.
-  // `tick` is captured by setInterval, but kick* and reconcile need
+  // `tick` is captured by setInterval, but kick and reconcile need
   // to be the latest closures; we look them up from refs.
+  // ORCH Day 12 — kickRestRef + restKickedFor removed (backend handles
+  // Q+figures dispatch now; nothing to track on the frontend side).
   const kickRef = useRef(kickTheoryAlone);
-  const kickRestRef = useRef(kickRestParallel);
   const reconcileRef = useRef(reconcile);
   useEffect(() => {
     kickRef.current = kickTheoryAlone;
-    kickRestRef.current = kickRestParallel;
     reconcileRef.current = reconcile;
-  }, [kickTheoryAlone, kickRestParallel, reconcile]);
-  // Track whether we've already fired Q+figures so we don't re-fire every tick.
-  const restKickedFor = useRef<string | null>(null);
+  }, [kickTheoryAlone, reconcile]);
 
   const tick = useCallback(async () => {
     if (tickRunning.current) return; // overlap guard
@@ -918,25 +875,21 @@ export function useExtractionPipeline(): UseExtractionPipeline {
       }
 
       // ─── Phase transitions (read latest state via setState callback) ───
+      //
+      // ORCH Day 12 — the "kick Q+figures" branch is gone; the backend
+      // orchestrator dispatches them automatically when theory's tail
+      // (linker + embedder) completes. We only need to detect when the
+      // whole pipeline has settled (or stalled) and trigger reconcile.
       let didKickTheory = false;
-      let didKickRest = false;
       let didReconcile = false;
       setState((prev) => {
         // 1. analysing → kick theory once schema is done
+        //    kickTheoryAlone now just hits /approve, which the backend
+        //    routes through coordinator (Day 8). Idempotent — safe.
         if (prev.phase === 'analysing' && prev.schema.status === 'done') {
           didKickTheory = true;
         }
-        // 2. extracting + theory done + haven't fired rest → kick Q+figures
-        if (
-          prev.phase === 'extracting' &&
-          prev.theory.status === 'done' &&
-          prev.questions.jobId === null &&
-          prev.figures.jobId === null &&
-          restKickedFor.current !== prev.bookId
-        ) {
-          didKickRest = true;
-        }
-        // 3. extracting + theory failed → reconcile immediately
+        // 2. extracting + theory failed → reconcile immediately
         //    (Q+figures never started; partial state)
         if (
           prev.phase === 'extracting' &&
@@ -946,14 +899,14 @@ export function useExtractionPipeline(): UseExtractionPipeline {
         ) {
           didReconcile = true;
         }
-        // 4. extracting + all 3 terminal → reconcile
+        // 3. extracting + all 3 terminal → reconcile
         if (prev.phase === 'extracting') {
           const allTerm =
             isTerminal(prev.theory.status) &&
             isTerminal(prev.questions.status) &&
             isTerminal(prev.figures.status);
           if (allTerm && (prev.questions.jobId !== null || prev.figures.jobId !== null)) {
-            // Rest was actually kicked + finished — safe to reconcile.
+            // Rest finished (backend-orchestrated) — safe to reconcile.
             didReconcile = true;
           }
         }
@@ -961,10 +914,6 @@ export function useExtractionPipeline(): UseExtractionPipeline {
       });
       if (didKickTheory && s.bookId) {
         await kickRef.current(s.bookId);
-      }
-      if (didKickRest && s.bookId) {
-        restKickedFor.current = s.bookId;
-        await kickRestRef.current(s.bookId);
       }
       if (didReconcile && s.bookId) {
         stopPolling();
@@ -998,7 +947,6 @@ export function useExtractionPipeline(): UseExtractionPipeline {
 
       dbg('start()', bookId);
       reconciledFor.current = null;
-      restKickedFor.current = null;
 
       apply(() => ({ ...initialState(bookId), phase: 'loading' }));
 
@@ -1146,18 +1094,22 @@ export function useExtractionPipeline(): UseExtractionPipeline {
       }) as Partial<ExtractionState>);
 
       try {
+        // ORCH Day 12 — per-stage retry now uses the Day 10 orchestrator-
+        // mediated endpoints. Each one surgically resets that stage and
+        // routes the resumption through the coordinator (no race with
+        // the in-flight pipeline).
         let jobId: string | null = null;
         if (stage === 'schema') {
           jobId = (await postAnalyse(bookId)).job_id;
           apply(() => ({ phase: 'analysing' }));
         } else if (stage === 'theory') {
-          jobId = (await postReExtractAll(bookId)).job_id;
+          jobId = (await postRetryTheory(bookId)).job_id;
           apply(() => ({ phase: 'extracting', failedSections: [] }));
         } else if (stage === 'questions') {
-          jobId = (await postQuestionBank(bookId)).job_id;
+          jobId = (await postRetryQuestions(bookId)).job_id;
           apply(() => ({ phase: 'extracting', questionsFailed: false }));
         } else if (stage === 'figures') {
-          jobId = (await postExtractFigures(bookId)).job_id;
+          jobId = (await postRetryFigures(bookId)).job_id;
           apply(() => ({ phase: 'extracting', figuresFailed: false }));
         }
         apply(() => ({
