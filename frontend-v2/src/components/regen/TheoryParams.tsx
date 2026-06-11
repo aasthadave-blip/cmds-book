@@ -57,11 +57,16 @@ export function TheoryParams({ value, onChange }: Props) {
       </ParamRow>
 
       <ParamRow>
-        <ParamLabel hint="Voice / register of the rewritten prose.">Tone</ParamLabel>
+        <ParamLabel hint="Academic register variant. Rigorous = dense exam-prep; Pedagogical = balanced for comprehension; Interactive = formal but engaging.">
+          Tone
+        </ParamLabel>
         <SegmentChoice
-          options={['academic', 'conversational', 'simplified'] as const}
+          options={
+            ['academic_rigorous', 'academic_pedagogical', 'academic_interactive'] as const
+          }
           value={value.tone}
           onChange={(v) => upd('tone', v)}
+          format={(v) => v.replace('academic_', '')}
         />
       </ParamRow>
 

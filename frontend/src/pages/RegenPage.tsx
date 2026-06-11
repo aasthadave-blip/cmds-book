@@ -67,8 +67,8 @@ function collectTheoryDisplay(
 }
 
 const DEFAULT: RegenParams = {
-  intensity: "moderate",
-  tone: "academic",
+  intensity: "heavy",
+  tone: "academic_pedagogical",
   equations_handling: "preserve",
   diagrams_handling: "preserve",
   analogies: "none",
@@ -79,15 +79,15 @@ const DEFAULT: RegenParams = {
 };
 
 const INTENSITY_OPTS: [RegenParams["intensity"], string, string][] = [
-  ["light", "Light", "20–30% — vocabulary only"],
+  ["light", "Light", "30–40% — vocabulary only"],
   ["moderate", "Moderate", "40–60% — restructured sentences"],
   ["heavy", "Heavy", "70–90% — full rewrite"],
 ];
 
 const TONE_OPTS: [RegenParams["tone"], string, string][] = [
-  ["academic", "Academic", "Formal, third-person"],
-  ["conversational", "Conversational", "Friendly, accessible"],
-  ["simplified", "Simplified", "Short sentences, examples"],
+  ["academic_rigorous", "Rigorous", "Formal, dense, exam-prep"],
+  ["academic_pedagogical", "Pedagogical", "Balanced for comprehension"],
+  ["academic_interactive", "Interactive", "Formal but engaging"],
 ];
 
 const EQ_OPTS: [RegenParams["equations_handling"], string, string][] = [
@@ -114,11 +114,6 @@ const DIAG_OPTS: [RegenParams["diagrams_handling"], string, string][] = [
 const LANG_OPTS = [
   ["en", "English"],
   ["hi", "Hindi"],
-  ["ta", "Tamil"],
-  ["te", "Telugu"],
-  ["mr", "Marathi"],
-  ["bn", "Bengali"],
-  ["gu", "Gujarati"],
 ];
 
 export function RegenPage() {

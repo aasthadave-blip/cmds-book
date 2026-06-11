@@ -117,19 +117,32 @@ def paragraphs_to_blocks(paragraphs: list[dict]) -> list[dict]:
 
 def split_blocks(
     blocks: list[dict],
+    protected_types: set[str] | None = None,
 ) -> tuple[list[dict], list[dict]]:
-    """Return (invariant_blocks, free_blocks) preserving order."""
-    invariant = [b for b in blocks if b.get("t") in INVARIANT_TYPES]
-    free = [b for b in blocks if b.get("t") not in INVARIANT_TYPES]
+    """Return (invariant_blocks, free_blocks) preserving order.
+
+    ``protected_types`` is the set of block types copied verbatim (the
+    "invariant" bucket). Defaults to the canonical INVARIANT_TYPES. The regen
+    path passes a narrowed set (INVARIANT_TYPES minus "def") so definition
+    bodies get rewritten while equations/figures/examples stay protected.
+    """
+    protected = INVARIANT_TYPES if protected_types is None else protected_types
+    invariant = [b for b in blocks if b.get("t") in protected]
+    free = [b for b in blocks if b.get("t") not in protected]
     return invariant, free
 
 
 def merge_blocks_in_order(
     original_blocks: list[dict],
     regenerated_free_blocks: list[dict],
+    protected_types: set[str] | None = None,
 ) -> list[dict]:
     """Walk original blocks; at each position copy invariants verbatim and
     pull in order from ``regenerated_free_blocks`` for free slots.
+
+    ``protected_types`` must match the set passed to ``split_blocks`` for this
+    regen run so the free/invariant classification is consistent on both
+    sides. Defaults to the canonical INVARIANT_TYPES.
 
     Defensive fallback: if the LLM under-produced free blocks (e.g. collapsed
     multiple body paragraphs into one), the unfilled free slots now fall
@@ -142,10 +155,11 @@ def merge_blocks_in_order(
     so nothing is lost; usually this combined with the prompt's block-count
     rule means the leftover list is empty in practice.
     """
+    protected = INVARIANT_TYPES if protected_types is None else protected_types
     merged: list[dict] = []
     free_idx = 0
     for orig in original_blocks:
-        if orig.get("t") in INVARIANT_TYPES:
+        if orig.get("t") in protected:
             merged.append(dict(orig))
         else:
             if free_idx < len(regenerated_free_blocks):

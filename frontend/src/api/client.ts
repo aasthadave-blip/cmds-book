@@ -228,12 +228,12 @@ export interface Job {
 
 export interface RegenParams {
   intensity: "light" | "moderate" | "heavy";
-  tone: "academic" | "conversational" | "simplified";
+  tone: "academic_rigorous" | "academic_pedagogical" | "academic_interactive";
   equations_handling: "preserve" | "explain";
   diagrams_handling: "preserve" | "describe";
   analogies: "none" | "add_one" | "add_multiple";
   structure: "identical" | "reorganize";
-  language: string;
+  language: "en" | "hi";
   target_audience?: string | null;
   custom_instructions?: string | null;
 }

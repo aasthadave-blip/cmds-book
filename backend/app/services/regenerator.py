@@ -42,6 +42,14 @@ logger = logging.getLogger(__name__)
 
 MAX_TOKENS = 16000
 
+# Block types copied verbatim during regeneration. This is the canonical
+# INVARIANT_TYPES MINUS "def": definition bodies ARE rewritten (term kept,
+# content rephrased), while equations, figures, examples, tables, and refs
+# stay character-for-character identical.
+from app.schemas.block import INVARIANT_TYPES as _INVARIANT_TYPES
+
+REGEN_PROTECTED_TYPES: set[str] = _INVARIANT_TYPES - {"def"}
+
 
 def free_blocks_to_text(free_blocks: list[dict]) -> str:
     """Flatten free blocks into the plain-text body used in the P5 user message.
@@ -70,6 +78,14 @@ def free_blocks_to_text(free_blocks: list[dict]) -> str:
         elif t == "kp":
             parts.append(
                 f"[BLOCK {idx} type=key_point]\n{b.get('c', '')}\n[/BLOCK {idx}]"
+            )
+        elif t == "def":
+            # Definition: the term is the defined concept name and must be
+            # preserved verbatim; only the body content is rewritten.
+            term = b.get("term", "")
+            parts.append(
+                f'[BLOCK {idx} type=definition term="{term}"]\n'
+                f"{b.get('c', '')}\n[/BLOCK {idx}]"
             )
         elif t == "list":
             items = b.get("items", []) or []
@@ -115,6 +131,9 @@ def build_user_message(section_id: str, section_title: str, free_text: str) -> s
         "- Map [BLOCK i type=body]   → output[i].type = \"body\"\n"
         "- Map [BLOCK i type=heading] → output[i].type = \"heading\"\n"
         "- Map [BLOCK i type=key_point] → output[i].type = \"key_point\"\n"
+        "- Map [BLOCK i type=definition] → output[i].type = \"definition\" — keep the "
+        "\"term\" EXACTLY as given (verbatim), rephrase ONLY the \"content\"; emit both "
+        "\"term\" and \"content\" fields.\n"
         "- Map [BLOCK i type=list]   → emit one list_item block per numbered item (preserve count exactly).\n"
         "- DO NOT merge two consecutive body blocks into one. DO NOT skip any block.\n"
         "- Content wrapped in [LIST]...[/LIST] is a numbered list. Output each item as a separate "
@@ -140,7 +159,9 @@ async def regenerate_section(
     worker pre-assigned to THIS section via the redistribute mechanism.
     Only consulted when the v3 prompt is active (env-var gated).
     """
-    invariant_blocks, free_blocks = split_blocks(blocks)
+    invariant_blocks, free_blocks = split_blocks(
+        blocks, protected_types=REGEN_PROTECTED_TYPES
+    )
 
     if not free_blocks:
         # Nothing to rewrite — return originals untouched
@@ -159,14 +180,18 @@ async def regenerate_section(
     data = parse_json(text)
     regen_paragraphs = list(data.get("paragraphs") or [])
 
-    # Convert paragraphs → blocks, then KEEP ONLY free types. Any invariant type
-    # Claude smuggled in is silently dropped (per the spec, case 4 edge case).
-    from app.schemas.block import INVARIANT_TYPES
-
+    # Convert paragraphs → blocks, then KEEP ONLY rewritable types. Any
+    # still-protected type (eq/fig/example/table/refs) Claude smuggled in is
+    # silently dropped. "def" is rewritable here, so regenerated definitions
+    # are retained.
     regen_blocks_all = paragraphs_to_blocks(regen_paragraphs)
-    regen_free = [b for b in regen_blocks_all if b.get("t") not in INVARIANT_TYPES]
+    regen_free = [
+        b for b in regen_blocks_all if b.get("t") not in REGEN_PROTECTED_TYPES
+    ]
 
-    return merge_blocks_in_order(blocks, regen_free)
+    return merge_blocks_in_order(
+        blocks, regen_free, protected_types=REGEN_PROTECTED_TYPES
+    )
 
 
 def post_regen_qc(original_blocks: list[dict], regenerated_blocks: list[dict]) -> PostRegenQCResult:

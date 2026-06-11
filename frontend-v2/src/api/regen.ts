@@ -11,25 +11,32 @@ import { ApiError, req } from './client';
 //
 //   {
 //     intensity:         'light' | 'moderate' | 'heavy',
-//     tone:              'academic' | 'conversational' | 'simplified',
+//     tone:              'academic_rigorous' | 'academic_pedagogical' | 'academic_interactive',
 //     equations_handling:'preserve' | 'explain',
 //     diagrams_handling: 'preserve' | 'describe',
 //     analogies:         'none' | 'add_one' | 'add_multiple',
 //     structure:         'identical' | 'reorganize',
-//     language:          string,            // default 'en'
+//     language:          'en' | 'hi',        // default 'en'
 //     target_audience:   string | null,
 //     custom_instructions: string | null,
 //     section_ids:       string[] | null,   // null/omitted = all sections
 //   }
 
+export type TheoryTone =
+  | 'academic_rigorous'
+  | 'academic_pedagogical'
+  | 'academic_interactive';
+
+export type TheoryLanguage = 'en' | 'hi';
+
 export type TheoryRegenParams = {
   intensity: 'light' | 'moderate' | 'heavy';
-  tone: 'academic' | 'conversational' | 'simplified';
+  tone: TheoryTone;
   equations_handling: 'preserve' | 'explain';
   diagrams_handling: 'preserve' | 'describe';
   analogies: 'none' | 'add_one' | 'add_multiple';
   structure: 'identical' | 'reorganize';
-  language?: string;
+  language?: TheoryLanguage;
   target_audience?: string | null;
   custom_instructions?: string | null;
   // v3 recap rules (opt-in). Empty / omitted = no recap behavior.
@@ -65,7 +72,7 @@ export const getRecapRules = () => req<RecapRule[]>(`/api/recap-rules`);
 // are stable. Reviewer immediately sees that regen IS doing something.
 export const defaultTheoryParams: TheoryRegenParams = {
   intensity: 'heavy',
-  tone: 'academic',
+  tone: 'academic_pedagogical',
   equations_handling: 'preserve',
   diagrams_handling: 'preserve',
   analogies: 'add_one',

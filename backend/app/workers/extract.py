@@ -855,8 +855,17 @@ def regenerate_book_task(
             return any(t.startswith(p) for p in _EX_PREFIXES)
 
         if section_ids is None:
-            # "Regen all" — drop containers + example sections
-            sections = [s for s in all_sections if s.section_id not in container_ids]
+            # "Regen all" — drop containers that have NO direct blocks of their
+            # own (pure structural wrappers whose content lives entirely in
+            # child sections). Containers that carry their own blocks — e.g. a
+            # "Relation" heading with an intro paragraph — ARE included so that
+            # intro paragraph gets regenerated block-by-block like any other
+            # section. Empty containers are still skipped to avoid wasting a
+            # Gemini call on a section with nothing to rewrite.
+            sections = [
+                s for s in all_sections
+                if s.section_id not in container_ids or bool(s.blocks)
+            ]
             before_n = len(sections)
             sections = [s for s in sections if not _is_example_section(s)]
             skipped_n = before_n - len(sections)
@@ -893,7 +902,11 @@ def regenerate_book_task(
             return {"ok": False, "reason": "no_sections"}
 
         try:
-            rp = RegenParams(**params)
+            # Normalize deprecated tone/language values from older stored
+            # regen rows (covers normal dispatch + startup orphan recovery).
+            from app.schemas.regen import normalize_legacy_params
+
+            rp = RegenParams(**normalize_legacy_params(params))
         except Exception as e:
             _update_job(
                 session,

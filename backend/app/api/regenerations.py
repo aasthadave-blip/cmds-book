@@ -15,7 +15,7 @@ from app.models.job import Job
 from app.models.regeneration import Regeneration
 from app.models.section import Section
 from app.schemas.book import BookUploadResponse
-from app.schemas.regen import RegenerationOut, RegenParams
+from app.schemas.regen import RegenerationOut, RegenParams, normalize_legacy_params
 
 router = APIRouter(tags=["regenerations"])
 
@@ -204,6 +204,11 @@ async def rerun_section(
     custom = body.get("custom_instructions", "")
     if custom:
         base_params["custom_instructions"] = custom
+    # Legacy-value normalization: regenerations created before the tone
+    # rename + language narrowing store old enum values (e.g. tone="academic",
+    # language="ta"). Re-running them would 422 against the current RegenParams
+    # schema, so map legacy values to their closest current equivalents.
+    base_params = normalize_legacy_params(base_params)
     # recap_rule_ids might leak through base_params; that's fine — keep them
     params = RegenParams(**base_params)
     recap_ids = list(params.recap_rule_ids or [])
