@@ -20,6 +20,13 @@ import remarkGfm from 'remark-gfm';
 // We import it lazily here so it's pulled in only when MathMarkdown
 // is first used in the bundle.
 import 'katex/dist/katex.min.css';
+// mhchem extension — enables `\ce{...}` chemistry formulas:
+//   \ce{H2O}            → H₂O
+//   \ce{CH3-CH2-OH}     → CH₃–CH₂–OH
+//   \ce{Fe^{2+}}        → Fe²⁺
+//   \ce{2H2 + O2 -> 2H2O}  → balanced reaction with arrow
+// Side-effect import — registers \ce, \pu, \bond commands globally with KaTeX.
+import 'katex/contrib/mhchem';
 
 type Props = {
   children: string;

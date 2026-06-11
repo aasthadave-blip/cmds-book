@@ -674,14 +674,23 @@ export function useExtractionPipeline(): UseExtractionPipeline {
       // creates jobs for Q+Fig WITHOUT going through the frontend, so
       // the frontend never gets those job IDs. We use book.<stage>_status
       // (now exposed by BookOut after Day 12.5) as the source of truth.
+      // Poll the book whenever the pipeline is in-flight and ANY stage is
+      // (or may be) driven by the backend orchestrator without a client
+      // jobId. book.<stage>_status is the single source of truth on the
+      // server-auto-proceed path. Kept deliberately BROAD — covering every
+      // in-flight phase plus any non-terminal jobless stage — so a new
+      // stage or a new status string can never silently stop the polling.
+      // That silent-stop was the class of bug that hid live progress and
+      // forced manual refreshes.
       const needsBookPoll =
-        s.bookId && (
-          // legacy case — theory running with no jobId (attached to backend run)
-          (s.theory.status === 'running' && !s.theory.jobId) ||
-          // ORCH 12.5 — Q or Fig without a job ID means backend dispatched
-          // them and we need to discover their state from book.<stage>_status
-          (!s.questions.jobId && s.questions.status !== 'done' && s.questions.status !== 'failed') ||
-          (!s.figures.jobId && s.figures.status !== 'done' && s.figures.status !== 'failed')
+        !!s.bookId && (
+          s.phase === 'loading' ||
+          s.phase === 'analysing' ||
+          s.phase === 'approving' ||
+          s.phase === 'extracting' ||
+          (['theory', 'questions', 'figures'] as StageKey[]).some(
+            (k) => !s[k].jobId && !isTerminal(s[k].status),
+          )
         );
       if (needsBookPoll) {
         try {
@@ -705,9 +714,12 @@ export function useExtractionPipeline(): UseExtractionPipeline {
 
           apply((prev) => {
             const patch: Partial<ExtractionState> = { bookStatus: book.status };
-            // Theory — keep existing job-poll behavior for backwards
-            // compat (legacy attached-run case). When mapped status is
-            // terminal, force the theory stage forward too.
+            // Theory — driven by book.theory_status when no client-side
+            // jobId (server auto-proceed path). Without the 'running'
+            // branch, theoryActive (line ~815) never goes true on
+            // server-kicked theory → getSections() never polled → UI
+            // shows 0% even though theory IS running. Same pattern as
+            // questions/figures below.
             const tStatus = mapStage(bk.theory_status);
             if (tStatus === 'done' && prev.theory.status !== 'done') {
               patch.theory = { ...prev.theory, status: 'done', progress: 100 };
@@ -716,6 +728,27 @@ export function useExtractionPipeline(): UseExtractionPipeline {
                 ...prev.theory,
                 status: 'failed',
                 error: 'Theory worker failed',
+              };
+            } else if (
+              tStatus === 'running'
+              && prev.theory.status !== 'running'
+              && prev.theory.status !== 'done'
+              && prev.theory.status !== 'failed'
+            ) {
+              patch.theory = {
+                ...prev.theory,
+                status: 'running',
+                message: 'Extracting theory…',
+                lastProgressAt: Date.now(),
+              };
+            } else if (
+              tStatus === 'queued'
+              && prev.theory.status === 'unknown'
+            ) {
+              patch.theory = {
+                ...prev.theory,
+                status: 'queued',
+                message: 'Queued — waiting for worker',
               };
             }
             // Questions — driven entirely by book.questions_status now
@@ -740,6 +773,32 @@ export function useExtractionPipeline(): UseExtractionPipeline {
                 patch.figures = { ...prev.figures, status: 'failed', error: 'Figures extraction failed' };
               } else if (fStatus === 'running') {
                 patch.figures = { ...prev.figures, status: 'running', message: 'Extracting figures...', lastProgressAt: Date.now() };
+              }
+            }
+
+            // ── Phase is server-authoritative ───────────────────────
+            // Advance the overall phase from book.status so the UI moves
+            // forward even when the backend orchestrator drives stages on
+            // its own (the client holds no jobIds on that path). Only ever
+            // moves FORWARD into 'analysing' / 'extracting'; never overrides
+            // a terminal or reconciling phase (those are owned by the
+            // reconcile transition below). This is what makes "View
+            // extracted" / live status appear WITHOUT a manual refresh.
+            const TERMINAL_PHASES: Phase[] = ['done', 'partial', 'error', 'reconciling'];
+            if (!TERMINAL_PHASES.includes(prev.phase)) {
+              const bstat = book.status;
+              if (bstat === 'analysing' || bstat === 'schema_ready') {
+                if (prev.phase === 'idle' || prev.phase === 'loading') {
+                  patch.phase = 'analysing';
+                }
+              } else if (
+                bstat === 'extracting'
+                || bstat === 'processing'
+                || bstat === 're_extracting'
+              ) {
+                if (prev.phase !== 'extracting') {
+                  patch.phase = 'extracting';
+                }
               }
             }
             return patch;
@@ -949,13 +1008,19 @@ export function useExtractionPipeline(): UseExtractionPipeline {
           didReconcile = true;
         }
         // 3. extracting + all 3 terminal → reconcile
+        // The jobId gate that was here previously required the CLIENT to
+        // have kicked questions or figures itself. With server auto-
+        // proceed (post-Day-8 orchestrator), the client never gets
+        // jobIds — stages flip to terminal purely via book-status
+        // polling. Dropping the jobId requirement lets the phase
+        // transition to 'done'/'partial' on the server-driven path too.
+        // All-three-terminal is sufficient ground truth.
         if (prev.phase === 'extracting') {
           const allTerm =
             isTerminal(prev.theory.status) &&
             isTerminal(prev.questions.status) &&
             isTerminal(prev.figures.status);
-          if (allTerm && (prev.questions.jobId !== null || prev.figures.jobId !== null)) {
-            // Rest finished (backend-orchestrated) — safe to reconcile.
+          if (allTerm) {
             didReconcile = true;
           }
         }
@@ -1046,11 +1111,23 @@ export function useExtractionPipeline(): UseExtractionPipeline {
             },
           }));
         } catch (e) {
-          apply(() => ({
-            phase: 'error',
-            errorMessage: `Couldn't start analyse: ${explain(e)}`,
-          }));
-          return;
+          // 409 Conflict = analyse is ALREADY running. The backend's CAS
+          // guard (or a concurrent dispatch — e.g. React StrictMode double
+          // mount, or the server auto-dispatching on upload) won the race.
+          // This is NOT a failure: schema IS being built. Treat it as
+          // "attach and observe" — stay in 'analysing' and let the tick
+          // loop pick up real progress from book.schema_status. Showing a
+          // red "FAILED" here while schema runs at 30% was the bug.
+          if (e instanceof ApiError && e.status === 409) {
+            dbg('analyse already running (409) — observing existing run');
+            apply(() => ({ phase: 'analysing' }));
+          } else {
+            apply(() => ({
+              phase: 'error',
+              errorMessage: `Couldn't start analyse: ${explain(e)}`,
+            }));
+            return;
+          }
         }
       } else if (book.status === 'analysing') {
         // Backend is still analysing. We don't know the job_id so we can't
@@ -1088,21 +1165,27 @@ export function useExtractionPipeline(): UseExtractionPipeline {
           questions: { ...prev.questions, status: 'queued', message: 'waiting for theory' },
           figures: { ...prev.figures, status: 'queued', message: 'waiting for theory' },
         }));
-      } else if (book.status === 'ready' || book.status === 'extracted') {
-        // Book is already extracted. Make /extract page READ-ONLY for this
-        // book — show everything as done and DO NOT start polling (which
-        // would otherwise auto-kick questions + figures jobs every visit).
-        // To explicitly re-extract, the user should hit the "Re-extract"
-        // CTA in the UI which fires kickThreeParallel with forceFresh.
+      } else if (
+        book.status === 'ready' ||
+        book.status === 'extracted' ||
+        book.status === 'partial' ||
+        book.status === 'approved' ||
+        book.status === 'done'
+      ) {
+        // Terminal state — fully extracted, or 'partial' (extracted with some
+        // sections failed). READ-ONLY: show done and DO NOT poll/kick. A
+        // terminal book must NEVER auto re-extract on revisit. ('partial'
+        // previously fell through to the else branch and force-re-extracted
+        // on every mount — that was the "revisiting restarts extraction" bug.)
+        // Re-running is an explicit user CTA only.
         apply((prev) => ({
-          phase: 'done',
+          phase: book.status === 'partial' ? 'partial' : 'done',
           bookStatus: book.status,
           schema:    { ...prev.schema,    status: 'done', progress: 100 },
           theory:    { ...prev.theory,    status: 'done', progress: 100 },
           questions: { ...prev.questions, status: 'done', progress: 100 },
           figures:   { ...prev.figures,   status: 'done', progress: 100 },
         }));
-        // Read-only state — do NOT call startPolling below; return early.
         return;
       } else if (book.status === 'failed') {
         apply(() => ({
@@ -1112,13 +1195,14 @@ export function useExtractionPipeline(): UseExtractionPipeline {
         }));
         return;
       } else {
-        // Unknown status — best effort: assume schema is done and kick fresh.
-        dbg('unknown book.status', book.status, '— assuming schema done, forcing fresh kick');
+        // Unknown / in-progress status — OBSERVE only. Never auto-fire a
+        // destructive re-extract (that restarted books on every mount). The
+        // server's coordinator drives progression; we just poll & reflect.
+        dbg('unhandled book.status', book.status, '— observing (no destructive kick)');
         apply((prev) => ({
           phase: 'extracting',
           schema: { ...prev.schema, status: 'done', progress: 100 },
         }));
-        await kickThreeParallel(bookId, /* forceFresh */ true);
       }
 
       // Kick polling.

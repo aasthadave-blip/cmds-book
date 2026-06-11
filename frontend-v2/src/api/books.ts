@@ -185,6 +185,12 @@ export function useBooks() {
       const raw = await req<BackendBook[]>('/api/books');
       return raw.map(adaptBook);
     },
+    // Continuous reconciliation of the library with the server: new books
+    // (including ones uploaded by OTHER users) and status changes appear
+    // without a manual refresh. The /api/books list is cheap; 5s is a good
+    // balance for a multi-team service.
+    refetchInterval: 5000,
+    refetchOnWindowFocus: true,
   });
 
   const state: State = q.isPending
@@ -231,6 +237,17 @@ export function useBook(id: string | undefined) {
       return { book, chapters, raw } as BookDetail;
     },
     enabled: Boolean(id),
+    // Live status: poll fast while the book is in-flight (schema/theory/
+    // questions/figures running) so the extract progress screen updates on
+    // its own. Stop once the book reaches a terminal state (ready/failed)
+    // to avoid pointless polling. Reconciliation, not one-shot.
+    refetchInterval: (query) => {
+      const raw = query.state.data?.raw?.status;
+      if (!raw) return 2500; // still loading → keep polling
+      const terminal = READY_STATUSES.has(raw) || raw === 'failed';
+      return terminal ? false : 2500;
+    },
+    refetchOnWindowFocus: true,
   });
 
   const state: BookState = !id

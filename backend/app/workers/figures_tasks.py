@@ -127,6 +127,31 @@ def _load_pdf_bytes(book: Book) -> bytes:
     return download_pdf(book.pdf_url or "")
 
 
+def _derive_body_type(cands: list[dict[str, Any]]) -> str | None:
+    """Derive Figure.body_type from a list of Gemini candidate refs.
+
+    The figure extractor prompt emits per-candidate `context` as one of
+    "theory" | "question" | "solution" | "other". Only figures that
+    belong to a question (Cat A) need a body_type:
+
+        any context == "solution" → "solution" (figure is in worked solution)
+        any context == "question" → "question" (figure is in question stem)
+        else (theory / other / empty) → None
+
+    Solution wins over question if BOTH are present on different
+    candidates: the figure visually sits inside the solution body, the
+    question-context ref is the cross-reference back to its parent
+    question. The embedder uses body_type to pick Question.raw_text vs
+    Question.solution_text for placement.
+    """
+    contexts = {c.get("context") for c in cands if c.get("context")}
+    if "solution" in contexts:
+        return "solution"
+    if "question" in contexts:
+        return "question"
+    return None
+
+
 # ---------------------------------------------------------------------------
 # extract_figures_v2
 # ---------------------------------------------------------------------------
@@ -172,14 +197,17 @@ def _extract_figures_v2_impl(book_id: str, job_id: str) -> dict[str, Any]:
                 status="failed", error="book has no pdf_url",
                 finished_at=datetime.utcnow(),
             )
-            book.figures_status = "failed"
-            session.commit()
+            from app.workers.orchestrator import cas_set_stage
+            if cas_set_stage(
+                session, book_uuid, "figures", "failed",
+                from_states=("running",),
+            ):
+                session.commit()
             _orch_dispatch(book_uuid)  # ORCH Day 6
             return {"status": "failed", "error": "book has no pdf_url"}
-        # Phase 5d (CONTRACT.md §2): mark figures stage as running. Watchdog
-        # (Phase 7) will detect runs that stall past stale_after.
-        book.figures_status = "running"
-        session.commit()
+        # NOTE: figures_status="running" is now set atomically by the
+        # orchestrator's _dispatch_figures (CAS) before this worker
+        # fires. No-op here.
 
         _update_job(
             session, job_uuid,
@@ -218,11 +246,15 @@ def _extract_figures_v2_impl(book_id: str, job_id: str) -> dict[str, Any]:
                 status="failed", error=f"Gemini extract failed: {e}",
                 finished_at=datetime.utcnow(),
             )
-            # Phase 5d: Gemini extract failed.
+            # CAS-protected failure write.
             b = session.get(Book, book_uuid)
             if b is not None:
-                b.figures_status = "failed"
-                session.commit()
+                from app.workers.orchestrator import cas_set_stage
+                if cas_set_stage(
+                    session, book_uuid, "figures", "failed",
+                    from_states=("running",),
+                ):
+                    session.commit()
         _orch_dispatch(book_uuid)  # ORCH Day 6
         return {"status": "failed", "error": str(e)}
 
@@ -306,6 +338,65 @@ def _extract_figures_v2_impl(book_id: str, job_id: str) -> dict[str, Any]:
                 session, book_uuid, primary_section_ref
             ) if primary_section_ref else None
 
+            # Unified section resolver (post-Gemini, code-only). Replaces
+            # Gemini's fragile visual-proximity guess with deterministic
+            # block-text search:
+            #   LABELED   → find which section's prose contains the label
+            #               (e.g. "Figure 8.1"). Caption disambiguates ties.
+            #   UNLABELED → find which section's prose contains the
+            #               anchor_text. Safe page-proximity fallback that
+            #               refuses to silently pick when multiple leaf
+            #               sections share the page (the old bug).
+            anchor_text = head.get("anchor_text") or ""
+            page_number = head.get("page")
+            is_labelled = bool(head.get("is_labelled"))
+            label = (
+                head.get("normalized_label")
+                or head.get("placeholder_text")
+                or head.get("caption")
+            )
+            caption = head.get("caption")
+
+            # Run resolver if we have ANY signal to work with (label OR
+            # anchor). Falls through to Gemini's primary_section_ref
+            # when neither yields a confident match.
+            if (is_labelled and label) or anchor_text:
+                from app.services.figure_section_resolver import (
+                    resolve_section_for_figure,
+                )
+                from app.models.section import Section as _Section
+
+                theory_sections = session.execute(
+                    select(_Section).where(_Section.book_id == book_uuid)
+                ).scalars().all()
+
+                resolved = resolve_section_for_figure(
+                    is_labelled=is_labelled,
+                    label=label,
+                    caption=caption,
+                    anchor_text=anchor_text,
+                    page_number=page_number,
+                    fallback_section_ref=primary_section_ref or "",
+                    fallback_section_uuid=primary_section_uuid,
+                    theory_sections=list(theory_sections),
+                )
+                if resolved.resolved_section_ref and (
+                    resolved.resolved_section_ref != primary_section_ref
+                ):
+                    logger.info(
+                        "figure_section_resolver: override book=%s fig=%s "
+                        "labelled=%s label=%r anchor=%r %r → %r "
+                        "(reason=%s, matched=%r)",
+                        book_uuid, fig_id_text, is_labelled,
+                        (label or "")[:40], anchor_text[:60],
+                        primary_section_ref,
+                        resolved.resolved_section_ref,
+                        resolved.reason,
+                        resolved.matched_sections,
+                    )
+                    primary_section_ref = resolved.resolved_section_ref
+                    primary_section_uuid = resolved.resolved_section_uuid
+
             fig_row = Figure(
                 book_id=book_uuid,
                 section_id=primary_section_ref or "_orphan",
@@ -328,6 +419,13 @@ def _extract_figures_v2_impl(book_id: str, job_id: str) -> dict[str, Any]:
                 context_hint=", ".join(
                     sorted({c.get("context") for c in cands if c.get("context")})
                 ) or None,
+                # F3: body_type — derived from the same Gemini context values.
+                # The prompt already distinguishes "question" (question stem)
+                # from "solution" (worked solution body). For theory figs
+                # body_type stays NULL — context_hint alone identifies them.
+                # Solution wins over question if a figure has BOTH (it sits
+                # in the worked-solution body, not the question stem).
+                body_type=_derive_body_type(cands),
                 regen_meta=positional_meta,
             )
             session.add(fig_row)
@@ -382,27 +480,36 @@ def _extract_figures_v2_impl(book_id: str, job_id: str) -> dict[str, Any]:
             "references_created": inserted_refs,
             "missed_anchors": metadata.get("missed_anchors") or [],
         }
-        # Phase 5d: figures stage done. "partial" if some anchors missed
-        # but at least one figure was inserted; "done" if everything clean.
-        # Empty PDFs (no figures detected at all) count as "done", not failed.
+        # Figures stage terminal write — CAS-protected so a duplicate
+        # or /re-extract reset can't be clobbered. Empty PDFs (no figures
+        # detected) count as "done", not failed.
         book_row = session.get(Book, book_uuid)
         if book_row is not None:
             missed = len(result["missed_anchors"])
             if inserted_figures == 0 and missed == 0:
-                book_row.figures_status = "done"  # no figures in PDF
+                new_status = "done"  # no figures in PDF
             elif missed > 0 and inserted_figures > 0:
-                book_row.figures_status = "partial"
+                new_status = "partial"
             elif inserted_figures > 0:
-                book_row.figures_status = "done"
+                new_status = "done"
             else:
-                book_row.figures_status = "failed"
-            # Phase 5e: re-derive book.status. Figures is often the last
-            # stage to complete; this is where the book finally flips to
-            # "ready" (or "partial" if anything failed/empty).
-            from app.services.book_status import derive_book_status
-            derived = derive_book_status(book_row)
-            book_row.status = "extracting" if derived == "queued" else derived
-            session.commit()
+                new_status = "failed"
+            from app.workers.orchestrator import cas_set_stage
+            if cas_set_stage(
+                session, book_uuid, "figures", new_status,
+                from_states=("running",),
+            ):
+                session.refresh(book_row)
+                from app.services.book_status import derive_book_status
+                derived = derive_book_status(book_row)
+                book_row.status = "extracting" if derived == "queued" else derived
+                session.commit()
+            else:
+                logger.info(
+                    "extract_figures_v2: dropping terminal write — "
+                    "figures_status no longer 'running' book=%s",
+                    book_uuid,
+                )
         _update_job(
             session, job_uuid,
             status="succeeded", progress=100,

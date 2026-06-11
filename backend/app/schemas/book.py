@@ -40,6 +40,10 @@ class BookOut(BookBase):
     theory_retries: int = 0
     questions_retries: int = 0
     figures_retries: int = 0
+    # SCHEMA Rebalance — surface validator warnings to the frontend so
+    # the user can see why a schema landed in `needs_review` state (or
+    # why an otherwise-accepted schema still has informational warnings).
+    schema_warnings: list[dict[str, Any]] | None = None
     created_at: datetime
     updated_at: datetime
 
@@ -62,6 +66,7 @@ class BookOut(BookBase):
             theory_retries=book.theory_retries,
             questions_retries=book.questions_retries,
             figures_retries=book.figures_retries,
+            schema_warnings=book.schema_warnings,
             created_at=book.created_at,
             updated_at=book.updated_at,
         )

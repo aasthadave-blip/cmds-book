@@ -23,6 +23,7 @@ import { useCallback, useEffect, useMemo, useRef, useState } from 'react';
 import { useNavigate, useParams } from 'react-router-dom';
 
 import { API_BASE, ApiError, req } from '../api/client';
+import { MathMarkdown } from '../components/MathMarkdown';
 import { useBook } from '../api/books';
 import { useSections, type Section } from '../api/sections';
 import {
@@ -1584,10 +1585,11 @@ function QuestionContent({
           fontSize: 13.5,
           lineHeight: 1.55,
           color: 'var(--ink-900)',
-          whiteSpace: 'pre-wrap',
         }}
       >
-        {question.raw_text || (
+        {question.raw_text ? (
+          <MathMarkdown>{question.raw_text}</MathMarkdown>
+        ) : (
           <em style={{ color: 'var(--ink-400)' }}>(no text)</em>
         )}
       </div>
@@ -1624,11 +1626,9 @@ function QuestionContent({
               fontSize: 12.5,
               lineHeight: 1.6,
               color: 'var(--ink-800)',
-              whiteSpace: 'pre-wrap',
-              fontFamily: 'var(--font-mono)',
             }}
           >
-            {question.solution_text}
+            <MathMarkdown>{question.solution_text || ''}</MathMarkdown>
           </div>
         </details>
       )}

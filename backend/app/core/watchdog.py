@@ -42,6 +42,26 @@ STALE_AFTER_S = 300
 # kills stale Jobs, so Job cleanup happens first, then locks release.
 ORCH_LOCK_TIMEOUT_MIN = 10
 
+# Build Step 1 — Reconciliation safety net.
+# Event-only orchestration breaks permanently if any dispatch event is
+# lost (crash, OOM, exception between status-write and dispatch). The
+# reconciler periodically re-drives in-flight books that have gone stale
+# with no live Job, so "stuck forever" is architecturally impossible.
+#
+# RECONCILE_BATCH    — max stalled books re-driven per scan (anti-herd).
+# MAX_RECOVERY_ATTEMPTS — give up after this many re-drives and mark the
+#                      book failed (anti-infinite-loop / burning Gemini).
+#                      Reset to 0 in the coordinator on real forward
+#                      progress, so a recovered book gets the full budget
+#                      again on any later legitimate stall.
+RECONCILE_BATCH = 5
+MAX_RECOVERY_ATTEMPTS = 5
+
+# In-flight book.status values the reconciler is allowed to touch. NEVER
+# includes terminal states (ready/failed/partial) or schema_ready (which
+# covers schema_status == 'done' awaiting approval AND needs_review).
+_INFLIGHT_STATUSES = ("analysing", "extracting", "processing")
+
 
 _engine = create_engine(settings.SYNC_DATABASE_URL, pool_pre_ping=True)
 _WatchdogSession = sessionmaker(bind=_engine, class_=Session, autoflush=False)
@@ -114,6 +134,7 @@ def _scan_once() -> int:
             if has_live_job is not None:
                 continue  # legitimate in-flight
             # No live Job, but stage(s) say "running" → orphan. Fail them.
+            any_orphan_marked = False
             for stage in (
                 "schema_status", "theory_status",
                 "questions_status", "figures_status",
@@ -126,8 +147,25 @@ def _scan_once() -> int:
                         book.id, stage,
                     )
                     killed += 1
+                    any_orphan_marked = True
             book.status = derive_book_status(book)
             session.commit()
+
+            # Day 15 fix — fire coordinator after orphan cleanup so the
+            # state machine can auto-retry (if retry budget remains) or
+            # finalize. Without this dispatch, the book sits in 'failed'
+            # forever and the auto-retry safety net never activates.
+            # Same pattern as the stale-lock branch below.
+            if any_orphan_marked:
+                try:
+                    from app.workers.runner import dispatch
+                    dispatch("coordinate_extraction", str(book.id))
+                except Exception as e:
+                    logger.warning(
+                        "watchdog: orphan-cleanup coordinator dispatch "
+                        "failed for book=%s: %s",
+                        book.id, e,
+                    )
 
         # ORCH Day 11 — force-release stale orchestrator locks.
         # The coordinator normally holds extraction_lock_at only during
@@ -171,7 +209,113 @@ def _scan_once() -> int:
                     book.id, e,
                 )
             killed += 1
+
+        # Build Step 1 — reconciliation safety net. Runs AFTER the
+        # stale-job, orphan-stage, and stale-lock branches so any locks
+        # those branches released are visible here. Re-drives in-flight
+        # books that have gone stale with no live Job by dispatching the
+        # idempotent coordinator (NOT workers directly — the coordinator's
+        # CAS-lock handles concurrency).
+        killed += _reconcile_stalled_books(session)
+
     return killed
+
+
+def _reconcile_stalled_books(session) -> int:
+    """Re-drive in-flight books that stalled with no live Job.
+
+    The single safety net that makes "stuck forever" impossible. A book
+    is stalled when:
+      - book.status is in-flight (analysing/extracting/processing) — never
+        ready/failed/partial/schema_ready, so terminal + awaiting-approval
+        + needs_review books are untouched.
+      - it hasn't been updated for STALE_AFTER_S (don't race fresh
+        dispatches — updated_at auto-bumps on every status write).
+      - no live Job (queued/running) exists for it.
+
+    Guards (Part 1d):
+      - Concurrency: we dispatch the coordinator, which CAS-locks. Two
+        watchdogs → only one coordinator proceeds.
+      - Staleness: updated_at < now - STALE_AFTER_S.
+      - Herd: LIMIT RECONCILE_BATCH per scan.
+      - Loop: recovery_attempts cap → mark failed and stop.
+      - Terminal-safe: status filter excludes ready/failed/partial; an
+        extra schema_status != 'needs_review' guard belts-and-suspenders
+        the needs_review case (book.status is 'schema_ready' there, so it
+        wouldn't match the in-flight filter anyway).
+
+    Returns the number of books re-driven OR failed this scan.
+    """
+    from app.models.book import Book
+    from app.services.book_status import derive_book_status
+
+    cutoff = datetime.now(timezone.utc) - timedelta(seconds=STALE_AFTER_S)
+
+    candidates = session.execute(
+        select(Book)
+        .where(
+            Book.status.in_(_INFLIGHT_STATUSES),
+            Book.schema_status != "needs_review",
+            Book.updated_at < cutoff,
+        )
+        .order_by(Book.updated_at.asc())
+    ).scalars().all()
+
+    acted = 0
+    for book in candidates:
+        if acted >= RECONCILE_BATCH:
+            break  # anti-thundering-herd — leave the rest for next scan
+
+        # Skip if a live Job exists (legitimate in-flight work).
+        has_live_job = session.execute(
+            select(Job).where(
+                Job.book_id == book.id,
+                Job.status.in_(["queued", "running"]),
+            ).limit(1)
+        ).scalars().first()
+        if has_live_job is not None:
+            continue
+
+        # Anti-infinite-loop: cap recovery attempts.
+        if (book.recovery_attempts or 0) >= MAX_RECOVERY_ATTEMPTS:
+            # Mark the book failed + fail the pending/in-flight stage so
+            # the user sees a clear terminal state instead of a silent
+            # spinner. Stop re-driving (don't burn Gemini calls).
+            for stage in (
+                "schema_status", "theory_status",
+                "questions_status", "figures_status",
+            ):
+                if getattr(book, stage) in ("pending", "running"):
+                    setattr(book, stage, "failed")
+                    break
+            book.status = derive_book_status(book)
+            session.commit()
+            logger.error(
+                "reconcile: book %s exceeded recovery cap (%d) → failed",
+                book.id, MAX_RECOVERY_ATTEMPTS,
+            )
+            acted += 1
+            continue
+
+        # Re-drive via the unified coordinator. It decides the right next
+        # step (dispatch_analyse / dispatch_theory / retry / finalize).
+        book.recovery_attempts = (book.recovery_attempts or 0) + 1
+        session.commit()
+        try:
+            from app.workers.runner import dispatch
+            dispatch("coordinate_extraction", str(book.id))
+            logger.warning(
+                "reconcile: re-driving stalled book %s (attempt %d/%d)",
+                book.id, book.recovery_attempts, MAX_RECOVERY_ATTEMPTS,
+            )
+        except Exception as e:
+            logger.warning(
+                "reconcile: coordinator dispatch failed for book=%s: %s",
+                book.id, e,
+            )
+        acted += 1
+
+    return acted
 
 
 async def watchdog_loop() -> None:

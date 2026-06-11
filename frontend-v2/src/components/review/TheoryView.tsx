@@ -9,6 +9,7 @@
 //   { t: 'fig', c: string, label?: str } → figure caption / reference
 //   ... other types passed through as raw JSON for now
 
+import React from 'react';
 import type { Section } from '../../api/sections';
 import type { Figure } from '../../api/figures';
 import { figureImageUrl } from '../../api/figures';
@@ -123,6 +124,47 @@ type TheoryViewProps = {
  * theory body figures all fall through to the "Figure not available inline"
  * branch even when the Figure row + image_bytes + figure_references all exist.
  */
+/** Parse a LaTeX `\begin{tabular}...\end{tabular}` string into headers + rows.
+ *
+ * Backend Unit 2 emits tables as LaTeX (e.g. "\begin{tabular}{|l|l|}\hline
+ * Element & Symbol \\ \hline Hydrogen & H \\ Oxygen & O \\ \hline
+ * \end{tabular}"). The browser KaTeX renderer doesn't render `tabular` as a
+ * real HTML table — it falls through as text. So we parse it ourselves and
+ * emit a native <table>.
+ *
+ * Recognizes: `\\` row separators, `&` cell separators, `\hline` boundaries.
+ * The first row (between the first two \hline markers) is treated as headers
+ * when present; otherwise all rows are body.
+ *
+ * Returns null if the string doesn't look like a tabular block — caller falls
+ * back to the legacy structured headers/rows path.
+ */
+function parseLatexTabular(s: string): { headers: string[]; rows: string[][] } | null {
+  const trimmed = s.trim();
+  if (!/\\begin\{tabular\}/.test(trimmed)) return null;
+  const bodyMatch = trimmed.match(/\\begin\{tabular\}\{[^}]*\}([\s\S]*?)\\end\{tabular\}/);
+  if (!bodyMatch) return null;
+  const body = bodyMatch[1];
+  // Split row-by-row on `\\` while preserving any inline LaTeX. Then drop
+  // \hline tokens (they're separators, not content).
+  const rawRows = body
+    .split(/\\\\/)
+    .map((r) => r.replace(/\\hline/g, '').trim())
+    .filter((r) => r.length > 0);
+  if (rawRows.length === 0) return null;
+  const rows = rawRows.map((r) =>
+    r.split('&').map((c) => c.replace(/\\textbackslash\{\}/g, '\\').trim())
+  );
+  // Heuristic: if the original body has \hline both before and after the
+  // first row (i.e. "\hline X & Y \\ \hline"), treat the first row as headers.
+  const firstHlineRe = /\\begin\{tabular\}\{[^}]*\}\s*\\hline/;
+  const hasHeaderHline = firstHlineRe.test(trimmed);
+  if (hasHeaderHline && rows.length > 1) {
+    return { headers: rows[0], rows: rows.slice(1) };
+  }
+  return { headers: [], rows };
+}
+
 function normLabel(s: string | null | undefined): string {
   if (!s) return '';
   // Match "Figure X.Y", "Fig. X.Y", or "Fig X.Y" prefix and capture the
@@ -236,6 +278,32 @@ export function TheoryView({
     }
   }
 
+  // Unit 10 completion: build a {block_idx → embedded figures} map so the
+  // figure_embedder's placement decisions are surfaced in the UI for figures
+  // that have no label number (and therefore can't be matched via figureByLabel).
+  //
+  // The embedder writes `placement_block_idx` on every FigureReference. The
+  // sections API exposes those rows as `section.embedded_figures`. We render
+  // each figure right AFTER its placement block, regardless of whether the
+  // figure has a label.
+  type EmbeddedFigure = {
+    placement_block_idx?: number | null;
+    image_url?: string;
+    label?: string;
+    figure_number?: string;
+    caption?: string;
+    figure_id?: string;
+    ref_id?: string;
+  };
+  const figuresByBlockIdx = new Map<number, EmbeddedFigure[]>();
+  for (const ef of (section.embedded_figures ?? []) as EmbeddedFigure[]) {
+    const idx = ef.placement_block_idx;
+    if (typeof idx !== 'number') continue;
+    const list = figuresByBlockIdx.get(idx) ?? [];
+    list.push(ef);
+    figuresByBlockIdx.set(idx, list);
+  }
+
   return (
     <div
       style={{
@@ -291,7 +359,12 @@ export function TheoryView({
         ) : (
           <div style={{ marginTop: 20 }}>
             {blocks.map((b, i) => (
-              <BlockRender key={i} block={b} figureByLabel={figureByLabel} />
+              <React.Fragment key={i}>
+                <BlockRender block={b} figureByLabel={figureByLabel} />
+                {figuresByBlockIdx.get(i)?.map((ef, j) => (
+                  <EmbeddedFigureRender key={`embed-${i}-${j}`} ef={ef} />
+                ))}
+              </React.Fragment>
             ))}
           </div>
         )}
@@ -375,13 +448,13 @@ function BlockRender({
           margin: '24px 0 10px',
         }}
       >
-        {(block as { c?: string }).c}
+        <MathMarkdown inline>{(block as { c?: string }).c ?? ''}</MathMarkdown>
       </h3>
     );
   }
   if (t === 'p') {
     return (
-      <p
+      <div
         style={{
           fontSize: 15,
           lineHeight: 1.7,
@@ -389,13 +462,16 @@ function BlockRender({
           margin: '0 0 14px',
         }}
       >
-        {(block as { c?: string }).c}
-      </p>
+        <MathMarkdown>{(block as { c?: string }).c ?? ''}</MathMarkdown>
+      </div>
     );
   }
   if (t === 'eq') {
     const c = (block as { c?: string }).c ?? '';
-    // RAW OCR rendering — display exactly what was extracted.
+    // Pipe through MathMarkdown → KaTeX renders $$...$$ display math.
+    // The backend wraps eq blocks in $$...$$ via Unit 4 latex_normalizer,
+    // so this just renders. Fallback styling kept for the rare case of
+    // raw text (no $ delimiters) — KaTeX simply prints as text.
     return (
       <div
         style={{
@@ -403,14 +479,13 @@ function BlockRender({
           background: 'var(--indigo-50)',
           border: '1px solid var(--indigo-100)',
           borderRadius: 10,
-          fontFamily: 'var(--font-mono)',
           fontSize: 14,
           color: 'var(--indigo-700)',
           margin: '10px 0 14px',
-          whiteSpace: 'pre-wrap',
+          overflowX: 'auto',
         }}
       >
-        {c}
+        <MathMarkdown>{c}</MathMarkdown>
       </div>
     );
   }
@@ -447,11 +522,11 @@ function BlockRender({
               marginBottom: 4,
             }}
           >
-            {b.term}
+            <MathMarkdown inline>{b.term}</MathMarkdown>
           </div>
         )}
         <div style={{ fontSize: 14, lineHeight: 1.65, color: 'var(--ink-800)' }}>
-          {b.c}
+          <MathMarkdown>{b.c ?? ''}</MathMarkdown>
         </div>
       </div>
     );
@@ -482,12 +557,12 @@ function BlockRender({
         >
           Key Point
         </div>
-        {(block as { c?: string }).c}
+        <MathMarkdown>{(block as { c?: string }).c ?? ''}</MathMarkdown>
       </div>
     );
   }
   if (t === 'fig') {
-    const b = block as { c?: string; label?: string };
+    const b = block as { c?: string; caption?: string; label?: string };
     // Look up the actual Figure row for inline image rendering.
     const key = normLabel(b.label) || normLabel(b.c);
     const fig = key ? figureByLabel.get(key) : undefined;
@@ -553,9 +628,13 @@ function BlockRender({
               {b.label ?? fig?.figure_number}
             </div>
           )}
-          {(b.c || fig?.caption) && (
+          {/* Description: read from block's c, then block's caption,
+              then the matched Figure row's caption. block_normalizer
+              outputs `caption`, so unlabeled figs (caption-only blocks)
+              were rendering empty before this fallback was added. */}
+          {(b.c || b.caption || fig?.caption) && (
             <div style={{ fontSize: 12.5, color: 'var(--ink-700)', lineHeight: 1.5 }}>
-              {b.c ?? fig?.caption}
+              {b.c ?? b.caption ?? fig?.caption}
             </div>
           )}
         </figcaption>
@@ -582,8 +661,8 @@ function BlockRender({
         }}
       >
         {items.map((it, i) => (
-          <li key={i} style={{ marginBottom: 6, whiteSpace: 'pre-wrap' }}>
-            {strip(it)}
+          <li key={i} style={{ marginBottom: 6 }}>
+            <MathMarkdown inline>{strip(it)}</MathMarkdown>
           </li>
         ))}
       </Tag>
@@ -591,10 +670,94 @@ function BlockRender({
   }
   if (t === 'table') {
     const b = block as {
-      headers?: string[];
-      rows?: string[][];
+      c?: string;            // Unit 2: LaTeX \begin{tabular}...\end{tabular}
+      headers?: string[];    // legacy structured form
+      rows?: string[][];     // legacy structured form
       caption?: string;
     };
+    // LaTeX tabular path — backend now ships `c` field. Convert
+    // \begin{tabular}{|l|l|}\hline H1 & H2 \\ ... \end{tabular} into an
+    // HTML <table> we can style. KaTeX doesn't render tabular as a real
+    // HTML table; parsing it ourselves gives us native <table> output.
+    if (b.c && b.c.trim()) {
+      const parsed = parseLatexTabular(b.c);
+      if (parsed) {
+        const { headers, rows } = parsed;
+        return (
+          <div style={{ margin: '10px 0 16px' }}>
+            {b.caption && (
+              <div
+                style={{
+                  fontSize: 12,
+                  color: 'var(--ink-500)',
+                  fontStyle: 'italic',
+                  marginBottom: 6,
+                }}
+              >
+                <MathMarkdown inline>{b.caption}</MathMarkdown>
+              </div>
+            )}
+            <div
+              style={{
+                overflowX: 'auto',
+                border: '1px solid var(--line)',
+                borderRadius: 8,
+              }}
+            >
+              <table
+                style={{
+                  width: '100%',
+                  borderCollapse: 'collapse',
+                  fontSize: 13,
+                }}
+              >
+                {headers.length > 0 && (
+                  <thead>
+                    <tr>
+                      {headers.map((h, i) => (
+                        <th
+                          key={i}
+                          style={{
+                            padding: '8px 12px',
+                            background: 'var(--surface-2)',
+                            textAlign: 'left',
+                            fontWeight: 700,
+                            color: 'var(--ink-900)',
+                            borderBottom: '1px solid var(--line)',
+                          }}
+                        >
+                          <MathMarkdown inline>{h}</MathMarkdown>
+                        </th>
+                      ))}
+                    </tr>
+                  </thead>
+                )}
+                <tbody>
+                  {rows.map((row, ri) => (
+                    <tr key={ri}>
+                      {row.map((cell, ci) => (
+                        <td
+                          key={ci}
+                          style={{
+                            padding: '8px 12px',
+                            borderTop: '1px solid var(--line-2)',
+                            verticalAlign: 'top',
+                            color: 'var(--ink-800)',
+                          }}
+                        >
+                          <MathMarkdown inline>{cell}</MathMarkdown>
+                        </td>
+                      ))}
+                    </tr>
+                  ))}
+                </tbody>
+              </table>
+            </div>
+          </div>
+        );
+      }
+    }
+    // Legacy structured form (existing prod data uses this)
     return (
       <div style={{ margin: '10px 0 16px' }}>
         {b.caption && (
@@ -638,7 +801,7 @@ function BlockRender({
                         borderBottom: '1px solid var(--line)',
                       }}
                     >
-                      {h}
+                      <MathMarkdown inline>{h}</MathMarkdown>
                     </th>
                   ))}
                 </tr>
@@ -657,7 +820,7 @@ function BlockRender({
                         color: 'var(--ink-800)',
                       }}
                     >
-                      {cell}
+                      <MathMarkdown inline>{cell}</MathMarkdown>
                     </td>
                   ))}
                 </tr>
@@ -794,5 +957,99 @@ function BlockRender({
         {JSON.stringify(block, null, 2)}
       </pre>
     </details>
+  );
+}
+
+
+/** Render a figure attached at a specific block position by the figure
+ * embedder. Used for figures without printed labels (anchor-only / position
+ * fallback) that the label-keyed `figureByLabel` map cannot resolve.
+ * The image_url comes from the API response (`/api/figures/<id>/image`).
+ */
+function EmbeddedFigureRender({
+  ef,
+}: {
+  ef: {
+    image_url?: string;
+    label?: string;
+    figure_number?: string;
+    caption?: string;
+    placement_kind?: string;
+    figure_id?: string;
+  };
+}) {
+  const label = ef.figure_number || ef.label || '';
+  const hasImage = Boolean(ef.image_url);
+  return (
+    <figure
+      style={{
+        margin: '14px 0 18px',
+        padding: 0,
+        border: '1px solid var(--line)',
+        borderRadius: 10,
+        overflow: 'hidden',
+        background: 'var(--surface)',
+      }}
+    >
+      {hasImage ? (
+        <div
+          style={{
+            background: 'var(--surface-2)',
+            padding: 12,
+            display: 'grid',
+            placeItems: 'center',
+            borderBottom: '1px solid var(--line)',
+          }}
+        >
+          <img
+            src={ef.image_url}
+            alt={label || ef.caption || 'Figure'}
+            style={{
+              maxWidth: '100%',
+              maxHeight: 360,
+              objectFit: 'contain',
+              display: 'block',
+            }}
+          />
+        </div>
+      ) : (
+        <div
+          style={{
+            padding: 14,
+            background: 'var(--surface-2)',
+            borderBottom: '1px dashed var(--line)',
+            display: 'flex',
+            gap: 12,
+            alignItems: 'center',
+            fontSize: 13,
+            color: 'var(--ink-500)',
+          }}
+        >
+          <Icon name="image" size={18} className="muted" />
+          <span>Figure not available inline</span>
+        </div>
+      )}
+      {(label || ef.caption) && (
+        <figcaption style={{ padding: '10px 14px' }}>
+          {label && (
+            <div
+              style={{
+                fontWeight: 700,
+                color: 'var(--ink-900)',
+                marginBottom: 4,
+                fontSize: 13.5,
+              }}
+            >
+              {label}
+            </div>
+          )}
+          {ef.caption && (
+            <div style={{ fontSize: 12.5, color: 'var(--ink-700)', lineHeight: 1.5 }}>
+              {ef.caption}
+            </div>
+          )}
+        </figcaption>
+      )}
+    </figure>
   );
 }

@@ -104,38 +104,56 @@ async def list_sections(
     result = await session.execute(
         select(Section).where(Section.book_id == book_id)
     )
-    secs_by_id = {s.section_id: s for s in result.scalars().all()}
+    all_sections = list(result.scalars().all())
+    secs_by_id = {s.section_id: s for s in all_sections}
+    # UUID-keyed map — canonical identity (CONTRACT.md §1).
+    # Schema sections carry `uuid` per SchemaSection.uuid; Section rows
+    # use `id` (UUID PK). When both align, lookup is drift-proof.
+    secs_by_uuid = {str(s.id): s for s in all_sections}
     embedded_by_section = await _load_embedded_figures(session, book_id)
 
     # Build the canonical schema order. Same helper used by books.py
     # export ordering — keep the two paths consistent.
-    ordered_ids: list[str] = []
+    # Lookup priority: UUID (canonical) → slug (legacy).
+    # For new books (post-UUID migration), UUID matches → correct order.
+    # For legacy books with drifted slugs AND no matching UUID, the section
+    # falls through to the lexicographic fallback at the bottom (broken
+    # order — a pre-existing data issue, not fixed here).
+    ordered_sections: list[Section] = []
+    seen_section_pks: set = set()
     book = await session.get(Book, book_id)
     if book is not None and book.schema:
         try:
             schema_obj = BookSchema(**book.schema)
             for ss in _flatten(schema_obj):
-                if ss.id in secs_by_id and ss.id not in ordered_ids:
-                    ordered_ids.append(ss.id)
+                matched: Section | None = None
+                # 1. UUID (canonical, drift-proof)
+                if ss.uuid and ss.uuid in secs_by_uuid:
+                    matched = secs_by_uuid[ss.uuid]
+                # 2. Slug (works when slugs happen to align)
+                elif ss.id in secs_by_id:
+                    matched = secs_by_id[ss.id]
+                if matched is None or matched.id in seen_section_pks:
+                    continue
+                ordered_sections.append(matched)
+                seen_section_pks.add(matched.id)
         except Exception:
-            ordered_ids = []
+            ordered_sections = []
+            seen_section_pks = set()
 
     # Build the output list in schema order, then append any DB-only
     # sections (defensive — orphans that aren't in the schema but exist
     # in the sections table) at the end in lexicographic order so they
     # remain visible to the user / editor.
     out: list[SectionOut] = []
-    seen: set[str] = set()
-    for sid in ordered_ids:
-        s = secs_by_id[sid]
+    for s in ordered_sections:
         d = SectionOut.model_validate(s)
         d.embedded_figures = embedded_by_section.get(s.section_id, [])
         out.append(d)
-        seen.add(sid)
     for sid in sorted(secs_by_id):
-        if sid in seen:
-            continue
         s = secs_by_id[sid]
+        if s.id in seen_section_pks:
+            continue
         d = SectionOut.model_validate(s)
         d.embedded_figures = embedded_by_section.get(s.section_id, [])
         out.append(d)

@@ -55,6 +55,14 @@ class Figure(Base):
     regen_cache_key: Mapped[str | None] = mapped_column(sa.String(64), nullable=True)
     context_hint: Mapped[str | None] = mapped_column(sa.String(32), nullable=True)
     regen_meta: Mapped[dict | None] = mapped_column(sa.JSON, nullable=True)
+    # 0030 — body_type. Only meaningful when context_hint = "question":
+    #   "question" → figure appears in the question stem (the prompt body)
+    #   "solution" → figure appears in the worked solution (e.g. step diagram)
+    #   NULL        → not applicable (theory figs leave this null;
+    #                  context_hint alone identifies them)
+    # Used by the question-figure embedder (F1/F2) to route into
+    # Question.raw_text vs Question.solution_text.
+    body_type: Mapped[str | None] = mapped_column(sa.String(16), nullable=True)
     # 0016 — Q5 approval workflow. Set when user clicks "Approve & move to
     # Regenerated"; cleared on Unapprove. ✨ Regenerated folder filters
     # to rows where approved_at IS NOT NULL.

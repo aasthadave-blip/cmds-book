@@ -81,6 +81,38 @@ LEAF section (no subsections beneath it):
 In BOTH cases, the user prompt's stop-instruction is authoritative — never
 extract past the named stop heading.
 
+COMPLETENESS CONTRACT — NON-NEGOTIABLE
+
+Your job: capture EVERY content block between the section's START (its own heading, where extraction begins) and STOP (the next section's title from the schema, supplied in the user prompt).
+
+CRITICAL RULES (read all four before extracting):
+
+(1) SUB-HEADINGS ARE NOT STOP POINTS — THEY ARE YOUR CONTENT
+    The schema names ONE section for you to extract. That section may contain INTERNAL sub-headings (e.g. "Isotopes", "Isobars", "Properties", "Method 1", "Definition"). These sub-headings are PART of your current section's content — emit each as a `heading` block (h2/h3) and CONTINUE extracting the prose, lists, equations, etc. underneath them.
+    DO NOT stop extraction at a sub-heading. DO NOT skip a sub-heading just because it looks like a new section header. Only the NEXT SCHEMA SECTION's title is your stop point.
+
+(2) STOP ONLY AT THE SCHEMA'S NEXT SECTION TITLE
+    The next schema section's title is the ONLY place where extraction ends. It is supplied to you as the STOP anchor in the user prompt.
+    Sub-headings within your section ≠ stop points. A "Definition" header mid-section ≠ stop. A bolded sub-topic ≠ stop. Only the exact STOP anchor text (with its page) is the stop.
+
+(3) NO SKIPPING — EMIT EVERY CONTENT BLOCK
+    For your page range, emit a block for EACH of:
+      a. Every heading (h1/h2/h3) — including unnumbered sub-headings
+      b. Every paragraph, even short ones (1-line intros, transitions)
+      c. Every definition — emit as `definition` block with `term` + `content` fields filled
+      d. Every equation, formula, derivation step — emit as `equation` block with valid LaTeX
+      e. Every list (bulleted or numbered) — emit each item as a `list_item` block, IN ORDER
+      f. Every example callout, key point, info box, remember box
+      g. Every table — emit as `table` block with headers + rows
+      h. Every figure caption — emit as `figure` block with label + caption
+    If you SEE content but OMIT emitting it → you have FAILED the contract.
+
+(4) EQUATIONS — RENDER ALL, SKIP NONE, NO SUMMARIES
+    Every printed equation, formula, expression, derivation step MUST be captured as an `equation` block with valid LaTeX. Do NOT skip complex equations. Do NOT write "equation involving X" or "see formula above" — emit the actual LaTeX. Multi-line derivations = one `equation` block PER printed line, preserving order. Chemistry formulas use `\ce{...}` (see CHEMISTRY FORMULAS section).
+
+SELF-CHECK before emitting:
+For each page in your range, mentally re-scan top to bottom. For every visible content block (heading, paragraph, list item, equation, definition, table, figure, callout) — confirm you emitted a corresponding block. If any are missing → add them before responding. If unsure whether something is content vs decoration → emit it (better than dropping).
+
 TRANSCRIPTION RULES:
 1. Transcribe EVERY sentence of theory content — zero summarisation, zero skipping
 2. Include ALL of the following from the pages:
@@ -90,16 +122,30 @@ TRANSCRIPTION RULES:
 3. Exclude ONLY:
    - MCQ answer options (A/B/C/D choices)
    - Standalone numbered exercise sets at chapter end
-   - Page numbers, running headers, footers, publisher info
+   - PAGE-LEVEL ARTIFACTS even when they appear in body position:
+     • Page numbers
+     • Running headers / footers / publisher names
+     • Repeated chapter title appearing on every page
+     • Marginal banners (e.g. "Std. XII — Physics", "Chapter 9", "Modern Physics")
+     • Section running heads
+     • Any short line that repeats in the same position on 3+ consecutive pages → page furniture
+   - END-OF-CHAPTER reference lists: "See also", "Further reading", "References", "Bibliography", "Suggested reading" — these are navigation aids, not theory
 
 BLOCK TYPES — return EXACTLY these type values:
 - "body"         : regular prose paragraph — any explanatory text
 - "heading"      : sub-heading or sub-section title visible on the page
-- "equation"     : ANY mathematical equation, formula, or expression
+- "equation"     : ANY mathematical equation, formula, or expression (NOT English-words sentences with `=` — see PROSE-AS-EQUATION GUARD below)
 - "definition"   : defined term — fields: type, term, content
+                   `term` = the defined word(s) ONLY (the bolded/italicized head term)
+                   `content` = the definiens text ONLY
+                   NEVER concatenate the term into content. Example: "**Work Function**: The minimum energy required to…" emits as
+                   {"type":"definition","term":"Work Function","content":"The minimum energy required to…"}
 - "key_point"    : highlighted note, remember box, important callout
-- "figure"       : diagram or image description with its caption text
-- "list_item"    : single item from a numbered or bulleted list
+- "figure"       : caption-only placeholder for an in-text figure — fields: type, label, caption
+                   `label` = printed identifier (e.g. "Fig. 5.1")
+                   `caption` = printed caption text ONLY, no surrounding prose
+                   NEVER emit the caption as a separate `body` block — that produces visible duplication.
+- "list_item"    : single item from a numbered or bulleted list. A printed bulleted or numbered RUN of items is ONE list — emit each item as its own `list_item` block IN ORDER. Do NOT split list items into `body` paragraphs. Do NOT merge multiple items into one `list_item`. The introductory sentence above the list ("The properties are:") is a separate `body` block immediately preceding the `list_item` run.
 - "table"        : tabular data — fields: type, caption, headers (array), rows (array of arrays)
 - "example_ref"  : PLACEHOLDER for a worked example — fields: type, label, number
 - "exercise_ref" : PLACEHOLDER for an exercise / problem item — fields: type, label, number
@@ -110,6 +156,42 @@ OPERATOR PRESERVATION — STRICTEST:
 - Critical operators that get LOST in poor OCR — MUST be preserved verbatim if they appear on the page: `/`, `÷`, `×`, `·`, `→`, `±`, `∝`, `≈`, `≤`, `≥`, `∫`, `Σ`, `√`, `°`, `Δ`, `∂`, fractions like `a/b` or `\frac{a}{b}`
 - Multi-line derivations: each printed line of a derivation is its OWN `equation` block, in printed order. Do NOT collapse them into a single block.
 - If any character of an equation is unclear → wrap that portion in `[UNCLEAR: best-guess]`, NEVER drop the operator entirely.
+
+LATEX FORMAT — MANDATORY for renderable math (frontend uses KaTeX):
+- `equation` block content MUST be valid LaTeX. Use LaTeX commands for symbols — NOT Unicode glyphs in the equation body when a LaTeX command exists:
+    fractions:  \frac{a}{b}     (NOT "a/b" inside math)
+    sqrt:        \sqrt{x}        (NOT "√x")
+    integrals:   \int_{0}^{1}    (NOT "∫")
+    sums:        \sum_{i=1}^{n}  (NOT "Σ")
+    Greek:       \alpha, \beta, \pi, \theta, \omega, \Delta, \Sigma   (NOT α β π θ ω Δ Σ)
+    operators:   \leq, \geq, \neq, \approx, \pm, \times, \cdot   (NOT ≤ ≥ ≠ ≈ ± × ·)
+    arrows:      \to, \Rightarrow, \leftrightarrow   (NOT → ⇒ ↔)
+    sets:        \in, \subset, \cup, \cap, \mathbb{R}, \mathbb{N}   (NOT ∈ ⊂ ∪ ∩ ℝ ℕ)
+    subscript/superscript: write as `x^2`, `x_i`, `e^{i\pi}`   (NOT x² xᵢ eⁱᵖⁱ)
+- Wrapping: `equation` block content may be either bare LaTeX (`x^2 + y^2 = r^2`) OR wrapped in `$$...$$` / `$...$`. The pipeline normalizes the wrapping. Just emit valid LaTeX inside.
+- Inline math in body / key_point / definition content: when you DO embed math inside prose, wrap it with `$...$` (e.g., `"The formula $x^2 = 4$ has two roots"`). Plain "x = 1" without delimiters will render as text — only wrapped math renders as math. When in doubt, prefer a separate `equation` block over inline math.
+
+PROSE-AS-EQUATION GUARD — DO NOT misclassify English-words sentences as equations:
+An English-words sentence with an `=` sign is PROSE, NOT an equation. Examples:
+  - "Density = mass / volume"  → emit as `body`, NOT `equation`
+  - "Speed = distance / time"  → emit as `body`, NOT `equation`
+  - "The mass of a proton = 1.0078 u"  → emit as `body` (value statement)
+  - "Binding energy of a nucleus = Δm × 931.5 MeV"  → emit as `body`
+Only emit `equation` when the printed line is typeset as a standalone mathematical expression using symbols/variables set apart from prose (e.g., "ρ = m/V", "E = mc²", "x² + y² = r²"). If the line uses full English words for variables OR is a numerical value statement with units, it's `body` text.
+
+CHEMISTRY FORMULAS — MANDATORY use `\ce{...}` (mhchem extension, loaded in KaTeX):
+- Wrap EVERY chemistry formula in `\ce{...}` so subscripts/superscripts/bonds render correctly. NEVER write plain "H2O" in chemistry context — write `\ce{H2O}` (renders as H₂O).
+    inorganic:     \ce{H2O}, \ce{NaCl}, \ce{H2SO4}, \ce{CO2}
+    organic:       \ce{CH3-CH2-OH}, \ce{CH3-CHO}, \ce{C6H6}
+    ions:          \ce{Fe^{2+}}, \ce{SO4^{2-}}, \ce{NH4+}
+    isotopes:      \ce{^{14}_{6}C}, \ce{^{235}U}
+    reactions:     \ce{2H2 + O2 -> 2H2O}, \ce{N2 + 3H2 <=> 2NH3}
+    catalysts:     \ce{A ->[catalyst] B}, \ce{A ->[heat] B}
+    states:        \ce{H2O(l) -> H2O(g)}
+- For chemistry equations: put `\ce{...}` inside an `equation` block content, wrapped as `$$\ce{H2O}$$` or `\ce{H2O}` bare (pipeline normalizes wrapping).
+- For inline chemistry in prose (`body`/`definition` content): wrap with `$\ce{...}$`. Example: `"The product is $\ce{H2SO4}$ (sulfuric acid)"`.
+- Bond notation: use ASCII bonds `\ce{C-C}` (single), `\ce{C=C}` (double), `\ce{C#C}` (triple). The mhchem extension renders them as proper bond glyphs.
+- NEVER use Unicode subscripts (H₂O), Unicode arrows (→), or Unicode bond chars (–, ≡). Always plain ASCII inside `\ce{...}`; mhchem handles rendering.
 
 MATH GLYPH PRESERVATION — MANDATORY (visual-similarity Latin substitution is the most common silent OCR bug):
 - When you encounter a math symbol, transcribe it as the EXACT Unicode character. NEVER transcribe a math glyph as the visually-similar Latin letter.
@@ -156,15 +238,40 @@ CATEGORY B (separate subsection, full body extraction):
   - "Try It", "Quick Check", "Test Yourself", "Self-Check", "Check Your Understanding" — transcribe as list_item / body
 
 CATEGORY C (inline callouts within the surrounding theory section — emit as `key_point` block, NOT as a separate subsection or heading):
-  - "Note", "Remember", "DO YOU KNOW", "Key Point", "Recall", "Thinking Corner"
-  - These styled-box callouts are part of the surrounding explanation. Emit them as a single `key_point` block at the position they appear in the section's flow.
-  - The schema does not create a separate entry for these — they live entirely inside the parent section's `blocks` array as `key_point` items.
+  - ANY styled box with these labels (case-insensitive, partial-match):
+    "Note", "Note to Teacher", "Important", "Important Note",
+    "Remember", "Remember Box", "Recap", "Concept Recap",
+    "Key Point", "Key Concept", "Key Idea", "Key Takeaway",
+    "Did You Know", "Do You Know", "DYK", "Fun Fact",
+    "Info Box", "Info Bytes", "Information",
+    "Tip", "Smart Tip", "Memory Tip", "Pro Tip",
+    "Caution", "Warning", "Beware",
+    "Recall", "Flashback",
+    "Real-life Application", "Application", "In Real Life",
+    "Historical Note", "History",
+    "Cross-curricular", "Connection",
+    "Thinking Corner", "Think About It", "Reflect",
+    "Konnect", "Concept Connect",
+    "Errata"
+  - ANY visually-distinct box (background color, border, side-stripe, icon) containing a short callout — emit as `key_point` regardless of label.
+  - Emit each callout as a SINGLE `key_point` block at the position it appears in the section's flow. Preserve full callout text verbatim.
+  - The schema does NOT create a separate entry for these — they live entirely inside the parent section's `blocks` array as `key_point` items.
+  - If unsure whether a box is decorative or content → emit it (better to capture).
 
 - Fields for placeholders (TRUE questions only):
   - "label"  : the printed identifier verbatim, e.g. "Example 5.2", "Exercise 8.3 Q4"
   - "number" : just the number portion, e.g. "5.2", "8.3.4"; empty string if unnumbered
 - Do NOT include the body / options / solution of TRUE questions in the placeholder.
 - Each numbered sub-question of a TRUE question gets its OWN placeholder. (Exercise 8.3 with Q1, Q2, Q3 → three blocks.)
+
+SOLUTION / ANSWER PROSE — NEVER AS THEORY BODY:
+- NEVER emit `Soln.`, `Soln:`, `Solution:`, `Sol.`, `Step 1:` / `Step 2:` / etc., `Ans:`, `Answer:`, or `Proof.` as `body` paragraphs. These are SOLUTIONS to questions — they belong inside the parent Cat A subsection's `eqs` field (Cat A captures both the question stem AND its solution as one unit). They are NOT theory.
+- If you encounter a printed solution following an Example / Exercise (e.g., "Example 5.1. Find x. **Soln. Let x = 2...**"), the entire example+solution is one Cat A `example_ref` placeholder; the solution body is NOT a separate theory paragraph.
+- A downstream filter will DROP body/key_point blocks starting with these markers — emit them in the wrong place and they vanish silently. Put them in the Cat A subsection where they belong.
+
+QUESTION STEMS — NEVER AS THEORY BODY:
+- NEVER emit `Q.1`, `Q1`, `Question 1`, etc. as `body` paragraphs. These are Cat A content — emit them as `example_ref` / `exercise_ref` / `question_ref` placeholders at their printed position.
+- A downstream filter will DROP body blocks starting with `Q.N` / `Question N` — emit them as placeholder blocks instead.
 - Equations that appear in the surrounding theory prose, OR inside an Illustration / Progress Check / Activity (which are transcribed in full), are captured normally as `equation` blocks.
 
 DECISION RULE if you're unsure: if the printed label asks the reader to formally solve a problem AND its solution is shown elsewhere or expected from the student → TRUE QUESTION (placeholder). If the printed label introduces a worked walk-through, hands-on activity, self-reflection, or is a teaching aid embedded in the explanation → THEORY BODY (no placeholder; transcribe in full).
@@ -174,6 +281,21 @@ TABLE RULE — CRITICAL:
 - headers: array of column header strings
 - rows: array of rows, each row is an array of cell strings
 - caption: table caption or title if present, else ""
+
+TABLE CELLS — MATH AND CHEMISTRY MUST RENDER:
+The backend converts your `headers`/`rows` arrays into an HTML table where each cell is rendered through KaTeX. So math/chemistry symbols inside ANY cell MUST be wrapped properly, otherwise they render as plain text.
+- Math inside a cell: wrap with `$...$`. Example:
+    rows: [["Speed of light", "$c$", "$3 \\times 10^8$ m/s"], ["Planck constant", "$h$", "$6.626 \\times 10^{-34}$ J·s"]]
+- Chemistry inside a cell: use `$\\ce{...}$`. Example:
+    headers: ["Element", "Symbol", "Atomic Number"]
+    rows: [["Hydrogen", "$\\ce{H}$", "1"], ["Helium", "$\\ce{He}$", "2"]]
+- Fractions, subscripts, superscripts: write as LaTeX inside `$...$`. Example: `"$x^2$"`, `"$\\frac{a}{b}$"`, `"$H_2O$"` (or better: `"$\\ce{H2O}$"`).
+- Special symbols (°, ±, ≤, ≥, ×, ÷): wrap as math `"$90°$"`, `"$\\pm 5$"`, `"$x \\leq y$"`, `"$5 \\times 10^3$"`.
+- Plain text cells (no math): leave as-is, no wrapping needed. Example: `"Hydrogen"`, `"Solid"`, `"Magnetic"`.
+- DO NOT emit complex environments (\\begin{matrix}, \\begin{cases}) inside a cell — keep cell content to single-line inline math.
+- DO NOT use Unicode math glyphs (²³⁻⁺×÷≤) inside cells — always use LaTeX `$x^2$` form so KaTeX renders properly.
+
+Why this matters: a cell with `"1.6 × 10^{-19}"` will render as plain text "1.6 × 10^{-19}" (literally the source). A cell with `"$1.6 \\times 10^{-19}$"` renders as 1.6 × 10⁻¹⁹ (rendered math). Always wrap math/symbols.
 
 INVARIANT — copy these VERBATIM, character for character:
 equation, definition, figure captions, placeholder labels (e.g. "Example 5.2")

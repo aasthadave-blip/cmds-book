@@ -68,6 +68,10 @@ _RUNNING = "running"
 _DONE = "done"
 _FAILED = "failed"
 _PARTIAL = "partial"
+# SCHEMA Rebalance — accept-with-warnings schema outcome. NOT terminal-failed
+# and NOT auto-advanceable: the book is waiting for the user to approve the
+# warnings. The coordinator must never auto-advance a needs_review book.
+_NEEDS_REVIEW = "needs_review"
 _TERMINAL = frozenset({_DONE, _FAILED, _PARTIAL})
 
 
@@ -78,6 +82,8 @@ def _decide_next_action(book: Book) -> str:
     """Decide the next single transition based on current book state.
 
     Returns one of:
+      "dispatch_analyse"    — schema pending, kick off the analyser
+      "retry_analyse"       — schema failed, retries available
       "dispatch_theory"     — schema done, theory pending
       "dispatch_questions"  — theory finalized, questions pending (alone)
       "dispatch_figures"    — theory finalized, figures pending (alone)
@@ -86,10 +92,23 @@ def _decide_next_action(book: Book) -> str:
       "retry_questions"     — questions failed, retries available
       "retry_figures"       — figures failed, retries available
       "finalize"            — all stages terminal, set book.status final
-      "no_action"           — waiting for in-flight work to complete
+      "no_action"           — waiting for in-flight work / user approval
     """
-    # Don't act until schema is fully done
+    # Build Step 1 — handle the FULL lifecycle, schema included. The
+    # coordinator is now the ONE entry point from upload → finalize.
+    if book.schema_status == _PENDING:
+        return "dispatch_analyse"
+    if book.schema_status == _RUNNING:
+        return "no_action"  # analyser in flight
+    if book.schema_status == _FAILED:
+        if (book.schema_retries or 0) < MAX_AUTO_RETRIES:
+            return "retry_analyse"
+        return "no_action"  # terminal-failed — surfaced to user, no auto-advance
+    if book.schema_status == _NEEDS_REVIEW:
+        # accept-with-warnings — waiting for user approval. NEVER auto-advance.
+        return "no_action"
     if book.schema_status != _DONE:
+        # Unknown/unexpected schema status — be safe, don't act.
         return "no_action"
 
     # Phase A — theory pending → dispatch
@@ -139,6 +158,65 @@ def _decide_next_action(book: Book) -> str:
     return "no_action"
 
 
+# ─── Atomic stage transitions (CAS) ───────────────────────────────────
+#
+# Every stage_status transition uses an atomic compare-and-set (UPDATE
+# ... WHERE) so concurrent actors can't race on it. The single rule
+# across the whole pipeline:
+#
+#     If you're about to write stage_status, you MUST check that the
+#     current value is what you expect. If it isn't, drop your write —
+#     someone else got there first.
+#
+# This closes both classes of races we hit historically:
+#   - Two dispatchers each create a worker (because both saw "pending")
+#   - The losing duplicate's failure tail overwrites the winning sibling's
+#     successful state (because the tail blindly wrote "failed")
+
+
+_STAGE_COLS = {
+    "schema":    Book.schema_status,
+    "theory":    Book.theory_status,
+    "questions": Book.questions_status,
+    "figures":   Book.figures_status,
+}
+
+
+def cas_set_stage(
+    session,
+    book_uuid: UUID,
+    stage: str,
+    new_value: str,
+    from_states: tuple[str, ...],
+) -> bool:
+    """Atomically transition a stage's status. Returns True iff we won.
+
+    `stage` is one of "schema" / "theory" / "questions" / "figures".
+    `from_states` are the values we expect the column to currently have;
+    if it's anything else, our update is a no-op and we return False —
+    the caller should drop whatever follow-up work they were planning.
+
+    Commits inside so the write lands atomically. Callers using the
+    in-memory Book object should refresh it after this returns True
+    (their `book.<stage>_status` will be stale otherwise).
+    """
+    col = _STAGE_COLS[stage]
+    result = session.execute(
+        sa.update(Book)
+        .where(Book.id == book_uuid)
+        .where(col.in_(from_states))
+        .values({col.key: new_value})
+    )
+    session.commit()
+    won = result.rowcount > 0
+    if not won:
+        logger.info(
+            "cas_set_stage: lost race book=%s stage=%s want=%s from=%s",
+            book_uuid, stage, new_value, from_states,
+        )
+    return won
+
+
 # ─── Lock primitives (atomic via UPDATE WHERE) ───────────────────────
 
 
@@ -179,6 +257,21 @@ def _release_lock(session, book_uuid: UUID) -> None:
 # ─── Dispatchers (create Job rows + dispatch worker tasks) ───────────
 
 
+def _reset_recovery_attempts(session, book: Book) -> None:
+    """Reset the reconciler's recovery counter on genuine forward progress.
+
+    Called by every dispatcher AFTER it wins the CAS into _RUNNING — i.e.
+    a stage just transitioned pending/failed → running and real work is
+    being dispatched. This means a book that recovered cleanly via the
+    reconciler is no longer carrying old recovery_attempts, so a later
+    legitimate stall gets the full MAX_RECOVERY_ATTEMPTS budget again
+    rather than being wrongly capped. Idempotent / cheap (no-op when
+    already 0). Caller commits as part of its own dispatch commit.
+    """
+    if (book.recovery_attempts or 0) != 0:
+        book.recovery_attempts = 0
+
+
 def _new_job(session, book_uuid: UUID, job_type: str) -> UUID:
     """Create a Job row, commit, return its UUID."""
     job = Job(book_id=book_uuid, type=job_type, status="queued", progress=0)
@@ -190,15 +283,55 @@ def _new_job(session, book_uuid: UUID, job_type: str) -> UUID:
 
 
 def _dispatch_theory(session, book: Book) -> None:
+    """Dispatch theory worker (extract_book).
+
+    Atomic guard via cas_set_stage — if a sibling coordinator already
+    moved theory_status out of {pending, failed}, we drop this dispatch.
+    """
+    if not cas_set_stage(
+        session, book.id, "theory", _RUNNING, from_states=(_PENDING, _FAILED),
+    ):
+        return
+    session.refresh(book)
+    _reset_recovery_attempts(session, book)
     job_id = _new_job(session, book.id, "extract")
     book.status = "extracting"
     session.commit()
     from app.workers.runner import dispatch
     dispatch("extract_book", str(book.id), str(job_id))
     logger.info(
-        "orchestrator: dispatched extract_book for book=%s job=%s",
+        "orchestrator: dispatched extract_book book=%s job=%s",
         book.id, job_id,
     )
+
+
+def _dispatch_analyse(session, book: Book) -> UUID | None:
+    """Dispatch the schema analyser (analyse_book).
+
+    Atomic guard via cas_set_stage. If schema_status is already running
+    or terminal, returns None — the API endpoint should map that to 409.
+    Otherwise returns the new job_id.
+
+    All callers (API endpoint, upload auto-dispatch, manual retry) go
+    through this function so the atomic guarantee applies to every
+    analyse dispatch site.
+    """
+    if not cas_set_stage(
+        session, book.id, "schema", _RUNNING, from_states=(_PENDING, _FAILED),
+    ):
+        return None
+    session.refresh(book)
+    _reset_recovery_attempts(session, book)
+    job_id = _new_job(session, book.id, "analyse")
+    book.status = "analysing"
+    session.commit()
+    from app.workers.runner import dispatch
+    dispatch("analyse_book", str(book.id), str(job_id))
+    logger.info(
+        "orchestrator: dispatched analyse_book book=%s job=%s",
+        book.id, job_id,
+    )
+    return job_id
 
 
 def _dispatch_questions(session, book: Book) -> None:
@@ -212,6 +345,14 @@ def _dispatch_questions(session, book: Book) -> None:
     ("Superseded") so the bank list stays clean across retries.
     """
     from app.models.question_bank import QuestionBank
+
+    # Atomic CAS FIRST — drop dispatch if a sibling already moved the stage.
+    # MUST run before any DB writes so a CAS-loser doesn't leak a
+    # QuestionBank row or clobber the winner's pending bank list.
+    if not cas_set_stage(
+        session, book.id, "questions", _RUNNING, from_states=(_PENDING, _FAILED),
+    ):
+        return
 
     # Supersede any prior pending/extracting banks (orphans from
     # earlier retries that never finished).
@@ -236,6 +377,8 @@ def _dispatch_questions(session, book: Book) -> None:
     session.flush()
     bank_id = bank.id
 
+    session.refresh(book)
+    _reset_recovery_attempts(session, book)
     job_id = _new_job(session, book.id, "extract_questions")
     book.status = "extracting"
     session.commit()
@@ -253,13 +396,19 @@ def _dispatch_questions(session, book: Book) -> None:
 
 
 def _dispatch_figures(session, book: Book) -> None:
+    if not cas_set_stage(
+        session, book.id, "figures", _RUNNING, from_states=(_PENDING, _FAILED),
+    ):
+        return
+    session.refresh(book)
+    _reset_recovery_attempts(session, book)
     job_id = _new_job(session, book.id, "extract_figures")
     book.status = "extracting"
     session.commit()
     from app.workers.runner import dispatch
     dispatch("extract_figures_v2", str(book.id), str(job_id))
     logger.info(
-        "orchestrator: dispatched extract_figures_v2 for book=%s job=%s",
+        "orchestrator: dispatched extract_figures_v2 book=%s job=%s",
         book.id, job_id,
     )
 
@@ -278,6 +427,27 @@ def _finalize(session, book: Book) -> None:
 
 
 # ─── Retry handlers (ORCH Day 7) ──────────────────────────────────────
+
+
+def _retry_analyse(session, book: Book) -> None:
+    """Auto-retry schema (analyse) after a failed first attempt.
+
+    Reset schema_status failed → pending via CAS (so we don't clobber a
+    sibling that already moved it), bump the counter, then dispatch the
+    analyser. _dispatch_analyse itself does the pending → running CAS.
+    """
+    if not cas_set_stage(
+        session, book.id, "schema", _PENDING, from_states=(_FAILED,),
+    ):
+        return  # sibling already moved it — drop this retry
+    book.schema_retries = (book.schema_retries or 0) + 1
+    session.commit()
+    session.refresh(book)
+    logger.warning(
+        "orchestrator: AUTO-RETRY schema (attempt %d of %d) for book=%s",
+        book.schema_retries + 1, MAX_AUTO_RETRIES + 1, book.id,
+    )
+    _dispatch_analyse(session, book)
 
 
 def _retry_theory(session, book: Book) -> None:
@@ -367,7 +537,11 @@ def _coordinate_extraction(book_id: str) -> dict:
                 book.questions_status, book.figures_status, action,
             )
 
-            if action == "dispatch_theory":
+            if action == "dispatch_analyse":
+                _dispatch_analyse(session, book)
+            elif action == "retry_analyse":
+                _retry_analyse(session, book)
+            elif action == "dispatch_theory":
                 _dispatch_theory(session, book)
             elif action == "dispatch_questions":
                 _dispatch_questions(session, book)

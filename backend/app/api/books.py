@@ -13,6 +13,7 @@ from uuid import UUID
 
 from fastapi import APIRouter, Body, Depends, File, Form, HTTPException, Query, UploadFile, status
 from fastapi.responses import Response
+import sqlalchemy as sa
 from sqlalchemy import select
 from sqlalchemy.ext.asyncio import AsyncSession
 
@@ -303,48 +304,47 @@ async def analyse_book(
     if not book.pdf_url:
         raise HTTPException(400, detail="Book has no associated PDF")
 
-    # Phase 7 (CONTRACT.md §5): refuse to start a second analyse while
-    # one is already in flight. Today's prod chaos came from triggering
-    # /analyse 3 times during the OOM window — three workers fought over
-    # the same book.schema field, last writer won, state went incoherent.
-    # 409 Conflict is the user-visible signal "we already heard you".
-    in_flight = (await session.execute(
-        select(Job).where(
-            Job.book_id == book_id,
-            Job.status.in_(["queued", "running"]),
-        ).limit(1)
-    )).scalars().first()
-    if in_flight is not None:
-        raise HTTPException(
-            status.HTTP_409_CONFLICT,
-            detail=(
-                f"Already analysing (job_id={in_flight.id}). Wait for it "
-                "to finish or cancel it before re-triggering."
-            ),
-        )
-
-    job = Job(book_id=book.id, type="analyse", status="queued", progress=0)
-    session.add(job)
-    await session.flush()
-
-    book.status = "analysing"
-    # Phase 5d/7: reset stage statuses on a fresh analyse cycle so the
-    # watchdog and /quality see this as a new run, not a stale one.
+    # Reset downstream stages on a fresh analyse cycle. schema_status is
+    # reset to "pending" so the orchestrator's CAS allows the dispatch
+    # (it accepts "pending" or "failed" as starting states).
     book.schema_status = "pending"
     book.theory_status = "pending"
     book.questions_status = "pending"
     book.figures_status = "pending"
-
-    # Commit before dispatch so worker thread sees the new Job row.
+    book.theory_finalized_at = None
     await session.commit()
 
-    # Dispatch via the runner (inline or Celery based on settings)
-    import app.workers.extract  # noqa: F401 — ensure registrations run
-    from app.workers.runner import dispatch
+    # Route through the orchestrator's atomic dispatcher. The CAS inside
+    # guarantees only one analyse job can be created per book at a time;
+    # a duplicate POST returns 409 instead of spawning a second worker.
+    # This replaced the older TOCTOU "SELECT then INSERT" Job-table
+    # check, which was racy under concurrent requests.
+    import app.workers.extract  # noqa: F401 — registrations
+    import app.workers.orchestrator  # noqa: F401 — registrations
+    from app.workers.orchestrator import _dispatch_analyse, SyncSession
+    from app.models.book import Book as BookModel
 
-    dispatch("analyse_book", str(book.id), str(job.id))
+    # The orchestrator helper is sync (Celery world). Bridge by opening
+    # a sync session, loading the book, and running the dispatch there.
+    def _do_dispatch() -> UUID | None:
+        with SyncSession() as s:
+            b = s.get(BookModel, book_id)
+            if b is None:
+                return None
+            return _dispatch_analyse(s, b)
 
-    return BookUploadResponse(book_id=book.id, job_id=job.id, status="analysing")
+    import asyncio
+    job_id = await asyncio.to_thread(_do_dispatch)
+    if job_id is None:
+        raise HTTPException(
+            status.HTTP_409_CONFLICT,
+            detail=(
+                "Already analysing (a sibling request won the race). "
+                "Wait for it to finish or use /re-extract for a hard reset."
+            ),
+        )
+
+    return BookUploadResponse(book_id=book.id, job_id=job_id, status="analysing")
 
 
 @router.patch("/{book_id}/schema", response_model=BookOut)
@@ -489,36 +489,89 @@ async def re_extract_book(
     if not book.schema:
         raise HTTPException(400, detail="Book has no schema — run /analyse first")
 
-    # Phase 7 (CONTRACT.md §5): refuse if another extract is in flight.
+    # Atomic CAS — only proceed if NO stage is currently running AND no
+    # fresh orchestrator lock is held. This single UPDATE…WHERE replaces
+    # the previous "SELECT then UPDATE" pattern which had a race window:
+    # two near-simultaneous re-extract clicks both saw "no in-flight",
+    # both cleared `extraction_lock_at=None`, both spawned theory workers.
+    # Now: rapid double-clicks → only ONE wins. The losers get a 409.
+    from sqlalchemy import update
+    from datetime import datetime, timedelta
+    from app.models.section import Section
+
+    lock_cutoff = datetime.utcnow() - timedelta(minutes=10)
+    cas = (
+        update(Book)
+        .where(Book.id == book_id)
+        # Refuse if any per-stage worker is mid-run
+        .where(Book.theory_status != "running")
+        .where(Book.questions_status != "running")
+        .where(Book.figures_status != "running")
+        # Refuse if a fresh orchestrator lock is held
+        .where(sa.or_(
+            Book.extraction_lock_at.is_(None),
+            Book.extraction_lock_at < lock_cutoff,
+        ))
+        # ORCH Day 9 — full hard reset. Per-stage statuses → pending.
+        # Orchestrator state cleared so the coordinator treats this as
+        # a brand-new run with a fresh retry budget.
+        .values(
+            status="extracting",
+            theory_status="pending",
+            questions_status="pending",
+            figures_status="pending",
+            theory_finalized_at=None,
+            extraction_lock_at=None,
+            theory_retries=0,
+            questions_retries=0,
+            figures_retries=0,
+        )
+    )
+    result = await session.execute(cas)
+    if result.rowcount == 0:
+        # CAS lost — another re-extract is already in flight, OR a worker
+        # is currently running on this book, OR a fresh orchestrator lock
+        # is held. Either way, refuse without touching state.
+        await session.rollback()
+        raise HTTPException(
+            status.HTTP_409_CONFLICT,
+            detail=(
+                "Book has an in-flight extraction (worker running or "
+                "another re-extract just dispatched). Wait for it to "
+                "finish before re-extracting."
+            ),
+        )
+
+    # Belt-and-suspenders — also catch in-flight Jobs that aren't reflected
+    # in stage_status yet (very narrow race between Job INSERT and stage CAS).
     in_flight = (await session.execute(
         select(Job).where(
             Job.book_id == book_id,
             Job.status.in_(["queued", "running"]),
+            Job.type.in_(["extract", "extract_questions", "extract_figures"]),
         ).limit(1)
     )).scalars().first()
     if in_flight is not None:
+        # Roll back the CAS we just won — another path is already running.
+        await session.rollback()
         raise HTTPException(
             status.HTTP_409_CONFLICT,
             detail=(
-                f"Book has an in-flight task (job_id={in_flight.id}, "
-                f"status={in_flight.status!r}). Wait for it to finish or "
-                "cancel before re-extracting."
+                f"Book has an in-flight extraction job (job_id={in_flight.id}, "
+                f"type={in_flight.type!r}, status={in_flight.status!r}). "
+                f"Wait for it to finish before re-extracting."
             ),
         )
 
-    # Reset all existing sections to pending so they get re-extracted
-    from sqlalchemy import update
-    from app.models.section import Section
+    # CAS won AND no live Job — safe to wipe sections + commit + dispatch.
     await session.execute(
         update(Section)
         .where(Section.book_id == book_id)
         .values(status="pending", blocks=[], attempts=0, qc_local=None)
     )
 
-    # ORCH Day 9 — approval marker Job. Actual extraction Jobs are
-    # created by the coordinator's per-worker dispatchers. Matches the
-    # Day 8 /approve pattern: the API action itself completes
-    # immediately and the coordinator owns the rest.
+    # ORCH Day 9 — approval marker Job. Actual extraction Jobs are created
+    # by the coordinator's per-worker dispatchers. Matches the /approve pattern.
     job = Job(
         book_id=book.id, type="extract",
         status="succeeded", progress=100,
@@ -526,20 +579,6 @@ async def re_extract_book(
     )
     session.add(job)
     await session.flush()
-
-    book.status = "extracting"
-    # Phase 5d/7 + ORCH Day 9 — full hard reset. Per-stage statuses go
-    # back to pending. Orchestrator state cleared (finalized marker,
-    # any leftover lock, retry counters) so the coordinator's state
-    # machine treats this as a brand-new run with a fresh retry budget.
-    book.theory_status = "pending"
-    book.questions_status = "pending"
-    book.figures_status = "pending"
-    book.theory_finalized_at = None
-    book.extraction_lock_at = None
-    book.theory_retries = 0
-    book.questions_retries = 0
-    book.figures_retries = 0
 
     # Commit before dispatch so the coordinator sees the cleared state.
     await session.commit()

@@ -124,37 +124,56 @@ async def extract_figures_v2(
     if not book.pdf_url:
         raise HTTPException(400, detail="Book has no uploaded PDF")
 
-    # Phase 7 (CONTRACT.md §5): refuse if another task is in flight.
-    from sqlalchemy import select as _select
-    in_flight = (await session.execute(
-        _select(Job).where(
-            Job.book_id == book_id,
-            Job.status.in_(["queued", "running"]),
-        ).limit(1)
-    )).scalars().first()
-    if in_flight is not None:
+    # Race-free dispatch — route through the orchestrator's atomic
+    # _dispatch_figures helper. The CAS inside ensures only one figures
+    # job can be created at a time per book: a concurrent request (or a
+    # race with the coordinator's auto-dispatch) gets 409 instead of
+    # spawning a duplicate worker. Replaced the previous TOCTOU "SELECT
+    # Job WHERE running" check, which was racy under concurrent POSTs.
+    book.figures_status = "pending"  # reset so CAS sees pending → running
+    await session.commit()
+
+    import app.workers.figures_tasks  # noqa: F401 — registrations
+    import app.workers.orchestrator  # noqa: F401 — registrations
+    from app.workers.orchestrator import SyncSession, _dispatch_figures
+    from app.models.book import Book as BookModel
+    import asyncio
+
+    def _do_dispatch() -> str | None:
+        with SyncSession() as s:
+            b = s.get(BookModel, book_id)
+            if b is None:
+                return None
+            before = b.figures_status
+            _dispatch_figures(s, b)
+            s.refresh(b)
+            if b.figures_status != "running" or before == "running":
+                # CAS lost — nothing dispatched.
+                return None
+            # Get the freshly-created Job ID.
+            from app.models.job import Job as JobModel
+            from sqlalchemy import select as _select
+            j = s.execute(
+                _select(JobModel)
+                .where(JobModel.book_id == book_id, JobModel.type == "extract_figures")
+                .order_by(JobModel.id.desc())
+                .limit(1)
+            ).scalars().first()
+            return str(j.id) if j else None
+
+    job_id_str = await asyncio.to_thread(_do_dispatch)
+    if job_id_str is None:
         raise HTTPException(
             status.HTTP_409_CONFLICT,
             detail=(
-                f"Book has an in-flight task (job_id={in_flight.id}, "
-                f"status={in_flight.status!r}). Wait or cancel first."
+                "Figures extraction already running or terminal — "
+                "refused duplicate dispatch."
             ),
         )
 
-    job = Job(book_id=book.id, type="extract_figures_v2", status="queued", progress=0)
-    session.add(job)
-    await session.flush()
-    book.figures_status = "pending"  # reset for fresh run
-    await session.commit()
-
-    # Lazy import + dispatch
-    import app.workers.figures_tasks  # noqa: F401 — ensures task registration
-    from app.workers.runner import dispatch
-
-    dispatch("extract_figures_v2", str(book.id), str(job.id))
     return {
         "book_id": str(book.id),
-        "job_id": str(job.id),
+        "job_id": job_id_str,
         "status": "queued",
     }
 

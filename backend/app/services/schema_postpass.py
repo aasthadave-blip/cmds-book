@@ -251,26 +251,6 @@ def verify_schema_against_pdf_text(
     return schema, warnings
 
 
-# Backward-compat shim — preserves the old call site.
-# Returns the schema unchanged. Old callers that did
-# `schema = enrich_schema_with_question_markers(pdf, schema)` keep working.
-def enrich_schema_with_question_markers(
-    pdf_bytes: bytes, schema: BookSchema
-) -> BookSchema:
-    """DEPRECATED — use ``verify_schema_against_pdf_text`` instead.
-
-    Now a no-op wrapper that runs verification and discards warnings. Kept
-    so existing call sites don't break during migration.
-    """
-    schema_unchanged, warnings = verify_schema_against_pdf_text(pdf_bytes, schema)
-    if warnings:
-        logger.info(
-            "schema post-pass (compat): %s verifier warnings (not auto-fixed)",
-            len(warnings),
-        )
-    return schema_unchanged
-
-
 # ─── SCHEMA Week 1 Day 5 — Cross-check: schema → PDF ──────────────
 # Verifies each schema section's title actually appears on its claimed
 # page_start. Catches the "EXAMPLE 9.18 → page=9" case where Gemini
@@ -800,3 +780,5 @@ def apply_page_end_corrections(
 
     _walk(schema.sections)
     return schema
+
+

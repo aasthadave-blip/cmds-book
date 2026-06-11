@@ -17,7 +17,9 @@ Look at the page geometry first. Determine column layout:
   block below; it does not apply.
 - TWO-COLUMN: left column + right column with visible gutter. Common in
   MHT-CET / JEE / NEET prep books.
-- THREE-COLUMN: rare — three vertical streams side-by-side.
+- THREE-COLUMN / FOUR-COLUMN: rare — three or four vertical streams side-by-side.
+  Same multi-column reading rules apply: read each column FULLY top-to-bottom,
+  left-to-right, before moving to the next page.
 
 For SINGLE-COLUMN pages: continue with the standard rules below. No change
 from existing behavior.
@@ -257,6 +259,13 @@ If you are uncertain whether something is a question, ask yourself:
    determine / evaluate / explain something?"
 If the answer is no, EXCLUDE it. When in doubt, EXCLUDE.
 
+MULTI-COLUMN PAGES — READ EVERY COLUMN:
+Question banks frequently use 2, 3, or 4 columns per page. Read each column
+FULLY top-to-bottom before moving to the next column, in left-to-right order.
+Example: in a 2-column page, questions 1-15 may fill the LEFT column and 16-30
+the RIGHT column — you MUST capture both columns. Never stop at the bottom of
+the first column. Scan the whole page, all columns, before moving to the next page.
+
 ═══════════════════════════════════════════════════════════════════════════════
 COMPLETENESS — read every page, but never invent
 ═══════════════════════════════════════════════════════════════════════════════
@@ -406,6 +415,9 @@ HARD RULES — ANTI-HALLUCINATION
    θ → \theta, √x → \sqrt{x}, a² → a^{2}, a₁ → a_{1}, ½ → \frac{1}{2}, etc.
    Numbers joined by operators are math: "3 + 4 = 7" → "$3 + 4 = 7$".
    Do NOT simplify expressions; transcribe as printed.
+   CHEMISTRY: wrap every chemistry formula in \ce{...} inside math delimiters —
+   inline: $\ce{H2SO4}$, $\ce{Fe^{2+}}$, $\ce{CO2}$. Reactions: $\ce{2H2 + O2 -> 2H2O}$.
+   Use ASCII inside \ce{} (H2O not H₂O, -> not →). Never leave a formula as plain text.
 6. FIGURES — insert {{fig: <printed label> — <caption>}} at the exact position
    where the figure appears in the question text. Use the printed label
    verbatim ("Fig. 4.5"). If unlabelled: "(unlabelled diagram)".
@@ -419,6 +431,12 @@ HARD RULES — ANTI-HALLUCINATION
    If no solution is printed, `solution: ""` and `has_solution: false`.
    If the printed solution stops mid-step or is partially illegible,
    transcribe what is readable and stop. Do not finish it for the textbook.
+   WORKED EXAMPLES & SOLVED PROBLEMS: every EXAMPLE / Solved-example
+   item has a COMPLETE printed solution immediately after the problem
+   statement. You MUST capture the full solution (all steps, equations, final
+   answer) in the `solution` field. Never extract the problem without its
+   printed solution. If — and ONLY if — no solution is printed, leave
+   `solution` empty (never fabricate).
 8. WORKED EXAMPLE STRUCTURE — when both a problem statement and a solution are
    printed for the same example, put ONLY the problem statement (the part the
    reader is asked to solve) in `raw_text`, and the printed solution in
@@ -457,7 +475,7 @@ OUTPUT — STRICT JSON, no prose, no markdown fencing
       "raw_text": "<full verbatim question body with LaTeX math and {{fig: ...}} placeholders>",
       "solution": "<verbatim inline solution if printed, else empty string>",
       "page": <int 1-indexed in the original book>,
-      "question_number": "<as printed, e.g. '1', '1.2', 'Q.3', empty if unnumbered>",
+      "question_number": "<as printed, e.g. '1', '1.2', 'Q.3'. Emit for EVERY numbered item — downstream dedup keys on it; a missing number risks merging with another question. Empty ONLY if truly unnumbered>",
       "exercise_ref": "<exercise/problem-set label, e.g. 'Exercise 8.3', empty if none>",
       "has_options": <true ONLY if MCQ-style options are printed on the page>,
       "has_solution": <true ONLY if a solution is printed on the page>,

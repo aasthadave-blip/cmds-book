@@ -32,6 +32,7 @@ from app.models.job import Job
 from app.models.question import Question
 from app.models.question_bank import QuestionBank
 from app.services.prompt_loader import load_raw
+from app.services.section_identity import resolve_section_uuid
 from app.services.questions.linking import (
     LinkResult,
     SchemaIndex,
@@ -602,6 +603,7 @@ def _extract_one_block(
             bank_id=bank.id,
             book_id=book.id,
             section_ref=section_ref,
+            section_uuid=resolve_section_uuid(session, book.id, section_ref),
             section_title=section_title,
             page_start=page_num,
             page_end=page_num,
@@ -753,6 +755,7 @@ def _extract_one_inline(
             bank_id=bank.id,
             book_id=book.id,
             section_ref=section_ref,
+            section_uuid=resolve_section_uuid(session, book.id, section_ref),
             section_title=target.get("title"),
             page_start=page_num,
             page_end=page_num,

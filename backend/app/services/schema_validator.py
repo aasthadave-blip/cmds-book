@@ -27,6 +27,7 @@ Usage:
 
 from __future__ import annotations
 
+import re
 from dataclasses import dataclass, field
 from enum import Enum
 from typing import Any, Iterator
@@ -53,6 +54,18 @@ class ErrorType(str, Enum):
     INVALID_CONTENT_TYPES = "invalid_content_types"
     CAT_A_AT_END_NOT_EXCLUDED = "cat_a_at_end_not_excluded"
     EMPTY_PLACEHOLDER = "empty_placeholder"
+    # Theory Unit 1 — excluded_sections hard rules (§0.5 #4):
+    TITLE_DUPLICATE_ACROSS_ARRAYS = "title_duplicate_across_arrays"
+    MID_CHAPTER_EXCLUDED = "mid_chapter_excluded"
+    # Theory Unit 9 followup — §5.9 puzzle block prohibition:
+    PUZZLE_AS_SECTION = "puzzle_as_section"
+    # Theory followup — Cat A must nest under preceding Cat B section.
+    CAT_A_NOT_NESTED_UNDER_PREVIOUS_THEORY = "cat_a_not_nested_under_previous_theory"
+    # Positional Cat A — parent's page range must contain Cat A's page_start.
+    CAT_A_PARENT_PAGE_MISMATCH = "cat_a_parent_page_mismatch"
+    # Whole-schema page coverage — every page of the PDF must appear in
+    # sections[] or excluded_sections[].
+    SCHEMA_PAGE_COVERAGE_INCOMPLETE = "schema_page_coverage_incomplete"
 
 
 # Canonical set — used by Rule 7 and others.
@@ -837,7 +850,10 @@ def _check_cat_a_at_end_not_excluded(
             type=ErrorType.CAT_A_AT_END_NOT_EXCLUDED,
             section_id=section.get("id"),
             section_title=title,
-            severity="error",
+            # SCHEMA Rebalance — downgraded to warning. Position-trumps-label
+            # is subjective per user spec; valid mid-chapter "Solutions" /
+            # "Hints" callouts exist in some textbooks. Surface, don't block.
+            severity="warning",
             message=(
                 f'Section "{title}" is a standalone help section '
                 f"(hints/solutions/answer keys) — these belong in "
@@ -880,7 +896,8 @@ def _check_cat_a_at_end_not_excluded(
         type=ErrorType.CAT_A_AT_END_NOT_EXCLUDED,
         section_id=section.get("id"),
         section_title=title,
-        severity="error",
+        # SCHEMA Rebalance — downgraded to warning (see standalone-help branch).
+        severity="warning",
         message=(
             f'Section "{title}" is a Cat A bank at end of its chapter '
             f"(no theory section follows it). End-of-chapter banks "
@@ -1015,6 +1032,534 @@ def _check_page_out_of_bounds(
     return out
 
 
+def _collect_titles(items: list, recurse_key: str = "subsections") -> list[tuple[str, str | None, int | None]]:
+    """Flatten all titles in a tree. Returns [(title_normalized, id, page_start), ...]."""
+    out: list[tuple[str, str | None, int | None]] = []
+
+    def walk(nodes):
+        for n in nodes or []:
+            if not isinstance(n, dict):
+                continue
+            title = (n.get("title") or "").strip()
+            if title:
+                out.append((title, n.get("id"), n.get("page_start")))
+            walk(n.get(recurse_key) or [])
+
+    walk(items)
+    return out
+
+
+def _check_title_duplicate_across_arrays(data: dict) -> list[ValidationError]:
+    """Theory Unit 1 (§0.5 #4c): a title appearing in `sections[]` (recursive)
+    MUST NOT also appear in `excluded_sections[]` (recursive). Each piece
+    of content lives in exactly one tree.
+
+    Title comparison is exact (after strip). If excluded banks need to
+    organize questions by inline section structure, they MUST use
+    distinguishable names per the prompt rule.
+    """
+    sections = data.get("sections") or []
+    excluded = data.get("excluded_sections") or []
+
+    inline_titles = _collect_titles(sections)
+    excluded_titles = _collect_titles(excluded)
+
+    inline_title_set = {t for t, _, _ in inline_titles}
+
+    out: list[ValidationError] = []
+    seen_titles: set[str] = set()
+    for title, eid, page in excluded_titles:
+        if title in inline_title_set and title not in seen_titles:
+            seen_titles.add(title)
+            # Find the inline match to surface its location too
+            inline_match = next(
+                ((t, i, p) for t, i, p in inline_titles if t == title),
+                (None, None, None),
+            )
+            out.append(ValidationError(
+                type=ErrorType.TITLE_DUPLICATE_ACROSS_ARRAYS,
+                section_id=eid,
+                section_title=title,
+                severity="error",
+                message=(
+                    f'Title "{title}" appears in BOTH `sections[]` '
+                    f'(inline, id={inline_match[1]!r} page={inline_match[2]}) '
+                    f'AND `excluded_sections[]` (excluded, page={page}). '
+                    f'Each piece of content must live in exactly one array. '
+                    f'Either move it inline (if mid-chapter / theory follows) '
+                    f'or use a distinguishable name for the excluded entry '
+                    f'(e.g. "Practice Set — {title}").'
+                ),
+                context={
+                    "title": title,
+                    "inline_page": inline_match[2],
+                    "excluded_page": page,
+                },
+            ))
+    return out
+
+
+def _check_mid_chapter_excluded(data: dict) -> list[ValidationError]:
+    """Theory Unit 1 (§0.5 #4b): every `excluded_sections` entry MUST appear
+    AFTER the last theory section in the PDF. Mid-chapter Q-like content
+    (illustrations, in-text questions, named banks between theory blocks)
+    must be INLINE Cat A under its preceding theory parent, never demoted
+    to excluded as a fallback.
+
+    Cutoff = max `page_end` (or `page_start` if page_end missing) across
+    all inline sections that carry "theory" in content_types.
+    """
+    sections = data.get("sections") or []
+    excluded = data.get("excluded_sections") or []
+    if not excluded:
+        return []
+
+    # Find the maximum page touched by any theory-carrying section.
+    # Excludes type='chapter' wrappers because PYQ papers (§11.4) have a
+    # chapter wrapper marked ["theory"] that holds a tiny header and the
+    # whole question paper inside its page range — its page_end is not a
+    # meaningful "end of theory" boundary. Only NON-wrapper theory sections
+    # define the cutoff.
+    last_theory_page = 0
+
+    def walk_theory(nodes):
+        nonlocal last_theory_page
+        for n in nodes or []:
+            if not isinstance(n, dict):
+                continue
+            ct = n.get("content_types") or []
+            ntype = (n.get("type") or "").lower()
+            if (
+                isinstance(ct, list)
+                and "theory" in ct
+                and ntype != "chapter"
+            ):
+                pe = n.get("page_end") or n.get("page_start") or 0
+                if isinstance(pe, int) and pe > last_theory_page:
+                    last_theory_page = pe
+            walk_theory(n.get("subsections") or [])
+
+    walk_theory(sections)
+
+    if last_theory_page == 0:
+        # No theory anywhere — pure-Q book. Excluded position rule doesn't apply.
+        return []
+
+    out: list[ValidationError] = []
+    for ex in excluded:
+        if not isinstance(ex, dict):
+            continue
+        ps = ex.get("page_start")
+        if not isinstance(ps, int):
+            continue
+        if ps < last_theory_page:
+            out.append(ValidationError(
+                type=ErrorType.MID_CHAPTER_EXCLUDED,
+                section_id=ex.get("id"),
+                section_title=ex.get("title"),
+                severity="error",
+                message=(
+                    f'Excluded entry "{ex.get("title")}" starts on page '
+                    f'{ps}, which is BEFORE the last theory section ends '
+                    f'(page {last_theory_page}). `excluded_sections` is '
+                    f'for END-OF-CHAPTER content only. Mid-chapter Q-like '
+                    f'content (illustrations, in-text questions, mid-chapter '
+                    f'banks) must be INLINE Cat A under its preceding theory '
+                    f'parent per §8.3 — NEVER in excluded_sections.'
+                ),
+                context={
+                    "excluded_page_start": ps,
+                    "last_theory_page": last_theory_page,
+                },
+            ))
+    return out
+
+
+_PUZZLE_TITLE_RE = re.compile(
+    r"""
+    \b
+    (?:
+        crossword s?
+        | word \s* (?: puzzle | search ) s?
+        | jumble s?
+        | sudoku
+        | riddle s?
+        | brain \s* teaser s?
+    )
+    \b
+    """,
+    re.IGNORECASE | re.VERBOSE,
+)
+
+
+def _check_puzzle_as_section(data: dict) -> list[ValidationError]:
+    """§5.9: Crosswords, word puzzles, word searches, etc. are Cat C inline
+    callouts and MUST NEVER appear as their own section in `sections[]` OR
+    `excluded_sections[]`. They have no extractable theory/questions —
+    emitting them as a section creates a pending row that never gets
+    extracted and shows up as a broken empty entry in the UI.
+    """
+    out: list[ValidationError] = []
+
+    def walk_section(s, parent_id=None):
+        if not isinstance(s, dict):
+            return
+        title = (s.get("title") or "").strip()
+        if title and _PUZZLE_TITLE_RE.search(title):
+            out.append(ValidationError(
+                type=ErrorType.PUZZLE_AS_SECTION,
+                section_id=s.get("id"),
+                section_title=title,
+                severity="error",
+                message=(
+                    f'Section "{title}" is a puzzle/word-game block — per §5.9 '
+                    f'these are Cat C inline callouts, NOT separate sections. '
+                    f'Remove this section entry from `sections[]`; the surrounding '
+                    f'theory section absorbs the puzzle as inline body.'
+                ),
+                context={"title": title, "id": s.get("id")},
+            ))
+        for child in s.get("subsections") or []:
+            walk_section(child, s.get("id"))
+
+    for top in data.get("sections") or []:
+        walk_section(top)
+
+    def walk_excluded(e):
+        if not isinstance(e, dict):
+            return
+        title = (e.get("title") or "").strip()
+        if title and _PUZZLE_TITLE_RE.search(title):
+            out.append(ValidationError(
+                type=ErrorType.PUZZLE_AS_SECTION,
+                section_id=None,
+                section_title=title,
+                severity="error",
+                message=(
+                    f'Excluded entry "{title}" is a puzzle/word-game block — per '
+                    f'§5.9 these are Cat C inline callouts, NOT excluded sections. '
+                    f'Remove this from `excluded_sections[]`.'
+                ),
+                context={"title": title, "where": "excluded_sections"},
+            ))
+        for sub in e.get("subsections") or []:
+            walk_excluded(sub)
+
+    for ex in data.get("excluded_sections") or []:
+        walk_excluded(ex)
+
+    return out
+
+
+def _is_cat_a(section: dict) -> bool:
+    """Cat A = content_types includes 'questions' (or only 'questions')."""
+    ct = section.get("content_types") or []
+    if not isinstance(ct, list):
+        return False
+    return "questions" in ct
+
+
+def _is_cat_b(section: dict) -> bool:
+    """Cat B = content_types includes 'theory' (theory-bearing)."""
+    ct = section.get("content_types") or []
+    if not isinstance(ct, list):
+        return False
+    return "theory" in ct
+
+
+def _check_cat_a_nested_under_previous_theory(data: dict) -> list[ValidationError]:
+    """Every Cat A subsection MUST nest under the IMMEDIATELY PRECEDING Cat B
+    section in document order. If a Cat A is found at a level where a Cat B
+    sibling appeared earlier in the same parent's children list, the Cat A
+    should have been moved to be a child of that Cat B.
+
+    The deterministic rule walks each parent's children in array order
+    (which mirrors document order per §3.4). For every Cat A child found,
+    we check whether ANY preceding sibling is Cat B. If yes → the Cat A
+    is misplaced (should be nested under that preceding Cat B). If no
+    Cat B sibling exists → Cat A is genuinely at this level (e.g., pure-Q
+    chapter), allowed.
+
+    NOTE: this is a violation of POSITION-ORDER nesting, not a violation
+    of content-type rules. The Cat A's content is fine; only its placement
+    in the tree is wrong.
+    """
+    out: list[ValidationError] = []
+
+    def walk(parent: dict) -> None:
+        children = parent.get("subsections") or []
+        last_cat_b_idx: int | None = None
+        last_cat_b_id: str | None = None
+        last_cat_b_title: str | None = None
+        for i, child in enumerate(children):
+            if not isinstance(child, dict):
+                continue
+            if _is_cat_b(child):
+                last_cat_b_idx = i
+                last_cat_b_id = child.get("id")
+                last_cat_b_title = child.get("title", "")
+                # Recurse into Cat B (its own children get checked too)
+                walk(child)
+                continue
+            if _is_cat_a(child):
+                if last_cat_b_idx is not None:
+                    # Violation — Cat A at this level but a Cat B sibling
+                    # already exists. It should nest under that Cat B.
+                    out.append(ValidationError(
+                        type=ErrorType.CAT_A_NOT_NESTED_UNDER_PREVIOUS_THEORY,
+                        section_id=child.get("id"),
+                        section_title=child.get("title", ""),
+                        # SCHEMA Rebalance — downgraded to warning. The
+                        # cat_a_nesting sanitizer (schema_cat_a_nesting.py)
+                        # auto-repairs this deterministically before
+                        # validation in the production path, so the
+                        # validator firing here means the sanitizer's
+                        # post-state still has a stray Cat A under root —
+                        # informational, never blocking.
+                        severity="warning",
+                        message=(
+                            f'Cat A section "{child.get("title")}" (id={child.get("id")!r}) '
+                            f'is at level <{parent.get("id") or "ROOT"}> but a preceding '
+                            f'Cat B sibling "{last_cat_b_title}" (id={last_cat_b_id!r}) '
+                            f'exists earlier in this parent. Cat A must nest UNDER its '
+                            f'immediately preceding Cat B in document order. Move this '
+                            f'Cat A to be a child of "{last_cat_b_title}" (id={last_cat_b_id!r}).'
+                        ),
+                        context={
+                            "cat_a_id": child.get("id"),
+                            "cat_a_title": child.get("title"),
+                            "should_nest_under_id": last_cat_b_id,
+                            "should_nest_under_title": last_cat_b_title,
+                            "parent_id": parent.get("id"),
+                        },
+                    ))
+                # Recurse into Cat A's children too (rare but possible)
+                walk(child)
+                continue
+            # Other types (e.g., chapter wrapper, mixed-section types)
+            # walk through without affecting the last_cat_b tracking.
+            walk(child)
+
+    # Walk top-level sections. The fake "root" container holds them as siblings.
+    walk({"id": "ROOT", "subsections": data.get("sections") or []})
+    return out
+
+
+def _check_cat_a_parent_page_mismatch(data: dict) -> list[ValidationError]:
+    """Every Cat A subsection's `page_start` MUST fall within its parent
+    theory (Cat B) section's `[page_start, page_end]` range.
+
+    Catches the cross-page failure mode where Gemini nests Example 9.5
+    under §9.2 (p10-15) just because §9.2 mentions "see Example 9.5",
+    even though Example 9.5's printed heading lives on page 27 inside
+    §9.7's range.
+
+    Also catches same-page misnestings where Cat A's page_start sits
+    outside the immediate Cat B parent's page range (e.g. parent ends at
+    p3 but Cat A starts at p4 because it really belongs to the next
+    theory section).
+
+    Skip cases:
+      * Cat A has no parent in the main tree (top-level)
+      * Parent is not Cat B (e.g. Cat A nested under Cat A wrapper — caller
+        responsibility, different rule)
+      * Either parent or child has non-integer page_start/page_end (rule
+        1 handles those)
+      * Excluded section (only `sections[]` tree matters here)
+
+    The error context surfaces which theory section's range WOULD contain
+    the Cat A's page_start (if any), so the corrective fragment can
+    instruct Gemini precisely.
+    """
+    out: list[ValidationError] = []
+
+    sections = data.get("sections") or []
+
+    # Build a flat list of all (Cat B) theory sections with their page ranges
+    # for the "would-be parent" hint.
+    theory_index: list[tuple[dict, int, int, int]] = []  # (sec, ps, pe, depth)
+
+    def index_theory(nodes, depth):
+        for n in nodes or []:
+            if not isinstance(n, dict):
+                continue
+            if _is_cat_b(n):
+                ps = n.get("page_start")
+                pe = n.get("page_end")
+                if isinstance(ps, int) and not isinstance(ps, bool):
+                    if not (isinstance(pe, int) and not isinstance(pe, bool)):
+                        pe = ps
+                    theory_index.append((n, ps, pe, depth))
+            index_theory(n.get("subsections") or [], depth + 1)
+
+    index_theory(sections, 0)
+
+    def find_would_be_parent(child_ps: int, current_parent_id: str | None):
+        """Return the deepest theory section whose range contains child_ps.
+        Excludes the current_parent itself. Returns (id, title, range) or None."""
+        candidates = [
+            (s, ps, pe, d)
+            for (s, ps, pe, d) in theory_index
+            if ps <= child_ps <= pe and s.get("id") != current_parent_id
+        ]
+        if not candidates:
+            return None
+        # Deepest wins
+        candidates.sort(key=lambda c: -c[3])
+        s, ps, pe, _ = candidates[0]
+        return (s.get("id"), s.get("title"), [ps, pe])
+
+    def walk(nodes, parent):
+        for n in nodes or []:
+            if not isinstance(n, dict):
+                continue
+            if _is_cat_a(n) and parent is not None and _is_cat_b(parent):
+                c_ps = n.get("page_start")
+                p_ps = parent.get("page_start")
+                p_pe = parent.get("page_end")
+                if (
+                    isinstance(c_ps, int) and not isinstance(c_ps, bool)
+                    and isinstance(p_ps, int) and not isinstance(p_ps, bool)
+                    and isinstance(p_pe, int) and not isinstance(p_pe, bool)
+                ):
+                    if not (p_ps <= c_ps <= p_pe):
+                        wb = find_would_be_parent(c_ps, parent.get("id"))
+                        wb_part = ""
+                        if wb is not None:
+                            wb_part = (
+                                f' The theory section whose range '
+                                f'contains page {c_ps} is "{wb[1]}" '
+                                f'(id={wb[0]!r}, pages {wb[2][0]}-{wb[2][1]}).'
+                            )
+                        out.append(ValidationError(
+                            type=ErrorType.CAT_A_PARENT_PAGE_MISMATCH,
+                            section_id=n.get("id"),
+                            section_title=n.get("title"),
+                            # SCHEMA Rebalance — downgraded to warning.
+                            # The cat_a_nesting sanitizer (positional pass)
+                            # auto-repairs page-mismatch parent assignments
+                            # using PDF text. Validator firing here is
+                            # informational, not a retry trigger.
+                            severity="warning",
+                            message=(
+                                f'Cat A "{n.get("title")}" has page_start='
+                                f'{c_ps} but its current parent theory '
+                                f'"{parent.get("title")}" (id='
+                                f'{parent.get("id")!r}) only covers pages '
+                                f'{p_ps}-{p_pe}.{wb_part} '
+                                f'A Cat A must nest under the theory section '
+                                f'whose page range contains the Cat A\'s own '
+                                f'printed heading (per §3.2.6).'
+                            ),
+                            context={
+                                "cat_a_id": n.get("id"),
+                                "cat_a_title": n.get("title"),
+                                "cat_a_page_start": c_ps,
+                                "parent_id": parent.get("id"),
+                                "parent_title": parent.get("title"),
+                                "parent_pages": [p_ps, p_pe],
+                                "would_be_parent_id": wb[0] if wb else None,
+                                "would_be_parent_title": wb[1] if wb else None,
+                                "would_be_parent_pages": wb[2] if wb else None,
+                            },
+                        ))
+            walk(n.get("subsections") or [], n)
+
+    walk(sections, None)
+    return out
+
+
+def _check_schema_page_coverage(data: dict) -> list[ValidationError]:
+    """Whole-schema invariant: every page in [1..total_pages] must appear
+    in at least one section (anywhere in the sections[] tree) OR in
+    excluded_sections[]. Differs from Rule 6 (PAGE_COVERAGE_GAP, a
+    warning that only counts LEAF coverage) in two ways:
+
+      1. ERROR severity — blocks acceptance, drives corrective retry.
+         Missing pages almost always mean Gemini missed headings (see
+         §4.0 PASS 2 self-check). The downstream extractor then has no
+         section anchored on those pages, so any questions/figures there
+         go off-schema (the user's Modern Physics pp.37-46 case).
+
+      2. Container coverage counts — a chapter wrapper [1..30] with no
+         leaf children for pages 28-30 still "covers" them at the
+         container level. Rule 6 flags that as a warning; this rule
+         does not. We're catching the harder failure: pages absent
+         from the schema entirely.
+
+    Reads `total_pages` from `data` (schema's own top-level field). If
+    missing/invalid → skip (other rules / preflight handle that).
+    """
+    total_pages = data.get("total_pages")
+    if not isinstance(total_pages, int) or isinstance(total_pages, bool):
+        return []
+    if total_pages <= 0:
+        return []
+
+    def _is_int(v):
+        return isinstance(v, int) and not isinstance(v, bool)
+
+    covered: set[int] = set()
+
+    def _walk(nodes):
+        for n in nodes or []:
+            if not isinstance(n, dict):
+                continue
+            ps = n.get("page_start")
+            pe = n.get("page_end")
+            if _is_int(ps) and _is_int(pe) and ps <= pe:
+                for p in range(ps, pe + 1):
+                    if 1 <= p <= total_pages:
+                        covered.add(p)
+            elif _is_int(ps):
+                if 1 <= ps <= total_pages:
+                    covered.add(ps)
+            _walk(n.get("subsections") or [])
+
+    _walk(data.get("sections") or [])
+    _walk(data.get("excluded_sections") or [])
+
+    all_pages = set(range(1, total_pages + 1))
+    missing = sorted(all_pages - covered)
+    if not missing:
+        return []
+
+    # Group consecutive missing pages into ranges for the message.
+    ranges: list[tuple[int, int]] = []
+    run_start = missing[0]
+    run_end = missing[0]
+    for p in missing[1:]:
+        if p == run_end + 1:
+            run_end = p
+        else:
+            ranges.append((run_start, run_end))
+            run_start = run_end = p
+    ranges.append((run_start, run_end))
+
+    range_strs = [f"{a}" if a == b else f"{a}-{b}" for a, b in ranges]
+    return [ValidationError(
+        type=ErrorType.SCHEMA_PAGE_COVERAGE_INCOMPLETE,
+        section_id=None,
+        section_title=None,
+        # SCHEMA Rebalance — downgraded to warning. Many legitimate PDFs
+        # have un-covered cover pages, blanks, copyright pages, etc., and
+        # the page-clamping sanitizer + cross-check_section_pages already
+        # exercise stronger guarantees. Treating page coverage gaps as
+        # blocking forces retries on books that are actually fine.
+        severity="warning",
+        message=(
+            f"Schema page coverage incomplete. Missing pages: "
+            f"{', '.join(range_strs)}. Every page of the PDF must be "
+            f"covered by either sections[] or excluded_sections[]."
+        ),
+        context={
+            "missing_pages": missing,
+            "missing_ranges": [list(r) for r in ranges],
+            "total_pages": total_pages,
+        },
+    )]
+
+
 # ─── ENTRY POINT ───────────────────────────────────────────────────
 
 
@@ -1099,6 +1644,23 @@ def validate_schema(
         (errors if err.severity == "error" else warnings).append(err)
     # Day 7 — catastrophic empty schema
     for err in _check_empty_placeholder(data, pdf_total_pages):
+        (errors if err.severity == "error" else warnings).append(err)
+    # Theory Unit 1 — excluded_sections hard rules (§0.5 #4)
+    for err in _check_title_duplicate_across_arrays(data):
+        (errors if err.severity == "error" else warnings).append(err)
+    for err in _check_mid_chapter_excluded(data):
+        (errors if err.severity == "error" else warnings).append(err)
+    # Theory Unit 9 follow-up — §5.9 puzzle blocks must not be sections
+    for err in _check_puzzle_as_section(data):
+        (errors if err.severity == "error" else warnings).append(err)
+    # Cat A nesting rule — every Cat A must nest under preceding Cat B sibling
+    for err in _check_cat_a_nested_under_previous_theory(data):
+        (errors if err.severity == "error" else warnings).append(err)
+    # Positional Cat A — parent page range must contain Cat A's page_start
+    for err in _check_cat_a_parent_page_mismatch(data):
+        (errors if err.severity == "error" else warnings).append(err)
+    # Whole-schema page coverage — every PDF page must be in sections[] or excluded_sections[]
+    for err in _check_schema_page_coverage(data):
         (errors if err.severity == "error" else warnings).append(err)
 
     return ValidationResult(

@@ -236,6 +236,23 @@ async def _do_recover_orphaned_jobs() -> None:
 
         logger.warning("Found %d orphaned job(s) on startup — recovering...", len(orphans))
 
+        # Map job type → the stage column it owns. Recovery should only
+        # re-dispatch when the stage is in a recoverable state (pending /
+        # running). If the stage was already finalised after the crash
+        # (e.g. watchdog flipped it to 'failed' on shutdown, or a sibling
+        # call completed it) re-dispatching would either silently fail
+        # the CAS guard or, in rare cases, produce a duplicate worker.
+        # Skip with a clear Job error so the user knows.
+        _RECOVERABLE = {"pending", "running"}
+        _STAGE_COL_FOR_JOB = {
+            "analyse":             "schema_status",
+            "extract":             "theory_status",
+            "extract_figures":     "figures_status",
+            "extract_figures_v2":  "figures_status",
+            "extract_questions":   "questions_status",
+            "extract_questions_v2":"questions_status",
+        }
+
         for job in orphans:
             try:
                 book = session.get(Book, job.book_id)
@@ -245,6 +262,28 @@ async def _do_recover_orphaned_jobs() -> None:
                     session.commit()
                     skipped += 1
                     continue
+
+                # Stage-status guard for pipeline jobs (orchestrator-owned).
+                # Non-pipeline jobs (regen*) have their own tracking and
+                # are not part of this guard.
+                stage_col = _STAGE_COL_FOR_JOB.get(job.type)
+                if stage_col is not None:
+                    cur = getattr(book, stage_col, None)
+                    if cur not in _RECOVERABLE:
+                        job.status = "failed"
+                        job.error = (
+                            f"Recovery skipped — {stage_col}={cur!r} is "
+                            "already terminal. Use Retry from the UI to "
+                            "re-run this stage explicitly."
+                        )
+                        session.commit()
+                        skipped += 1
+                        logger.info(
+                            "recovery: skipping job %s (type=%s) — "
+                            "%s=%s already terminal",
+                            job.id, job.type, stage_col, cur,
+                        )
+                        continue
 
                 # Reset to clean queued state so UI shows it restarted
                 job.status = "queued"

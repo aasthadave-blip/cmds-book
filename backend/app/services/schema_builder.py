@@ -37,6 +37,11 @@ from __future__ import annotations
 
 import asyncio
 import logging
+import threading
+import time
+from dataclasses import dataclass, field
+from typing import Any
+from uuid import UUID
 
 from app.schemas.analyser import BookSchema, SchemaSection
 from app.services.prompt_loader import load_raw
@@ -45,8 +50,85 @@ from app.utils.json_parse import parse_json
 
 logger = logging.getLogger(__name__)
 
+
+@dataclass
+class SchemaBuildResult:
+    """Outcome of build_schema (rebalanced).
+
+    `schema` is always non-None when `status != "failed_preflight"`. On
+    accept-with-warnings, `status="needs_review"` and `warnings` carries
+    the validator's last-known issues plus any sanitizer fixes worth
+    surfacing. `last_failed_attempt` carries the raw dict of the LAST
+    failed Gemini attempt for offline diagnosis (None on first-pass success).
+    """
+
+    schema: BookSchema | None
+    status: str  # "ok" | "needs_review"
+    warnings: list[dict[str, Any]] = field(default_factory=list)
+    last_failed_attempt: dict | None = None
+
+
+class _SchemaHeartbeat:
+    """Background thread that pumps job.last_heartbeat_at every `interval`
+    seconds during a long Gemini schema call. No-op when `job_uuid` is None.
+
+    Independent of `app.core.heartbeat.Heartbeat` (which the outer worker
+    already wraps around build_schema). This finer-grained pump exists so
+    that even if the outer heartbeat ever gets removed, the Gemini call
+    itself can't blow past the watchdog's STALE_AFTER_S threshold of 300s.
+    """
+
+    def __init__(self, job_uuid: UUID | None, *, interval: float = 30.0) -> None:
+        self._job_uuid = job_uuid
+        self._interval = interval
+        self._stop = threading.Event()
+        self._thread: threading.Thread | None = None
+
+    def __enter__(self) -> "_SchemaHeartbeat":
+        if self._job_uuid is None:
+            return self
+        # Pump once immediately so the watchdog clock resets at the start.
+        self._beat()
+        self._thread = threading.Thread(
+            target=self._run, daemon=True, name="schema-gemini-heartbeat"
+        )
+        self._thread.start()
+        return self
+
+    def __exit__(self, *exc: Any) -> None:
+        self._stop.set()
+        if self._thread is not None:
+            self._thread.join(timeout=2)
+
+    def _run(self) -> None:
+        while not self._stop.wait(self._interval):
+            self._beat()
+
+    def _beat(self) -> None:
+        try:
+            # Import lazy so tests/import-time don't require the DB engine.
+            from datetime import datetime, timezone
+
+            from app.core.heartbeat import _HeartbeatSession
+            from app.models.job import Job
+
+            with _HeartbeatSession() as s:
+                job = s.get(Job, self._job_uuid)
+                if job is None:
+                    return
+                job.last_heartbeat_at = datetime.now(timezone.utc)
+                s.commit()
+        except Exception:
+            logger.exception(
+                "schema heartbeat write failed for job %s", self._job_uuid
+            )
+
 MAX_ATTEMPTS = 3
-GEMINI_MODEL = "gemini-2.5-flash"
+# SCHEMA Week 5 — switched from flash to pro after user-verified quality
+# improvement on production books. Pro handles dense multi-column and
+# math-heavy schemas more accurately. Flash remains in use for question
+# OCR + QA verifier where Pro's cost is overkill for transcription work.
+GEMINI_MODEL = "gemini-2.5-pro"
 
 
 def _ensure_event_loop() -> None:
@@ -130,7 +212,11 @@ def assign_uuids_to_schema(
 
 
 def _run_gemini_schema(
-    pdf_bytes: bytes, schema_prompt: str, *, timeout_s: int = 300,
+    pdf_bytes: bytes,
+    schema_prompt: str,
+    *,
+    timeout_s: int = 300,
+    job_uuid: UUID | None = None,
 ) -> dict:
     """One synchronous Gemini call: upload PDF → generate schema → return dict.
 
@@ -141,75 +227,23 @@ def _run_gemini_schema(
     """
     from app.core.gemini_runtime import call_gemini_with_pdf
 
-    raw = call_gemini_with_pdf(
-        pdf_bytes=pdf_bytes,
-        system_prompt=schema_prompt,
-        user_prompt="",
-        model=GEMINI_MODEL,
-        timeout_s=timeout_s,
-        max_output_tokens=32000,
-        # temperature=0.1 — slight sampling variance helps Gemini find
-        # rule-compliant interpretations on ambiguous page-spanning
-        # cases. Pure greedy (0.0) was observed to lock into wrong
-        # most-probable answers on specific PDF layouts; 0.1 gives
-        # enough wiggle room to find the binary-rule-compliant
-        # interpretation while still being highly deterministic.
-        temperature=0.1,
-        display_name="textbook_chapter.pdf",
-    )
+    # SCHEMA Rebalance Layer 2 — heartbeat thread bumps job.last_heartbeat_at
+    # every 30s during the Gemini call so the watchdog (STALE_AFTER_S=300)
+    # can never kill an in-flight schema generation. The outer worker's
+    # Heartbeat() also pumps every 10s; this is defence-in-depth. No-op
+    # when job_uuid is None (standalone callers, tests).
+    with _SchemaHeartbeat(job_uuid, interval=30.0):
+        raw = call_gemini_with_pdf(
+            pdf_bytes=pdf_bytes,
+            system_prompt=schema_prompt,
+            user_prompt="",
+            model=GEMINI_MODEL,
+            timeout_s=timeout_s,
+            max_output_tokens=32000,
+            temperature=0.1,
+            display_name="textbook_chapter.pdf",
+        )
     return parse_json(raw)
-
-
-def _build_image_only_template_schema(
-    total_pages: int, pdf_title: str | None
-) -> BookSchema:
-    """Generate a minimal valid schema for image-only PDFs.
-
-    Image-only PDFs (scanned without OCR, single-page graphics, etc.) have
-    no extractable text — pypdf returns nothing. Sending them to Gemini
-    yields incomplete output that the strict validator rejects, burning
-    3 retries (~$5 + 10 min wall time) before failing the upload.
-
-    This bypass generates a structurally valid minimal schema:
-      • Chapter wrapper at level 1 covering all pages
-      • content_types=["theory"] (chapter wrappers always carry theory)
-      • Empty subsections (no structure can be extracted from image-only PDF)
-      • extraction_notes explains the bypass to the user
-
-    The user can later use the schema editor UI to rename or add
-    structure manually — or re-upload an OCR'd version of the PDF.
-    """
-    import uuid as _uuid
-
-    title = (pdf_title or "").strip() or "Scanned Chapter"
-    chapter = SchemaSection(
-        id="ch1",
-        uuid=str(_uuid.uuid4()),
-        level=1,
-        title=title,
-        type="chapter",
-        page_start=1,
-        page_end=max(1, total_pages),
-        content_types=["theory"],
-        is_numbered=False,
-        expected_question_count=0,
-        subsections=[],
-    )
-    return BookSchema(
-        document_title=title,
-        subject="",
-        grade_level=None,
-        board=None,
-        total_pages=max(1, total_pages),
-        sections=[chapter],
-        excluded_sections=[],
-        exclusion_summary=[],
-        extraction_notes=(
-            "Image-only PDF detected by preflight — no text was extractable. "
-            "Schema generation was bypassed and a minimal placeholder created. "
-            "For full structural extraction, OCR the PDF and re-upload."
-        ),
-    )
 
 
 def build_schema(
@@ -217,7 +251,9 @@ def build_schema(
     *,
     is_multi_column: bool = False,
     pdf_title: str | None = None,
-) -> BookSchema:
+    job_uuid: UUID | None = None,
+    return_result: bool = False,
+) -> BookSchema | SchemaBuildResult:
     """Generate a structural schema from PDF bytes using Gemini 2.5 Pro.
 
     SYNCHRONOUS — call directly, do NOT wrap in asyncio.run().
@@ -280,24 +316,25 @@ def build_schema(
         len(preflight.rotation_pages),
     )
 
-    # SCHEMA Day 12.5 — image-only PDF bypass.
-    # When the preflight detector classifies the PDF as image-only
-    # (no extractable text via pypdf), Gemini consistently emits
-    # incomplete output that the strict validator rejects — burning 3
-    # retries and ~$5 of Gemini cost before failing the upload entirely.
-    # Generate a minimal valid template schema instead. The user can
-    # rename / restructure via the schema editor UI, or re-upload an
-    # OCR'd version for full structural extraction.
-    if preflight.pdf_type == "image_only":
-        logger.warning(
-            "Schema build: image-only PDF (%d page%s) — bypassing Gemini, "
-            "emitting minimal template schema (user can edit via UI)",
-            preflight.total_pages,
-            "" if preflight.total_pages == 1 else "s",
-        )
-        return _build_image_only_template_schema(
-            total_pages=preflight.total_pages, pdf_title=pdf_title,
-        )
+    # SCHEMA Week 5 — UNIFORM HANDLING for all PDF types.
+    #
+    # Previously: image-only PDFs were bypassed entirely (placeholder
+    # schema, Gemini never called). That special-case was a patch from
+    # an earlier model generation. It's removed now: every PDF type —
+    # digital, scanned, image-only — runs through the exact same
+    # pipeline. Gemini-2.5-Pro reads PDFs via vision regardless of
+    # text layer, so no bypass is needed. If a PDF is genuinely
+    # un-extractable, the validator + corrective-retry chain catches
+    # it the same way it catches any other failure.
+    #
+    # Preflight is still useful for observability (PDF type logging,
+    # timeout sizing) but does NOT branch the code path.
+    logger.info(
+        "Schema build: pdf_type=%s, %d page%s — uniform Gemini pipeline (no bypass).",
+        preflight.pdf_type,
+        preflight.total_pages,
+        "" if preflight.total_pages == 1 else "s",
+    )
 
     prompt_name = (
         "schema_architecture_multicolumn" if effective_multi_column else "schema_architecture"
@@ -308,6 +345,11 @@ def build_schema(
     # attempt's prompt can include corrective instructions.
     last_errors: list = []
     last_err: Exception | None = None
+    # SCHEMA Rebalance Layer 1/5 — track the best attempt for
+    # accept-with-warnings + last_failed_schema preservation.
+    last_attempt_data: dict | None = None
+    last_attempt_warnings: list = []
+    last_attempt_schema: BookSchema | None = None
 
     for attempt in range(1, MAX_ATTEMPTS + 1):
         try:
@@ -327,16 +369,75 @@ def build_schema(
                     attempt, len(last_errors),
                 )
 
-            data = _run_gemini_schema(pdf_bytes, prompt, timeout_s=gemini_timeout_s)
+            data = _run_gemini_schema(
+                pdf_bytes,
+                prompt,
+                timeout_s=gemini_timeout_s,
+                job_uuid=job_uuid,
+            )
             # SCHEMA Day 14: sanitizer DELETED. Validator + corrective
             # retry handle all the cases sanitizer previously masked.
             data = assign_uuids_to_schema(data)
+
+            # SCHEMA Week 5 — normalize hallucinated content_types BEFORE
+            # validation. Maps singular/alias values (e.g. 'question',
+            # 'solved_examples') and Gemini-invented categories (e.g.
+            # 'summary', 'biography') into the validator's vocabulary
+            # ({theory, questions, figures}). Idempotent. Closes the
+            # BAD_CONTENT_TYPE finding class surfaced by the Week 5 audit
+            # on 38 real books.
+            from app.services.schema_content_type_normalizer import (
+                normalize_schema_content_types,
+            )
+            data = normalize_schema_content_types(data)
+
+            # SCHEMA Rebalance Layer 4 — deterministic page/puzzle sanitizers
+            # run BEFORE validation so common Gemini errors auto-fix instead
+            # of burning corrective retries.
+            from app.services.schema_page_sanitizer import clamp_pages_to_bounds
+            from app.services.schema_puzzle_sanitizer import remove_puzzle_sections
+
+            data, n_clamped = clamp_pages_to_bounds(data, pdf_total_pages)
+            if n_clamped:
+                logger.info(
+                    "Page clamp sanitizer: fixed %d out-of-bounds page value(s) "
+                    "(attempt %s)", n_clamped, attempt,
+                )
+            data, n_puzzles_removed, puzzle_titles = remove_puzzle_sections(data)
+            if n_puzzles_removed:
+                logger.info(
+                    "Puzzle sanitizer: removed %d puzzle section(s) %s (attempt %s)",
+                    n_puzzles_removed, puzzle_titles, attempt,
+                )
+
+            # Cat A nesting sanitizer — deterministic post-pass that moves
+            # misplaced Cat A subsections (siblings of theory) under their
+            # immediately preceding Cat B sibling. Runs every attempt so
+            # Gemini's mistakes are auto-corrected before validation.
+            # Idempotent: re-running on already-sanitized data is a no-op.
+            from app.services.schema_cat_a_nesting import sanitize_cat_a_nesting
+            data, cat_a_report = sanitize_cat_a_nesting(data, pdf_bytes=pdf_bytes)
+            if cat_a_report.reparented or cat_a_report.positional_reparented:
+                logger.info(
+                    "Cat A nesting sanitizer: sibling=%d positional=%d "
+                    "(attempt %s, scanned_skip=%s)",
+                    cat_a_report.reparented,
+                    cat_a_report.positional_reparented,
+                    attempt,
+                    cat_a_report.positional_skipped_no_text,
+                )
 
             # SCHEMA Day 3: hard validation BEFORE accepting the schema.
             # If errors found, save them for the next attempt's corrective
             # prompt and retry.
             from app.services.schema_validator import validate_schema
             validation = validate_schema(data, pdf_total_pages=pdf_total_pages)
+            # SCHEMA Rebalance Layer 1 — preserve this attempt's data so
+            # we can accept-with-warnings if the loop exhausts retries.
+            last_attempt_data = data
+            last_attempt_warnings = [
+                _err_to_dict(w) for w in validation.warnings
+            ]
             if not validation.is_valid:
                 last_errors = validation.errors
                 logger.warning(
@@ -349,6 +450,7 @@ def build_schema(
                 )
 
             schema = BookSchema(**data)
+            last_attempt_schema = schema
 
             # Postpass — two passes:
             # Pass 1 (legacy): verify_schema_against_pdf_text — finds
@@ -421,11 +523,89 @@ def build_schema(
             except Exception as e:
                 logger.warning("schema page_end cross-check failed (continuing): %s", e)
 
+            if return_result:
+                return SchemaBuildResult(
+                    schema=schema,
+                    status="ok",
+                    warnings=last_attempt_warnings,
+                    last_failed_attempt=None,
+                )
             return schema
         except Exception as e:
             last_err = e
             logger.warning("Schema attempt %s failed: %s", attempt, e)
 
-    raise ValueError(
-        f"Schema generation failed after {MAX_ATTEMPTS} attempts: {last_err}"
+    # SCHEMA Rebalance Layer 1 — never hard-fail. After MAX_ATTEMPTS,
+    # accept the LAST attempt's schema with status="needs_review" and
+    # surface the validation errors as warnings. Caller (extract worker)
+    # writes book.schema_status="needs_review" + book.schema_warnings.
+    logger.warning(
+        "Schema validation exhausted %d attempts — accepting last attempt "
+        "with status=needs_review (last_err=%s)",
+        MAX_ATTEMPTS, last_err,
     )
+
+    # Build the surfaced warnings: validator errors (now informational)
+    # + any pre-existing warnings from the last attempt.
+    surfaced: list[dict[str, Any]] = []
+    for e in last_errors:
+        d = _err_to_dict(e)
+        # Mark these as "downgraded from error" so UI / ops can see
+        # they're the reason we landed in needs_review.
+        d["from_failed_validation"] = True
+        surfaced.append(d)
+    surfaced.extend(last_attempt_warnings)
+
+    if last_attempt_data is None:
+        # Every attempt blew up before producing parseable data — we
+        # really have nothing to save. Surface a synthetic warning and
+        # raise so callers know nothing landed.
+        raise ValueError(
+            f"Schema generation failed after {MAX_ATTEMPTS} attempts with no "
+            f"parseable Gemini output: {last_err}"
+        )
+
+    # Try to construct a BookSchema from the last attempt; if pydantic
+    # rejects it (e.g. fundamentally malformed), fall back to a minimal
+    # cover-only schema so the book lifecycle can still progress.
+    try:
+        salvaged = BookSchema(**last_attempt_data)
+    except Exception as e:
+        logger.warning(
+            "Could not construct BookSchema from last failed attempt "
+            "(reason: %s) — caller must handle salvaged=None", e,
+        )
+        salvaged = None
+        surfaced.append({
+            "type": "pydantic_construction_failed",
+            "severity": "error",
+            "message": f"Last attempt's data could not be parsed: {e!s}",
+        })
+
+    result = SchemaBuildResult(
+        schema=salvaged,
+        status="needs_review",
+        warnings=surfaced,
+        last_failed_attempt=last_attempt_data,
+    )
+    if return_result:
+        return result
+    # Legacy callers expect a raised exception on failure. To preserve
+    # backward-compat, raise here unless return_result was requested.
+    raise ValueError(
+        f"Schema generation needs review after {MAX_ATTEMPTS} attempts: "
+        f"{last_err}"
+    )
+
+
+def _err_to_dict(err) -> dict[str, Any]:
+    """Convert a ValidationError dataclass to a JSON-safe dict for
+    surfacing via book.schema_warnings."""
+    return {
+        "type": getattr(err.type, "value", str(err.type)),
+        "section_id": err.section_id,
+        "section_title": err.section_title,
+        "severity": err.severity,
+        "message": err.message,
+        "context": err.context,
+    }

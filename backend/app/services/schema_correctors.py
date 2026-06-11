@@ -331,6 +331,160 @@ def _fragment_empty_placeholder(
     )
 
 
+def _fragment_title_duplicate_across_arrays(
+    err: ValidationError, _total_pages: int | None
+) -> str:
+    """TITLE_DUPLICATE_ACROSS_ARRAYS — per §0.5 #4c, a title cannot live in
+    both sections[] and excluded_sections[]."""
+    title = err.context.get("title", err.section_title or "?")
+    inline_page = err.context.get("inline_page", "?")
+    excluded_page = err.context.get("excluded_page", "?")
+    return (
+        f"- Title \"{title}\" appears in BOTH `sections[]` "
+        f"(inline at page {inline_page}) AND `excluded_sections[]` "
+        f"(at page {excluded_page}). Per §0.5 #4(c), each piece of "
+        f"content lives in EXACTLY ONE array. Fix this: if the title "
+        f"refers to an inline section (theory or mid-chapter Cat A), "
+        f"REMOVE the excluded duplicate. If the excluded entry is a "
+        f"distinct end-of-chapter question bank that happens to test "
+        f"that section, RENAME it (e.g. \"Practice Set — {title}\" or "
+        f"\"Questions on {title}\") — never use the bare inline title "
+        f"verbatim in `excluded_sections`."
+    )
+
+
+def _fragment_puzzle_as_section(
+    err: ValidationError, _total_pages: int | None
+) -> str:
+    """PUZZLE_AS_SECTION — §5.9 violation."""
+    title = err.section_title or "?"
+    return (
+        f"- Section \"{title}\" is a puzzle / word-game / crossword block. "
+        f"Per §5.9, puzzle blocks are CAT C INLINE callouts — they have no "
+        f"extractable theory and no extractable questions. REMOVE this "
+        f"section entry entirely from both `sections[]` and `excluded_sections[]`. "
+        f"The surrounding theory section absorbs the puzzle as inline body "
+        f"automatically. Do NOT create any schema entry for crosswords, word "
+        f"puzzles, jumbles, sudoku, riddles, etc."
+    )
+
+
+def _fragment_cat_a_not_nested(
+    err: ValidationError, _total_pages: int | None
+) -> str:
+    """CAT_A_NOT_NESTED_UNDER_PREVIOUS_THEORY — Cat A placed as sibling of
+    preceding Cat B instead of nested under it."""
+    ctx = err.context or {}
+    cat_a_title = ctx.get("cat_a_title") or err.section_title or "?"
+    cat_a_id = ctx.get("cat_a_id") or err.section_id or "?"
+    target_title = ctx.get("should_nest_under_title") or "?"
+    target_id = ctx.get("should_nest_under_id") or "?"
+    return (
+        f'- Cat A subsection "{cat_a_title}" (id={cat_a_id!r}) is placed as '
+        f'a SIBLING of theory sections at the same level. Per §3.2, every '
+        f'Cat A subsection MUST nest under the immediately preceding Cat B '
+        f'section in document order. Move "{cat_a_title}" to be a CHILD '
+        f'of "{target_title}" (id={target_id!r}) — not a sibling.'
+    )
+
+
+def _fragment_cat_a_parent_page_mismatch(
+    err: ValidationError, _total_pages: int | None
+) -> str:
+    """CAT_A_PARENT_PAGE_MISMATCH — Cat A's page_start outside parent's
+    page range. Suggest the correct theory parent identified by the
+    validator's would-be-parent search."""
+    ctx = err.context or {}
+    cat_a_title = ctx.get("cat_a_title") or err.section_title or "?"
+    cat_a_id = ctx.get("cat_a_id") or err.section_id or "?"
+    cat_a_page = ctx.get("cat_a_page_start", "?")
+    parent_title = ctx.get("parent_title", "?")
+    parent_pages = ctx.get("parent_pages", ["?", "?"])
+    wb_id = ctx.get("would_be_parent_id")
+    wb_title = ctx.get("would_be_parent_title")
+    wb_pages = ctx.get("would_be_parent_pages")
+    if wb_id and wb_title:
+        wb_hint = (
+            f' The theory section whose page range contains page '
+            f'{cat_a_page} is "{wb_title}" (id={wb_id!r}, pages '
+            f'{wb_pages[0]}-{wb_pages[1]}). MOVE "{cat_a_title}" to be a '
+            f'CHILD of "{wb_title}" instead of "{parent_title}".'
+        )
+    else:
+        wb_hint = (
+            f' No other theory section\'s page range contains page '
+            f'{cat_a_page} either — re-check the Cat A\'s page_start: it '
+            f'must be the physical page where the Cat A\'s printed heading '
+            f'(e.g. "EXAMPLE 9.5") appears, NOT the page where a text '
+            f'reference like "see Example 9.5" appears.'
+        )
+    return (
+        f'- Cat A "{cat_a_title}" (id={cat_a_id!r}) has page_start='
+        f'{cat_a_page}, but its current parent theory "{parent_title}" '
+        f'only covers pages {parent_pages[0]}-{parent_pages[1]}. Per '
+        f'§3.2.6, a Cat A must nest under whichever theory section\'s '
+        f'page range contains the Cat A\'s OWN printed heading — NEVER '
+        f'a text reference position.{wb_hint}'
+    )
+
+
+def _fragment_mid_chapter_excluded(
+    err: ValidationError, _total_pages: int | None
+) -> str:
+    """MID_CHAPTER_EXCLUDED — per §0.5 #4b, every excluded entry must
+    appear AFTER the last theory section in the PDF."""
+    title = err.section_title or "?"
+    ex_page = err.context.get("excluded_page_start", "?")
+    last_theory = err.context.get("last_theory_page", "?")
+    return (
+        f"- Excluded entry \"{title}\" starts on page {ex_page}, which "
+        f"is BEFORE the last theory section ends (page {last_theory}). "
+        f"Per §0.5 #4(b), `excluded_sections` is for END-OF-CHAPTER "
+        f"content ONLY. Mid-chapter Q-like content (illustrations, "
+        f"in-text questions, mid-chapter exercises, banks sandwiched "
+        f"between theory blocks) MUST be INLINE Cat A under its preceding "
+        f"theory parent per §8.3 — never demoted to excluded_sections. "
+        f"Move \"{title}\" into `sections[]` as a Cat A subsection of "
+        f"the theory section that immediately precedes it in the PDF."
+    )
+
+
+def _fragment_schema_page_coverage_incomplete(
+    err: ValidationError, _total_pages: int | None
+) -> str:
+    """SCHEMA_PAGE_COVERAGE_INCOMPLETE — pages from [1..total_pages] are
+    absent from both sections[] and excluded_sections[].
+
+    Almost always means Gemini missed headings on those pages (the
+    Modern Physics pp.37-46 failure mode). Cite §4.0 (heading
+    enumeration two-pass scan) and tell Gemini to re-scan the gap.
+    """
+    ranges = err.context.get("missing_ranges", [])
+    total = err.context.get("total_pages", "?")
+    range_strs = [f"{a}" if a == b else f"{a}-{b}" for a, b in ranges]
+    pretty = ", ".join(range_strs) if range_strs else "?"
+    # Build a "pages X-Y" sentence for the re-scan instruction
+    if len(ranges) == 1 and ranges[0][0] != ranges[0][1]:
+        rescan = f"pages {ranges[0][0]}-{ranges[0][1]}"
+    elif len(ranges) == 1:
+        rescan = f"page {ranges[0][0]}"
+    else:
+        rescan = f"pages {pretty}"
+    return (
+        f"- Schema page coverage is INCOMPLETE. The PDF has "
+        f"{total} pages, but the following pages do not appear in "
+        f"sections[] OR excluded_sections[]: {pretty}. Per §4.0 "
+        f"(HEADING ENUMERATION), you almost certainly missed headings "
+        f"on {rescan}. Re-scan {rescan} for content — look for "
+        f"unnumbered theory sub-headings, end-of-chapter banks "
+        f"(JEE-NEET Wing, Practice Set, etc.), and numbered headings "
+        f"that lack obvious visual distinction. Add them to "
+        f"sections[] (theory or inline Cat A) or excluded_sections[] "
+        f"(end-of-chapter Q-banks/help) as appropriate. Every page of "
+        f"the PDF must be covered."
+    )
+
+
 # ─── DISPATCH TABLE ────────────────────────────────────────────────
 
 # Adding a new ErrorType requires adding a matching fragment here.
@@ -353,6 +507,17 @@ _FRAGMENT_BUILDERS = {
     ErrorType.INVALID_CONTENT_TYPES: _fragment_invalid_content_types,
     ErrorType.CAT_A_AT_END_NOT_EXCLUDED: _fragment_cat_a_at_end_not_excluded,
     ErrorType.EMPTY_PLACEHOLDER: _fragment_empty_placeholder,
+    # Theory Unit 1 — excluded_sections hard rules (§0.5 #4)
+    ErrorType.TITLE_DUPLICATE_ACROSS_ARRAYS: _fragment_title_duplicate_across_arrays,
+    ErrorType.MID_CHAPTER_EXCLUDED: _fragment_mid_chapter_excluded,
+    # Theory Unit 9 follow-up — §5.9 puzzle prohibition
+    ErrorType.PUZZLE_AS_SECTION: _fragment_puzzle_as_section,
+    # Cat A nesting rule
+    ErrorType.CAT_A_NOT_NESTED_UNDER_PREVIOUS_THEORY: _fragment_cat_a_not_nested,
+    # Positional Cat A parent page-range mismatch (§3.2.6)
+    ErrorType.CAT_A_PARENT_PAGE_MISMATCH: _fragment_cat_a_parent_page_mismatch,
+    # Whole-schema page coverage invariant
+    ErrorType.SCHEMA_PAGE_COVERAGE_INCOMPLETE: _fragment_schema_page_coverage_incomplete,
 }
 
 

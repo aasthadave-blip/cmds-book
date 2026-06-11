@@ -73,6 +73,22 @@ class Book(Base):
     theory_retries: Mapped[int] = mapped_column(
         sa.Integer, nullable=False, default=0, server_default="0",
     )
+    # Build Step 1 — schema auto-retry counter. Mirrors the theory/
+    # questions/figures counters: the coordinator allows ONE automatic
+    # retry on schema failure (transient Gemini error), then leaves the
+    # book terminal-failed for the user to retry manually.
+    schema_retries: Mapped[int] = mapped_column(
+        sa.Integer, nullable=False, default=0, server_default="0",
+    )
+    # Build Step 1 — reconciliation safety net. The watchdog reconciler
+    # increments this each time it re-drives a stalled book. When it hits
+    # MAX_RECOVERY_ATTEMPTS the book is marked failed and no longer
+    # re-driven (anti-infinite-loop). Reset to 0 whenever a stage makes
+    # genuine forward progress (pending/failed → running) so a book that
+    # recovered cleanly isn't wrongly capped on a later legitimate nudge.
+    recovery_attempts: Mapped[int] = mapped_column(
+        sa.Integer, nullable=False, default=0, server_default="0",
+    )
     questions_retries: Mapped[int] = mapped_column(
         sa.Integer, nullable=False, default=0, server_default="0",
     )
@@ -89,6 +105,12 @@ class Book(Base):
     # corrective-retry triggers). Populated by schema_builder during
     # generation. Shape: [{type, section_id, reason, severity}, ...]
     schema_warnings: Mapped[list | None] = mapped_column(sa.JSON, nullable=True)
+    # SCHEMA Rebalance — preserve the LAST failed Gemini attempt's schema
+    # for offline diagnosis. Set whenever an attempt fails validation
+    # (including the final attempt when the loop exhausts MAX_ATTEMPTS and
+    # we accept-with-warnings). NULL on books whose first attempt validated
+    # cleanly.
+    last_failed_schema: Mapped[dict | None] = mapped_column(sa.JSON, nullable=True)
     # schema_quality_score: 0-100. Computed by the schema validator
     # (lands in Week 2). 90+ good, 70-89 has warnings, <70 schema
     # is rejected outright and surfaced to the user.

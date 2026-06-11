@@ -33,7 +33,10 @@ from app.models.job import Job
 from app.models.question import Question
 from app.models.question_bank import QuestionBank
 from app.models.rejected_question import RejectedQuestion
+from app.models.section import Section
 from app.services.questions.linking import SchemaIndex, resolve_block_link
+from app.services.question_latex_normalizer import normalize_question_latex
+from app.workers.questions_v3 import _finalize_solution_flag
 
 books_router = APIRouter(prefix="/api/books", tags=["question-banks"])
 banks_router = APIRouter(prefix="/api/question-banks", tags=["question-banks"])
@@ -299,47 +302,90 @@ async def create_question_bank(
     if not book.pdf_url:
         raise HTTPException(400, detail="Book has no PDF")
 
-    # Mark any prior pending/extracting banks for this book as failed — they
-    # are orphans from earlier retries that never finished. Prevents pileup.
-    await session.execute(
-        update(QuestionBank)
-        .where(QuestionBank.book_id == book.id)
-        .where(QuestionBank.status.in_(["pending", "extracting"]))
-        .values(status="failed", last_error="Superseded by new extraction request")
-    )
-
-    bank = QuestionBank(
-        book_id=book.id,
-        title=book.title,
-        subject=book.subject,
-        status="pending",
-    )
-    session.add(bank)
-    await session.flush()
-
     from app.core.config import settings as _s
     worker_version = (_s.QUESTION_WORKER_VERSION or "v3").lower()
-    task_name = (
-        "extract_questions_v3" if worker_version == "v3" else "extract_questions_v2"
-    )
 
-    job = Job(
-        book_id=book.id, type=task_name, status="queued", progress=0
-    )
-    session.add(job)
-    await session.flush()
-
-    await session.commit()
-
+    # v3 path — route through the orchestrator's atomic _dispatch_questions
+    # for race-free CAS guarantee (same as theory/figures/analyse). v2 is
+    # legacy; preserve its behaviour for backward compat (no orchestrator
+    # routing exists for v2 and we don't want to refactor a deprecated path).
     if worker_version == "v3":
-        import app.workers.questions_v3  # noqa: F401 — ensure task registration
-        from app.workers.runner import dispatch
-        # v3 takes (book_id, bank_id, job_id) — different signature from v2.
-        dispatch(task_name, str(book.id), str(bank.id), str(job.id))
+        # Reset questions_status so CAS sees pending → running.
+        book.questions_status = "pending"
+        await session.commit()
+
+        import app.workers.questions_v3  # noqa: F401
+        import app.workers.orchestrator  # noqa: F401
+        from app.workers.orchestrator import SyncSession, _dispatch_questions
+        from app.models.book import Book as BookModel
+        from app.models.question_bank import QuestionBank as QBM
+        from app.models.job import Job as JobModel
+        import asyncio
+
+        def _do_dispatch() -> tuple[str | None, str | None]:
+            with SyncSession() as s:
+                b = s.get(BookModel, book_id)
+                if b is None:
+                    return None, None
+                before = b.questions_status
+                _dispatch_questions(s, b)
+                s.refresh(b)
+                if b.questions_status != "running" or before == "running":
+                    return None, None
+                from sqlalchemy import select as _select
+                bk = s.execute(
+                    _select(QBM).where(QBM.book_id == book_id, QBM.status == "pending")
+                    .order_by(QBM.id.desc()).limit(1)
+                ).scalars().first()
+                j = s.execute(
+                    _select(JobModel).where(
+                        JobModel.book_id == book_id,
+                        JobModel.type == "extract_questions",
+                    ).order_by(JobModel.id.desc()).limit(1)
+                ).scalars().first()
+                return (str(bk.id) if bk else None, str(j.id) if j else None)
+
+        bank_id_str, job_id_str = await asyncio.to_thread(_do_dispatch)
+        if bank_id_str is None or job_id_str is None:
+            raise HTTPException(
+                status.HTTP_409_CONFLICT,
+                detail=(
+                    "Question extraction already running or terminal — "
+                    "refused duplicate dispatch."
+                ),
+            )
+        # Match the legacy return contract — code below expects `bank` + `job`.
+        from uuid import UUID as _UUID
+        bank = await session.get(QuestionBank, _UUID(bank_id_str))
+        job = await session.get(Job, _UUID(job_id_str))
     else:
+        # v2 legacy path — kept as-is (deprecated).
+        await session.execute(
+            update(QuestionBank)
+            .where(QuestionBank.book_id == book.id)
+            .where(QuestionBank.status.in_(["pending", "extracting"]))
+            .values(status="failed", last_error="Superseded by new extraction request")
+        )
+
+        bank = QuestionBank(
+            book_id=book.id,
+            title=book.title,
+            subject=book.subject,
+            status="pending",
+        )
+        session.add(bank)
+        await session.flush()
+
+        job = Job(
+            book_id=book.id, type="extract_questions_v2", status="queued", progress=0
+        )
+        session.add(job)
+        await session.flush()
+        await session.commit()
+
         import app.workers.questions_v2  # noqa: F401
         from app.workers.runner import dispatch
-        dispatch(task_name, str(book.id), str(job.id))
+        dispatch("extract_questions_v2", str(book.id), str(job.id))
 
     return {
         "bank_id": str(bank.id),
@@ -946,15 +992,34 @@ async def restore_rejected(
         raise HTTPException(409, detail=f"Rejected item already {rej.status}")
 
     payload = rej.payload or {}
+    # Resolve section UUID for canonical FK (CONTRACT.md §1)
+    section_uuid_val: UUID | None = None
+    if rej.section_ref:
+        row = (await session.execute(
+            select(Section.id).where(
+                Section.book_id == rej.book_id,
+                Section.section_id == rej.section_ref,
+            )
+        )).first()
+        section_uuid_val = row[0] if row else None
+    # Q5: normalize LaTeX on restore (rejected rows may predate the
+    # normalizer). Idempotent — already-normalized text is unchanged.
+    _restored_raw, _ = normalize_question_latex(rej.raw_text or "")
+    _restored_sol = payload.get("solution_text")
+    if _restored_sol:
+        _restored_sol, _ = normalize_question_latex(_restored_sol)
+    # Q1 invariant: derive has_solution from the finalized solution_text.
+    _restored_sol, _restored_has_sol = _finalize_solution_flag(_restored_sol)
     q = Question(
         id=uuid4(),
         bank_id=rej.bank_id,
         book_id=rej.book_id,
         section_ref=rej.section_ref,
+        section_uuid=section_uuid_val,
         section_title=rej.section_title,
         page_start=rej.page_start,
         page_end=rej.page_end,
-        raw_text=rej.raw_text,
+        raw_text=_restored_raw,
         status="passed",
         question_number=payload.get("question_number"),
         exercise_ref=payload.get("exercise_ref"),
@@ -962,8 +1027,8 @@ async def restore_rejected(
         sub_part=payload.get("sub_part"),
         question_type=payload.get("question_type"),
         has_options=bool(payload.get("has_options") or False),
-        solution_text=payload.get("solution_text"),
-        has_solution=bool(payload.get("has_solution") or False),
+        solution_text=_restored_sol,
+        has_solution=_restored_has_sol,
         kind=(payload.get("kind") or "exercise"),
     )
     session.add(q)
@@ -1029,17 +1094,36 @@ async def restore_all_rejected(
     now = datetime.now(timezone.utc)
     restored = 0
     book_id_for_q2: UUID | None = None
+
+    # Build {book_id: {slug: section_uuid}} once for all books touched.
+    book_section_maps: dict[UUID, dict[str, UUID]] = {}
+    for rej in pending:
+        if rej.book_id not in book_section_maps:
+            rows = (await session.execute(
+                select(Section.section_id, Section.id).where(Section.book_id == rej.book_id)
+            )).all()
+            book_section_maps[rej.book_id] = {slug: sid for slug, sid in rows if slug}
+
     for rej in pending:
         payload = rej.payload or {}
+        section_uuid_val = book_section_maps.get(rej.book_id, {}).get(rej.section_ref) if rej.section_ref else None
+        # Q5: normalize LaTeX on bulk restore (idempotent).
+        _bulk_raw, _ = normalize_question_latex(rej.raw_text or "")
+        _bulk_sol = payload.get("solution_text")
+        if _bulk_sol:
+            _bulk_sol, _ = normalize_question_latex(_bulk_sol)
+        # Q1 invariant: derive has_solution from the finalized solution_text.
+        _bulk_sol, _bulk_has_sol = _finalize_solution_flag(_bulk_sol)
         q = Question(
             id=uuid4(),
             bank_id=rej.bank_id,
             book_id=rej.book_id,
             section_ref=rej.section_ref,
+            section_uuid=section_uuid_val,
             section_title=rej.section_title,
             page_start=rej.page_start,
             page_end=rej.page_end,
-            raw_text=rej.raw_text,
+            raw_text=_bulk_raw,
             status="passed",
             question_number=payload.get("question_number"),
             exercise_ref=payload.get("exercise_ref"),
@@ -1047,8 +1131,8 @@ async def restore_all_rejected(
             sub_part=payload.get("sub_part"),
             question_type=payload.get("question_type"),
             has_options=bool(payload.get("has_options") or False),
-            solution_text=payload.get("solution_text"),
-            has_solution=bool(payload.get("has_solution") or False),
+            solution_text=_bulk_sol,
+            has_solution=_bulk_has_sol,
             kind=(payload.get("kind") or "exercise"),
         )
         session.add(q)

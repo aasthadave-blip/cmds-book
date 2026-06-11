@@ -88,7 +88,10 @@ class ExcludedSection(BaseModel):
 
 class BookSchema(BaseModel):
     document_title: str = ""
-    subject: str = ""
+    # subject/grade_level/board are all "fill from print if visible, else null"
+    # per the schema prompt (§1, line 55). Pydantic must accept null for all
+    # three uniformly. Downstream consumers fall back to "" via `schema.subject or ""`.
+    subject: str | None = None
     grade_level: str | None = None
     board: str | None = None
     total_pages: int | None = None

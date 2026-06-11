@@ -48,6 +48,10 @@ from app.models.question import Question
 from app.models.question_bank import QuestionBank
 from app.schemas.analyser import BookSchema, ExcludedSection, SchemaSection
 from app.services.prompt_loader import load_raw
+from app.services.question_latex_normalizer import (
+    QuestionLatexReport,
+    normalize_question_latex,
+)
 from app.services.questions.dedup import dedup_bank
 from app.services.questions.structural_filter import filter_items
 from app.utils.json_parse import parse_json
@@ -63,6 +67,14 @@ GEMINI_MODEL = "gemini-2.5-flash"  # OCR-style transcription; Flash is ~4× chea
 MAX_ATTEMPTS = 3
 GEMINI_TIMEOUT_S = 150
 MAX_OUTPUT_TOKENS = 65536
+
+# Q6 Part A — Question Completeness Contract.
+# A unit is "incomplete" when it captured fewer than COMPLETENESS_THRESHOLD of
+# its schema-declared expected_question_count. Incomplete units get a bounded
+# number of full re-scan retries (separate budget from the existing Q3 targeted
+# retry and Q1/Q2 post-passes) before we accept the gap and record it.
+COMPLETENESS_THRESHOLD = 0.9
+MAX_COMPLETENESS_RETRIES = 2
 
 # Sub-retry policy for transient OCR errors — Gemini server disconnects, read
 # timeouts, 5xx. Doesn't burn through MAX_ATTEMPTS, just waits for the network
@@ -153,6 +165,42 @@ def _slice_pdf(pdf_bytes: bytes, page_start: int | None, page_end: int | None) -
         logger.warning("PDF slice failed (pages %s-%s): %s — using full PDF",
                        page_start, page_end, e)
         return pdf_bytes
+
+
+def _effective_slice_end(
+    page_end: int | None,
+    next_page_start: int | None,
+) -> int | None:
+    """Q6 Part C — compute the padded slice end without bleeding into the
+    next section.
+
+    We add the historical +1 trailing pad (a section's last question often
+    sits on the page the next section "officially" starts). But when the
+    next section starts on or before that padded page, we CLIP the pad to
+    the next section's start page so the slice still includes the shared
+    boundary page (needed for this section's tail) WITHOUT extending a full
+    page deeper into the next section's territory.
+
+    The prompt's STOP-anchor (next_title) still does the fine-grained
+    heading-level cut on the shared page; this clip is the coarse page-level
+    guard that keeps the slice from ever reaching pages that belong wholly
+    to the section AFTER the next one.
+
+      page_end=None                       → None   (caller passes full PDF)
+      next_page_start=None                → page_end + 1  (last unit; full pad)
+      page_end=3, next_page_start=3       → 3      (clip pad to boundary page)
+      page_end=3, next_page_start=5       → 4      (full +1 pad; no bleed)
+      page_end=3, next_page_start=4       → 4      (+1 pad lands on next start)
+    """
+    if page_end is None:
+        return None
+    padded = page_end + 1
+    if next_page_start is None:
+        return padded
+    # Never extend past the next section's start page. The boundary page
+    # itself (== next_page_start) is allowed so this section's tail on the
+    # shared page is still captured; the prompt STOP-anchor trims the rest.
+    return min(padded, next_page_start)
 
 
 def _extract_section_text(
@@ -508,7 +556,7 @@ class _Unit:
     """One extraction unit: a section or excluded section with page range."""
 
     __slots__ = ("kind", "id", "title", "page_start", "page_end",
-                 "expected", "next_title", "skipped",
+                 "expected", "next_title", "next_page_start", "skipped",
                  "section_start_heading")
 
     def __init__(
@@ -529,6 +577,11 @@ class _Unit:
         self.page_end = page_end
         self.expected = expected
         self.next_title: str | None = None
+        # Q6 Part C — page_start of the NEXT unit in schema order. Used by
+        # _effective_slice_end to clip this unit's trailing page pad so it
+        # never bleeds into the next section's questions. Set in the same
+        # wiring loop as next_title. None for the last unit (no successor).
+        self.next_page_start: int | None = None
         # When True, the unit is recorded in extraction_stats with
         # status="skipped" but no Gemini call is made. Used for the
         # "trust the schema's eqc=0" cost optimisation.
@@ -594,18 +647,20 @@ def _flatten_sections(
         #   extracted. Treat the chapter itself as the Cat A leaf and
         #   fall through to the normal emit path.
         if (node.type or "").lower() == "chapter":
+            # Wrapper rule: chapter is emitted as a Cat A unit IFF its
+            # content_types includes "questions" (i.e. loose questions
+            # sit directly under the chapter heading with no enclosing
+            # subsection — §10.4). Otherwise the chapter is a pure
+            # container; recurse only.
             has_q_at_chapter = "questions" in (node.content_types or [])
-            no_children = not (node.subsections or [])
-            if has_q_at_chapter and no_children:
-                # Fall through to the Cat A leaf-emit path below by
-                # NOT returning. The is_category_a check at line ~613
-                # will pick this up because content_types contains
-                # "questions".
-                pass
-            else:
+            if not has_q_at_chapter:
                 for c in node.subsections or []:
                     emit(c, depth + 1)
                 return
+            # Fall through to the normal Cat A emit path below. The
+            # P-1 HARD STOP further down explicitly skips chapter
+            # wrappers so the wrapper's loose Qs aren't blocked by
+            # the presence of Cat A children.
         # Excluded sections inside .sections tree (rare) handled below
         if (node.type or "").lower() == "excluded":
             return
@@ -637,11 +692,17 @@ def _flatten_sections(
         # container for grouping. If real prelude theory exists before
         # the first child's heading, the theory pipeline still extracts
         # it via the existing next_title hard-stop (extract.py:411-416).
+        # P-1 HARD STOP applies to numbered Cat B containers, NOT to the
+        # chapter wrapper. The wrapper's expQ counts only loose questions
+        # directly under the chapter heading (§10.4) — it does NOT roll
+        # up children — so emitting the wrapper alongside its Cat A
+        # children does not double-extract.
+        is_chapter_wrapper = (node.type or "").lower() == "chapter"
         has_cat_a_children = any(
             "questions" in (c.content_types or [])
             for c in children
         )
-        if has_cat_a_children:
+        if has_cat_a_children and not is_chapter_wrapper:
             emit_self = False
 
         if emit_self:
@@ -739,7 +800,12 @@ def _flatten_sections(
     # schema order — keep it.
 
     for i, u in enumerate(units):
-        u.next_title = units[i + 1].title if i + 1 < len(units) else None
+        if i + 1 < len(units):
+            u.next_title = units[i + 1].title
+            u.next_page_start = units[i + 1].page_start
+        else:
+            u.next_title = None
+            u.next_page_start = None
 
     # Page-coverage audit — warn if any pages between first and last unit
     # are NOT covered by any unit. Helps detect schema gaps that would
@@ -865,7 +931,7 @@ async def _extract_unit(
     )
     leading_pad = 1 if (is_example_unit and is_tight_slice and unit.page_start and unit.page_start > 1) else 0
     start = (unit.page_start - leading_pad) if unit.page_start is not None else None
-    padded_end = (unit.page_end + 1) if unit.page_end is not None else None
+    padded_end = _effective_slice_end(unit.page_end, unit.next_page_start)
     pdf_slice = _slice_pdf(pdf_bytes, start, padded_end)
     user_prompt = _build_user_prompt(unit)
 
@@ -994,28 +1060,47 @@ def _quality_check_question(item: dict[str, Any]) -> list[str]:
 
 
 def _dedupe_extracted(items: list[dict[str, Any]]) -> list[dict[str, Any]]:
-    """Per-section 100% dedup — keep only the first occurrence when two
-    extracted items have IDENTICAL normalized raw_text.
+    """Per-section dedup — number-aware (Q6 Part D).
+
+    Two extracted items are duplicates ONLY when they refer to the SAME
+    printed question. We decide that as follows:
+
+      • If BOTH items carry a question_number → they are duplicates iff
+        their normalized question_number is EQUAL. Two questions with
+        DIFFERENT question_numbers are NEVER duplicates, even when their
+        raw_text is byte-identical (short MCQs that legitimately share
+        wording — "Choose the correct option." stems — must not collapse).
+      • If a question_number is ABSENT → fall back to the historical
+        strict normalized-raw_text dedup (handles chunk-boundary repeats
+        of unnumbered items).
+
+    This stops the previous text-only dedup from silently eating
+    legitimately-distinct short questions that happen to share wording.
 
     Used after chunk-merge so the same question on a page-range boundary
-    that Gemini returned twice doesn't produce two DB rows. Strict
-    equality only — even a one-character difference is treated as a
-    distinct item (handles legitimate variants like "x² + 5x = 0" vs
-    "x² + 6x = 0").
-
-    Replaces the looser fingerprint-based dedup we used to have (which
-    collapsed structurally-similar items and ate legitimate variants).
+    that Gemini returned twice doesn't produce two DB rows.
     """
-    seen: set[str] = set()
+    seen_numbers: set[str] = set()   # normalized question_number
+    seen_text: set[str] = set()      # normalized raw_text (numberless fallback)
     out: list[dict[str, Any]] = []
     for it in items:
-        key = _normalize_for_strict_match(it.get("raw_text") or "")
-        if not key:
-            out.append(it)  # empty raw_text — keep it, let QC catch later
-            continue
-        if key in seen:
-            continue  # exact duplicate, drop silently
-        seen.add(key)
+        qno = _norm_qno(
+            it.get("question_number") or it.get("q_no") or ""
+        )
+        if qno:
+            # Number-keyed dedup. Different numbers are always distinct.
+            if qno in seen_numbers:
+                continue  # true duplicate (same printed number), drop silently
+            seen_numbers.add(qno)
+        else:
+            # Numberless fallback — strict normalized-text dedup.
+            key = _normalize_for_strict_match(it.get("raw_text") or "")
+            if not key:
+                out.append(it)  # empty raw_text — keep it, let QC catch later
+                continue
+            if key in seen_text:
+                continue  # exact duplicate, drop silently
+            seen_text.add(key)
         # Multi-column safety net — annotate any structural issues we
         # can detect from raw_text alone (brace balance, option order,
         # missing options). NO-OP for clean single-column extractions.
@@ -1146,7 +1231,7 @@ async def _run_targeted_retry(
         is_example and is_tight and unit.page_start and unit.page_start > 1
     ) else 0
     start = (unit.page_start - leading_pad) if unit.page_start is not None else None
-    padded_end = (unit.page_end + 1) if unit.page_end is not None else None
+    padded_end = _effective_slice_end(unit.page_end, unit.next_page_start)
     pdf_slice = _slice_pdf(pdf_bytes, start, padded_end)
 
     qnos_str = ", ".join(missing_qnos[:50])  # cap to avoid prompt bloat
@@ -1184,6 +1269,133 @@ async def _run_targeted_retry(
         return {"ok": False, "extracted": [], "rejected": [], "identified_total": 0}
 
 
+def _is_incomplete(expected: int | None, extracted: int) -> bool:
+    """Q6 Part A — pure completeness decision.
+
+    A unit is incomplete when it has a positive expected count AND captured
+    fewer than COMPLETENESS_THRESHOLD of it. expected<=0 means "no
+    expectation" → never incomplete. extracted==expected (or above) →
+    complete. At exactly the threshold (e.g. 9 of 10) → complete.
+    """
+    exp = int(expected or 0)
+    if exp <= 0:
+        return False
+    return extracted < exp * COMPLETENESS_THRESHOLD
+
+
+def _qno_of(item: dict[str, Any]) -> str:
+    """Normalized question_number for merge keys (empty if absent)."""
+    for k in ("question_number", "q_no"):
+        v = item.get(k)
+        if v is not None and str(v).strip():
+            return _norm_qno(v)
+    return ""
+
+
+def _merge_by_number(
+    existing: list[dict[str, Any]],
+    incoming: list[dict[str, Any]],
+) -> tuple[list[dict[str, Any]], int]:
+    """Q6 Part A — merge newly-found questions into the existing set by
+    question_number (NOT aggressive text-dedup). Returns (merged, added).
+
+    Rules:
+      • An incoming item whose normalized question_number already exists is
+        skipped (already captured).
+      • An incoming item with a NEW question_number is appended.
+      • An incoming item WITHOUT a question_number is appended only if its
+        normalized raw_text isn't already present (numberless fallback) —
+        mirrors _dedupe_extracted so retries can't manufacture duplicates.
+    """
+    seen_numbers = {_qno_of(it) for it in existing if _qno_of(it)}
+    seen_text = {
+        _normalize_for_strict_match(it.get("raw_text") or "")
+        for it in existing
+        if not _qno_of(it) and (it.get("raw_text") or "").strip()
+    }
+    merged = list(existing)
+    added = 0
+    for it in incoming:
+        qno = _qno_of(it)
+        if qno:
+            if qno in seen_numbers:
+                continue
+            seen_numbers.add(qno)
+            merged.append(it)
+            added += 1
+        else:
+            key = _normalize_for_strict_match(it.get("raw_text") or "")
+            if not key or key in seen_text:
+                continue
+            seen_text.add(key)
+            merged.append(it)
+            added += 1
+    return merged, added
+
+
+async def _run_completeness_retry(
+    unit: _Unit,
+    pdf_bytes: bytes,
+    system_prompt: str,
+    expected: int,
+    extracted: int,
+) -> dict[str, Any]:
+    """Q6 Part A — one full re-scan of the unit's ENTIRE page range with a
+    completeness addendum. Unlike the Q3 targeted retry (which names specific
+    missing q_nos), this re-extracts the whole section because the gap may be
+    a wholesale column-miss (e.g. the entire right column was skipped).
+
+    Returns the same shape as _extract_unit (ok/extracted/rejected/...).
+    """
+    is_example = bool(unit.id) and "example" in (unit.id or "").lower()
+    is_tight = (
+        unit.page_start is not None
+        and unit.page_end is not None
+        and unit.page_end - unit.page_start <= 0
+    )
+    leading_pad = 1 if (
+        is_example and is_tight and unit.page_start and unit.page_start > 1
+    ) else 0
+    start = (unit.page_start - leading_pad) if unit.page_start is not None else None
+    padded_end = _effective_slice_end(unit.page_end, unit.next_page_start)
+    pdf_slice = _slice_pdf(pdf_bytes, start, padded_end)
+
+    base_prompt = _build_user_prompt(unit)
+    addendum = (
+        f"\n\n═══ COMPLETENESS RETRY ═══\n"
+        f"This section is expected to contain {expected} questions "
+        f"(numbered 1..{expected} or similar). The previous pass found only "
+        f"{extracted}. Re-scan the ENTIRE page range. Extract EVERY numbered "
+        f"question. Read multi-column layouts column-by-column, left-to-right, "
+        f"reading each column fully top-to-bottom before moving to the next "
+        f"(see the MULTI-COLUMN rule). Do NOT skip questions, do NOT merge two "
+        f"questions into one item, do NOT drop questions that contain figures "
+        f"or tables. Return the COMPLETE set. (Still obey RULE B — never "
+        f"fabricate; if a number genuinely isn't printed, omit it.)"
+    )
+    user_prompt = base_prompt + addendum
+    try:
+        raw = await _gemini_call_with_transient_retries(
+            pdf_slice, system_prompt, user_prompt,
+            ctx=f"q6-completeness {unit.kind}/{unit.id}",
+        )
+        data = parse_json(raw)
+        if not isinstance(data, dict):
+            return {"ok": False, "extracted": [], "rejected": [], "identified_total": 0}
+        extracted_items = list(data.get("extracted") or [])
+        fr = filter_items(extracted_items)
+        return {
+            "ok": True,
+            "identified_total": int(data.get("identified_total") or 0),
+            "extracted": fr.kept,
+            "rejected": fr.rejected,
+        }
+    except Exception as e:
+        logger.warning("Q6 completeness retry failed for %s/%s: %s",
+                       unit.kind, unit.id, e)
+        return {"ok": False, "extracted": [], "rejected": [], "identified_total": 0}
+
+
 def _verify_and_degrade(
     items: list[dict[str, Any]],
     source_text: str,
@@ -1192,8 +1404,20 @@ def _verify_and_degrade(
 
     Returns (verified_items, rejected_items, degraded_count).
       - verified_items: items that passed (with stripped fields nulled)
-      - rejected_items: items that failed raw_text verification
-      - degraded_count: how many verified items had at least one stripped field
+                        PLUS items that failed the raw_text substring check
+                        but have real content — these are KEPT and flagged
+                        low-confidence / needs-review (Q6 Part D).
+      - rejected_items: ONLY items that are empty / garbage (no usable
+                        raw_text). Strict-substring failure no longer drops
+                        a real question — it merely flags it.
+      - degraded_count: how many kept items had at least one stripped field
+
+    Q6 Part D rationale: the strict ≥90% substring check drops valid
+    questions whenever pypdf text drifts from Gemini's OCR (figure-bearing
+    MCQs, scanned columns, math-heavy stems). Silently losing a real
+    question is worse than surfacing a low-confidence one. We therefore
+    only DROP when raw_text is genuinely empty; coverage failures KEEP the
+    question and mark qc_local.needs_review so a human can confirm.
     """
     verified: list[dict[str, Any]] = []
     rejected: list[dict[str, Any]] = []
@@ -1204,10 +1428,26 @@ def _verify_and_degrade(
             verified.append(item)
             continue
         if not vr.verified:
-            rejected.append({
+            reason = vr.reason or "verify failed"
+            raw_text = (item.get("raw_text") or "").strip()
+            # Only TRUE garbage (empty raw_text) is dropped. A coverage
+            # failure on a non-empty question is kept + flagged.
+            is_empty_garbage = (
+                not raw_text or "raw_text empty" in reason
+            )
+            if is_empty_garbage:
+                rejected.append({
+                    **item,
+                    "_q3_reject_reason": reason,
+                })
+                continue
+            # Keep but flag low-confidence / needs-review.
+            flagged = {
                 **item,
-                "_q3_reject_reason": vr.reason or "verify failed",
-            })
+                "_q3_low_confidence": True,
+                "_q3_verify_reason": reason,
+            }
+            verified.append(flagged)
             continue
         if vr.stripped_fields:
             cleaned = {**item}
@@ -1356,6 +1596,59 @@ async def _extract_unit_with_verify_and_retry(
             rejected_by_verify.extend(retry_rejected)
             verified_count = len(verified_items)
 
+    # 5b. Q6 Part A — COMPLETENESS CONTRACT.
+    # After verify + targeted retry, compare the captured count against the
+    # schema's expected_question_count. If we're below the threshold, run up
+    # to MAX_COMPLETENESS_RETRIES full re-scans of the ENTIRE page range,
+    # merging newly-found questions by question_number (never aggressive
+    # text-dedup). Separate budget from the Q3 targeted retry above.
+    #
+    # Applies to BOTH Cat A sections and excluded Q-banks: a wholesale
+    # column-miss (the entire right column skipped) is the dominant cause of
+    # the measured 90.3% capture rate, and the targeted retry above (excluded-
+    # only, q_no-named) can't recover a column that was never read.
+    completeness_incomplete = False
+    completeness_gap = 0
+    completeness_retries_used = 0
+    expected_for_gate = int(unit.expected or 0)
+    if expected_for_gate > 0 and _is_incomplete(expected_for_gate, verified_count):
+        completeness_incomplete = True
+        for attempt in range(1, MAX_COMPLETENESS_RETRIES + 1):
+            if not _is_incomplete(expected_for_gate, verified_count):
+                break
+            logger.info(
+                "Q6 completeness retry %d/%d: %s/%s — captured=%d expected=%d "
+                "(threshold=%.0f%%)",
+                attempt, MAX_COMPLETENESS_RETRIES, unit.kind, unit.id,
+                verified_count, expected_for_gate, COMPLETENESS_THRESHOLD * 100,
+            )
+            completeness_retries_used = attempt
+            cr = await _run_completeness_retry(
+                unit, pdf_bytes, system_prompt,
+                expected=expected_for_gate, extracted=verified_count,
+            )
+            if not cr.get("ok"):
+                break
+            cr_extracted = list(cr.get("extracted") or [])
+            cr_verified, cr_rejected, cr_degraded = _verify_and_degrade(
+                cr_extracted, source_text,
+            )
+            verified_items, added = _merge_by_number(verified_items, cr_verified)
+            degraded += cr_degraded
+            rejected_by_verify.extend(cr_rejected)
+            verified_count = len(verified_items)
+            if added == 0:
+                # Retry found nothing new — further retries won't help.
+                break
+        completeness_gap = max(0, expected_for_gate - verified_count)
+        logger.info(
+            "Q6 completeness gate result: %s/%s — final captured=%d expected=%d "
+            "gap=%d retries=%d still_incomplete=%s",
+            unit.kind, unit.id, verified_count, expected_for_gate,
+            completeness_gap, completeness_retries_used,
+            _is_incomplete(expected_for_gate, verified_count),
+        )
+
     # 6. Decide _q3_status (independent of downstream _classify_unit).
     if verified_count == 0:
         q3_status = "empty" if authoritative_expected == 0 else "partial"
@@ -1376,12 +1669,84 @@ async def _extract_unit_with_verify_and_retry(
     result["authoritative_expected"] = authoritative_expected
     result["_q3_retried"] = retried
     result["_q3_status"] = q3_status
+    # Q6 Part A telemetry.
+    result["completeness_incomplete"] = completeness_incomplete
+    result["completeness_gap"] = completeness_gap
+    result["completeness_retries"] = completeness_retries_used
     return result
+
+
+# ---------------------------------------------------------------------------
+# Q1 — Solution completeness
+# ---------------------------------------------------------------------------
+def _finalize_solution_flag(
+    solution_text: str | None,
+) -> tuple[str | None, bool]:
+    """Single source of truth for the solution data-integrity invariant.
+
+    ``has_solution`` MUST equal ``(solution_text is non-empty after strip)``.
+    Never flag=True with empty text; never text with flag=False.
+
+    Runs AFTER ``normalize_question_latex`` at every write site (Q5 normalize
+    first, then finalize). Returns ``(clean_text, has_solution_bool)``:
+      - empty / None / whitespace-only → ``(None, False)``
+      - otherwise                      → ``(stripped_text, True)``
+    """
+    if not solution_text:
+        return None, False
+    cleaned = solution_text.strip()
+    if not cleaned:
+        return None, False
+    return cleaned, True
+
+
+# Word-boundary patterns for sections whose SOURCE TYPE guarantees a printed
+# solution (worked examples / solved problems). Case-insensitive. We only
+# require a solution where the type guarantees one — never fabricate.
+_SOLUTION_BEARING_RE = re.compile(
+    r"\b(?:worked\s+example|solved\s+example|example|solved|illustration)\b",
+    re.IGNORECASE,
+)
+
+
+def _section_implies_solution(
+    section_title: str | None,
+    section_ref: str | None,
+    kind: str | None,
+) -> bool:
+    """Conditional guard: does this section's source type guarantee that
+    every item prints a complete solution?
+
+    True for worked-example / solved-problem / illustration sections —
+    detected via ``kind == 'example'`` OR a word-boundary match in the
+    section title / ref. False for plain MCQ banks and exercises (which
+    routinely print NO solution), so we never flag those as incomplete.
+    """
+    if (kind or "").strip().lower() == "example":
+        return True
+    for field in (section_title, section_ref):
+        if field and _SOLUTION_BEARING_RE.search(field):
+            return True
+    return False
 
 
 # ---------------------------------------------------------------------------
 # Persistence
 # ---------------------------------------------------------------------------
+def _normalize_question_fields(
+    raw_text: str, solution_text: str | None
+) -> tuple[str, str | None, QuestionLatexReport]:
+    """Run the KaTeX normalizer over a question's raw_text + solution_text
+    (options live inline in raw_text — no separate column). Returns the cleaned
+    pair plus a combined telemetry report for per-unit aggregation."""
+    raw_out, rep = normalize_question_latex(raw_text or "")
+    sol_out = solution_text
+    if solution_text:
+        sol_out, rep_sol = normalize_question_latex(solution_text)
+        rep = rep + rep_sol
+    return raw_out, sol_out, rep
+
+
 def _persist_unit(
     session: Session,
     bank_id: UUID,
@@ -1451,10 +1816,36 @@ def _persist_unit(
         ))
 
     inserted = 0
+    latex_agg = QuestionLatexReport()
     for item in result.get("extracted", []):
         raw_text = (item.get("raw_text") or "").strip()
         if not raw_text:
             continue
+        # KaTeX normalization: clean inline math spans, wrap bare Unicode math
+        # glyphs + obvious chemistry. Options live inline in raw_text.
+        raw_text, solution_text, rep = _normalize_question_fields(
+            raw_text, item.get("solution") or None
+        )
+        latex_agg = latex_agg + rep
+        # Q1 invariant: has_solution == (solution_text non-empty). Finalize
+        # AFTER normalize so we judge the cleaned text.
+        solution_text, has_solution = _finalize_solution_flag(solution_text)
+        # Q6 Part D — a question that failed strict-substring verification is
+        # KEPT (never silently dropped) but marked needs-review so the UI can
+        # surface it. Clean questions keep the historical pass payload.
+        low_conf = bool(item.get("_q3_low_confidence"))
+        if low_conf:
+            qc_local = {
+                "pass": False,
+                "score": 0.5,
+                "needs_review": True,
+                "failures": ["verify_low_confidence"],
+                "reason": item.get("_q3_verify_reason") or "",
+            }
+            qc_status_val = "flagged"
+        else:
+            qc_local = {"pass": True, "score": 1.0, "failures": []}
+            qc_status_val = "pending"
         q = Question(
             bank_id=bank_id,
             book_id=book_id,
@@ -1464,19 +1855,36 @@ def _persist_unit(
             page_start=item.get("page") or unit.page_start,
             page_end=unit.page_end,
             raw_text=raw_text,
-            qc_local={"pass": True, "score": 1.0, "failures": []},
+            qc_local=qc_local,
+            qc_status=qc_status_val,
             attempts=int(result.get("attempts") or 1),
             status="passed",
             question_number=item.get("question_number"),
             exercise_ref=item.get("exercise_ref"),
             kind=str(item.get("kind") or "exercise"),
             has_options=bool(item.get("has_options")),
-            solution_text=item.get("solution") or None,
-            has_solution=bool(item.get("has_solution")),
+            solution_text=solution_text,
+            has_solution=has_solution,
             identified_total=int(result.get("identified_total") or 0),
         )
         session.add(q)
         inserted += 1
+    if inserted and (
+        latex_agg.glyphs_wrapped
+        or latex_agg.chemistry_wrapped
+        or latex_agg.spans_normalized
+        or latex_agg.cases_fixed
+        or latex_agg.braces_repaired
+    ):
+        logger.info(
+            "latex_normalize unit=%s spans=%d glyphs=%d chem=%d cases=%d braces=%d",
+            unit.id,
+            latex_agg.spans_normalized,
+            latex_agg.glyphs_wrapped,
+            latex_agg.chemistry_wrapped,
+            latex_agg.cases_fixed,
+            latex_agg.braces_repaired,
+        )
     session.commit()
     return inserted
 
@@ -1732,6 +2140,8 @@ def _insert_only_merge(
     Skips items whose question_number already exists for this bank, so
     repeated retries don't create duplicates. Returns count inserted.
     """
+    from app.services.section_identity import resolve_section_uuid as _resolve_sec_uuid
+
     with SyncSession() as session:
         existing_qnos_for_bank = {
             _norm_qno(qn) for (qn,) in session.execute(
@@ -1742,6 +2152,8 @@ def _insert_only_merge(
             ).all() if qn
         }
 
+        section_uuid_val = _resolve_sec_uuid(session, book_id, unit.id)
+
         inserted = 0
         for item in result.get("extracted") or []:
             raw_text = (item.get("raw_text") or "").strip()
@@ -1750,10 +2162,17 @@ def _insert_only_merge(
             qno = item.get("question_number")
             if qno and _norm_qno(qno) in existing_qnos_for_bank:
                 continue  # already in DB, don't duplicate
+            # KaTeX normalization (same seam as _persist_unit).
+            raw_text, solution_text, _rep = _normalize_question_fields(
+                raw_text, item.get("solution") or None
+            )
+            # Q1 invariant: finalize flag AFTER normalize.
+            solution_text, has_solution = _finalize_solution_flag(solution_text)
             q = Question(
                 bank_id=bank_id,
                 book_id=book_id,
                 section_ref=unit.id,
+                section_uuid=section_uuid_val,
                 section_title=unit.title,
                 page_start=item.get("page") or unit.page_start,
                 page_end=unit.page_end,
@@ -1765,8 +2184,8 @@ def _insert_only_merge(
                 exercise_ref=item.get("exercise_ref"),
                 kind=str(item.get("kind") or "exercise"),
                 has_options=bool(item.get("has_options")),
-                solution_text=item.get("solution") or None,
-                has_solution=bool(item.get("has_solution")),
+                solution_text=solution_text,
+                has_solution=has_solution,
                 identified_total=int(result.get("identified_total") or 0),
             )
             session.add(q)
@@ -1787,8 +2206,14 @@ async def _run_solution_retry(
     pdf_bytes: bytes,
     system_prompt: str,
     qnos_needing_solution: list[str],
+    worked_example: bool = False,
 ) -> dict[str, Any]:
     """Re-OCR ONLY the solutions for the listed question numbers.
+
+    When ``worked_example`` is True the prompt asserts that a COMPLETE
+    printed solution is guaranteed to exist directly below each problem
+    (B3 — solution-completeness gate), demanding the full verbatim
+    transcription. The no-fabrication escape hatch is preserved either way.
 
     Returns ``{"ok": True, "items": [{question_number, solution}, ...]}``
     on success, or ``{"ok": False, "items": []}`` on failure.
@@ -1803,14 +2228,23 @@ async def _run_solution_retry(
         is_example and is_tight and unit.page_start and unit.page_start > 1
     ) else 0
     start = (unit.page_start - leading_pad) if unit.page_start is not None else None
-    padded_end = (unit.page_end + 1) if unit.page_end is not None else None
+    padded_end = _effective_slice_end(unit.page_end, unit.next_page_start)
     pdf_slice = _slice_pdf(pdf_bytes, start, padded_end)
 
     qnos_str = ", ".join(qnos_needing_solution[:50])
+    worked_addendum = (
+        "\nThis is a WORKED EXAMPLE / SOLVED PROBLEM section. The COMPLETE "
+        "solution is printed in the PDF immediately below (or beside) each "
+        "problem statement. You MUST extract the full solution VERBATIM — "
+        "every step, equation, and final answer. Do NOT skip or summarize. "
+        "If — and only if — a solution is genuinely not printed for a listed "
+        "question, OMIT it (never fabricate).\n"
+    ) if worked_example else ""
     user_prompt = (
         f"SOLUTION RECOVERY pass for section: \"{unit.title}\" (ID: {unit.id}).\n\n"
         f"On a previous pass, the following question numbers were extracted but "
-        f"their printed solution text was NOT transcribed: {qnos_str}.\n\n"
+        f"their printed solution text was NOT transcribed: {qnos_str}.\n"
+        f"{worked_addendum}\n"
         f"Re-scan the pages. For each listed question_number, locate the printed "
         f"SOLUTION / ANSWER / WORKED-OUT text that appears below, beside, or "
         f"adjacent to that question on the page. Transcribe it VERBATIM into a "
@@ -1857,24 +2291,54 @@ async def _retry_missing_solutions(
     pdf_bytes: bytes,
     system_prompt: str,
 ) -> None:
-    """Scan questions with has_solution=true and empty solution_text;
-    retry per-section to rescue the missing solution_text.
+    """Rescue questions that are missing their printed solution. Two
+    conditions are scanned, both retried per-section (max 1 retry/section):
+
+      (1) DATA-INCONSISTENCY — the model claimed has_solution=true but
+          solution_text is empty (companion to the Q1 invariant).
+      (2) SOLUTION-COMPLETENESS GATE (B2) — a worked-example / solved-problem
+          section (``_section_implies_solution``) whose question lacks any
+          solution at all. Worked examples ALWAYS print a complete solution,
+          so an empty one is an extraction miss. These sections get the
+          stronger "extract the FULL printed solution" prompt (B3).
+
+    Plain exercises / MCQ banks without printed solutions are NEVER scanned
+    under (2) — conditional guard, no fabrication.
     """
-    # 1. Find affected questions in DB
+    # 1. Find affected questions in DB.
     with SyncSession() as session:
-        affected = session.execute(
+        all_qs = session.execute(
             select(Question).where(
                 Question.book_id == book_id,
                 Question.bank_id == bank_id,
                 Question.regen_id.is_(None),
-                Question.has_solution.is_(True),
             )
         ).scalars().all()
-        # Filter: only those with empty solution_text
-        affected = [
-            q for q in affected
-            if not (q.solution_text or "").strip()
-        ]
+
+    affected: list[Question] = []
+    worked_sections: set[str] = set()
+    solution_incomplete_count = 0
+    for q in all_qs:
+        if (q.solution_text or "").strip():
+            continue  # already has a solution — nothing to do
+        is_worked = _section_implies_solution(
+            q.section_title, q.section_ref, q.kind
+        )
+        if is_worked:
+            # B2: worked example missing its guaranteed solution.
+            solution_incomplete_count += 1
+            worked_sections.add(q.section_ref)
+            affected.append(q)
+        elif q.has_solution:
+            # Data-inconsistency: flag=true but empty text (pre-Q1 rows or a
+            # stray model claim). Retry to honor the claim.
+            affected.append(q)
+
+    if solution_incomplete_count:
+        logger.info(
+            "[solution-gate] book=%s — %d worked-example question(s) missing "
+            "their printed solution (will retry)", book_id, solution_incomplete_count,
+        )
 
     if not affected:
         logger.info(
@@ -1920,6 +2384,7 @@ async def _retry_missing_solutions(
                 pdf_bytes=pdf_bytes,
                 system_prompt=system_prompt,
                 qnos_needing_solution=sorted(set(qnos)),
+                worked_example=sid in worked_sections,
             )
         except Exception as e:
             logger.warning(
@@ -1954,8 +2419,11 @@ async def _retry_missing_solutions(
                     continue  # already has solution; don't overwrite
                 sol = items_by_qno.get(_norm_qno(q.question_number))
                 if sol:
-                    q.solution_text = sol
-                    updated_here += 1
+                    sol_norm, _ = normalize_question_latex(sol)
+                    # Q1 invariant: keep solution_text + has_solution in lockstep.
+                    q.solution_text, q.has_solution = _finalize_solution_flag(sol_norm)
+                    if q.has_solution:
+                        updated_here += 1
             session.commit()
             updated_total += updated_here
             logger.info(
@@ -2060,6 +2528,7 @@ async def _run_v3(book_id: UUID, bank_id: UUID, job_id: UUID) -> dict[str, Any]:
                     message=f"Extracted {unit.title} ({done}/{total})",
                 )
 
+            sol_incomplete = 0
             if result.get("_skipped"):
                 kept = 0
                 identified = 0
@@ -2068,6 +2537,15 @@ async def _run_v3(book_id: UUID, bank_id: UUID, job_id: UUID) -> dict[str, Any]:
                 kept = len(result.get("extracted") or [])
                 identified = int(result.get("identified_total") or 0)
                 status = _classify_unit(unit.expected, kept, identified, bool(result.get("ok")))
+
+                # B2 — solution-completeness gate: count worked-example items
+                # that came back with no printed solution. The dedicated retry
+                # pass (_retry_missing_solutions) rescues these afterwards; this
+                # is the per-unit telemetry so the count is visible in stats.
+                if _section_implies_solution(unit.title, unit.id, unit.kind):
+                    for it in result.get("extracted") or []:
+                        if not (it.get("solution") or "").strip():
+                            sol_incomplete += 1
 
                 with SyncSession() as session:
                     _persist_unit(session, bank_id, book_id, unit, result)
@@ -2102,6 +2580,12 @@ async def _run_v3(book_id: UUID, bank_id: UUID, job_id: UUID) -> dict[str, Any]:
                 "status": status,
                 "attempts": result.get("attempts", 0),
                 "error": result.get("error"),
+                # B2 telemetry: worked-example items missing a printed solution.
+                "solution_incomplete": sol_incomplete,
+                # Q6 Part A telemetry — completeness gate per unit.
+                "completeness_incomplete": bool(result.get("completeness_incomplete")),
+                "completeness_gap": int(result.get("completeness_gap") or 0),
+                "completeness_retries": int(result.get("completeness_retries") or 0),
             })
 
             # Persist rolling stats so the UI can show progress mid-run. Sort by
@@ -2147,6 +2631,18 @@ async def _run_v3(book_id: UUID, bank_id: UUID, job_id: UUID) -> dict[str, Any]:
                     "total_identified": sum(s["identified"] for s in sorted_reports),
                     "total_extracted": extracted_total,
                     "missed": sum(b["missed"] for b in legacy_blocks),
+                    # B2: aggregate worked-example items missing a solution
+                    # (pre-retry). Surfaced so the gate is observable in stats.
+                    "solution_incomplete": sum(
+                        s.get("solution_incomplete") or 0 for s in sorted_reports
+                    ),
+                    # Q6 Part A: aggregate completeness-gate telemetry.
+                    "completeness_incomplete": sum(
+                        1 for s in sorted_reports if s.get("completeness_incomplete")
+                    ),
+                    "completeness_gap_total": sum(
+                        s.get("completeness_gap") or 0 for s in sorted_reports
+                    ),
                     "worker_version": "v3",
                 })
 
@@ -2271,35 +2767,43 @@ def _extract_questions_v3(book_id: str, bank_id: str, job_id: str) -> dict[str, 
     book_uuid = UUID(book_id)
     bank_uuid = UUID(bank_id)
     job_uuid = UUID(job_id)
-    # Phase 5d (CONTRACT.md §2): mark questions stage as running so
-    # /quality and watchdog (Phase 7) can detect stale runs.
-    with SyncSession() as session:
-        b = session.get(Book, book_uuid)
-        if b is not None:
-            b.questions_status = "running"
-            session.commit()
+    # NOTE: questions_status="running" is now written atomically by
+    # the orchestrator's _dispatch_questions (via CAS) BEFORE this
+    # worker fires. We no longer set it here — that was the source of
+    # the read-then-write race that produced duplicate workers when a
+    # coordinator ran between dispatch and worker pickup.
     try:
         result = asyncio.run(_run_v3(book_uuid, bank_uuid, job_uuid))
-        # Phase 5d: derive questions_status from bank outcome. The bank
+        # Derive terminal questions_status from bank outcome. The bank
         # has the authoritative per-section accounting; the book-level
-        # field just summarises it.
+        # field just summarises it. CAS-protected so a duplicate or
+        # /re-extract reset can't be clobbered by our late write.
         with SyncSession() as session:
             b = session.get(Book, book_uuid)
             bk = session.get(QuestionBank, bank_uuid)
             if b is not None:
                 if bk is None or bk.status == "failed":
-                    b.questions_status = "failed"
+                    new_status = "failed"
                 elif bk.status == "partial":
-                    b.questions_status = "partial"
+                    new_status = "partial"
                 else:  # "ready" or anything else clean
-                    b.questions_status = "done"
-                # Phase 5e: re-derive book.status now that questions stage
-                # completed. If figures still pending, status stays
-                # "extracting"; if all done, finally flips to "ready".
-                from app.services.book_status import derive_book_status
-                derived = derive_book_status(b)
-                b.status = "extracting" if derived == "queued" else derived
-                session.commit()
+                    new_status = "done"
+                from app.workers.orchestrator import cas_set_stage
+                if cas_set_stage(
+                    session, book_uuid, "questions", new_status,
+                    from_states=("running",),
+                ):
+                    session.refresh(b)
+                    from app.services.book_status import derive_book_status
+                    derived = derive_book_status(b)
+                    b.status = "extracting" if derived == "queued" else derived
+                    session.commit()
+                else:
+                    logger.info(
+                        "extract_questions_v3: dropping terminal write — "
+                        "questions_status no longer 'running' book=%s",
+                        book_uuid,
+                    )
 
         # ORCH Day 5 — step the state machine forward. Coordinator
         # checks whether figures is also done and finalizes the book,
@@ -2324,11 +2828,16 @@ def _extract_questions_v3(book_id: str, bank_id: str, job_id: str) -> dict[str, 
             )
             _update_bank(session, bank_uuid, status="failed",
                          last_error=str(e)[:2000])
-            # Phase 5d: stage failed.
+            # CAS-protected failure write — drop if a sibling or reset
+            # already moved questions_status out of "running".
             b = session.get(Book, book_uuid)
             if b is not None:
-                b.questions_status = "failed"
-                session.commit()
+                from app.workers.orchestrator import cas_set_stage
+                if cas_set_stage(
+                    session, book_uuid, "questions", "failed",
+                    from_states=("running",),
+                ):
+                    session.commit()
         # ORCH Day 5 — fire coordinator even on failure so it can
         # decide to retry (Day 7) or finalize the book as partial/failed.
         try:

@@ -34,6 +34,10 @@ from app.services.theory_extractor import (
     extract_section_with_qc,
     re_extract_with_fix,
 )
+from app.services.theory_slice import (
+    SliceComputationError,
+    compute_extraction_slice,
+)
 from app.workers.celery_app import celery_app
 from app.workers.runner import register as register_task
 
@@ -184,10 +188,31 @@ def analyse_book_task(self, book_id: str, job_id: str) -> dict:
                 base_msg=f"Running Gemini schema ({layout_tag} PDF)",
                 progress=30,
             ):
-                schema = build_schema(
+                # SCHEMA Rebalance — request the structured result so we
+                # can handle accept-with-warnings (status="needs_review")
+                # without losing the salvaged schema.
+                build_result = build_schema(
                     pdf_bytes,
                     is_multi_column=is_multi_column,
                     pdf_title=(book.title or None),
+                    job_uuid=job_uuid,
+                    return_result=True,
+                )
+            schema = build_result.schema
+            schema_build_status = build_result.status
+            schema_warnings_payload = build_result.warnings
+            last_failed_attempt = build_result.last_failed_attempt
+            if schema is None:
+                # No salvageable schema — fall through to the except path
+                # via raise, which marks schema_status="failed" + writes
+                # book.last_failed_schema for offline diagnosis.
+                if last_failed_attempt is not None:
+                    book.last_failed_schema = last_failed_attempt
+                if schema_warnings_payload:
+                    book.schema_warnings = schema_warnings_payload
+                session.commit()
+                raise ValueError(
+                    "Schema generation produced no parseable output across all attempts"
                 )
 
             # Derive AnalyserResult: use pymupdf fast-path if available, otherwise
@@ -254,28 +279,59 @@ def analyse_book_task(self, book_id: str, job_id: str) -> dict:
                 )
 
             book.schema = schema.model_dump()
+            # SCHEMA Rebalance — surface validator warnings + preserve
+            # the last failed attempt (if any) for offline diagnosis.
+            if schema_warnings_payload:
+                book.schema_warnings = schema_warnings_payload
+            else:
+                book.schema_warnings = None
+            if last_failed_attempt is not None:
+                book.last_failed_schema = last_failed_attempt
             # Preserve the user-supplied title. Only fall back to the schema's
             # guessed title if the upload had none (or it's a bare filename stub).
             if not (book.title and book.title.strip()):
                 book.title = schema.document_title or "Untitled"
             book.subject = schema.subject or book.subject
-            # Phase 5d: schema completed successfully. Downstream stages stay
-            # "pending" until extract_book picks them up.
-            book.schema_status = "done"
-            # Phase 5e: derive book.status from per-stage fields. Legacy
-            # "schema_ready" is preserved when downstream stages haven't
-            # been triggered yet (derive_book_status returns "queued" here,
-            # but to maintain backward compatibility with the schema-review
-            # gate, we keep the old "schema_ready" literal in this slot).
-            book.status = "schema_ready"
-            session.commit()
+            session.commit()  # persist schema data first
 
+            # Atomic CAS on schema_status — only mark "done" if we still
+            # own the "running" slot. If /re-extract reset us to "pending"
+            # mid-flight, or a stale duplicate worker is racing, our write
+            # is dropped silently. Prevents the failure-tail-clobber bug
+            # where a duplicate's late failure wrote schema_status="failed"
+            # on top of a sibling's successful "done".
+            from app.workers.orchestrator import cas_set_stage
+            # SCHEMA Rebalance — needs_review is a non-blocking outcome:
+            # schema is saved + lifecycle continues, but the schema_status
+            # flag tells the UI / downstream stages that validator
+            # warnings need user attention.
+            target_status = (
+                "needs_review" if schema_build_status == "needs_review" else "done"
+            )
+            if cas_set_stage(
+                session, book_uuid, "schema", target_status, from_states=("running",),
+            ):
+                book.status = "schema_ready"
+                session.commit()
+            else:
+                logger.info(
+                    "analyse_book: schema_status no longer 'running' — "
+                    "dropping terminal write (sibling/reset won) book=%s",
+                    book_uuid,
+                )
+
+            success_message = (
+                f"Schema saved with {len(schema_warnings_payload)} validator "
+                f"warning(s) — needs_review"
+                if schema_build_status == "needs_review"
+                else "Schema ready for approval"
+            )
             _update_job(
                 session,
                 job_uuid,
                 status="succeeded",
                 progress=100,
-                message="Schema ready for approval",
+                message=success_message,
                 finished_at=datetime.utcnow(),
             )
 
@@ -315,11 +371,28 @@ def analyse_book_task(self, book_id: str, job_id: str) -> dict:
             )
             book = session.get(Book, book_uuid)
             if book is not None:
-                book.status = "failed"
-                # Phase 5d: schema-stage failure (analyse_book is the schema
-                # task — extract_book covers theory/questions/figures).
-                book.schema_status = "failed"
-                session.commit()
+                # Atomic CAS — only mark schema_status="failed" if we
+                # still own the running slot. Without this guard, a
+                # duplicate-dispatched worker's late failure could
+                # overwrite a sibling's successful "done" state — which
+                # produced the "Backend reports book.status='failed'"
+                # dead-end on Class 9th Maths. With B1 (CAS at dispatch)
+                # duplicates shouldn't happen, but this is defence in
+                # depth — also protects against /re-extract racing with
+                # an in-flight worker.
+                from app.workers.orchestrator import cas_set_stage
+                if cas_set_stage(
+                    session, book_uuid, "schema", "failed",
+                    from_states=("running",),
+                ):
+                    book.status = "failed"
+                    session.commit()
+                else:
+                    logger.info(
+                        "analyse_book: dropping failure tail — "
+                        "schema_status no longer 'running' book=%s",
+                        book_uuid,
+                    )
             return {"ok": False, "error": str(e)}
 
 
@@ -366,8 +439,8 @@ def extract_book_task(self, book_id: str, job_id: str) -> dict:
             # section start), so extracting all sections causes zero duplication — each
             # section only gets its own intro text, not its children's content.
             all_sections = flatten_sections(schema)
-            if not all_sections:
-                raise RuntimeError("No sections in schema — approve the schema before extracting")
+            if not all_sections and not (schema.excluded_sections or []):
+                raise RuntimeError("Schema has no sections AND no excluded banks — approve the schema before extracting")
 
             # Skip pure Cat A (questions-only) sections from theory extraction.
             # They're handled by the question pipeline as placeholders. Calling
@@ -400,20 +473,34 @@ def extract_book_task(self, book_id: str, job_id: str) -> dict:
                     select(Section).where(Section.book_id == book_uuid)
                 ).scalars().all()
             }
+            from uuid import UUID as _UUID
             for sec_schema in all_sections:
                 sec = existing.get(sec_schema.id)
                 if sec is None:
-                    sec = Section(
-                        book_id=book_uuid,
-                        section_id=sec_schema.id,
-                        title=sec_schema.title,
-                        level=sec_schema.level,
-                        page_start=sec_schema.page_start,
-                        page_end=sec_schema.page_end,
-                        blocks=[],
-                        status="pending",
-                        attempts=0,
-                    )
+                    # Canonical identity (CONTRACT.md §1): when the schema
+                    # carries a UUID for this section, use it as the Section
+                    # row's primary key. This makes Section.id == schema.uuid
+                    # so downstream UUID-keyed lookups (sections endpoint
+                    # ordering, embedder placement) match cleanly without
+                    # slug heuristics. Legacy schemas without uuid keep
+                    # default uuid4() — old books still work via slug.
+                    sec_kwargs = {
+                        "book_id": book_uuid,
+                        "section_id": sec_schema.id,
+                        "title": sec_schema.title,
+                        "level": sec_schema.level,
+                        "page_start": sec_schema.page_start,
+                        "page_end": sec_schema.page_end,
+                        "blocks": [],
+                        "status": "pending",
+                        "attempts": 0,
+                    }
+                    if getattr(sec_schema, "uuid", None):
+                        try:
+                            sec_kwargs["id"] = _UUID(sec_schema.uuid)
+                        except (TypeError, ValueError):
+                            pass  # malformed uuid → fall back to default uuid4()
+                    sec = Section(**sec_kwargs)
                     session.add(sec)
                 else:
                     sec.title = sec_schema.title
@@ -422,6 +509,65 @@ def extract_book_task(self, book_id: str, job_id: str) -> dict:
                     sec.page_end = sec_schema.page_end
                     sec.status = "pending"
             session.commit()
+
+            # SCHEMA Week 5 / Solution 1 — pure-Q chapter fast-path.
+            # If the schema has zero Cat B sections (theory worker has
+            # nothing to extract), skip the extraction loop + tails
+            # entirely and finalize immediately. Without this, the
+            # worker still iterates an empty list, runs linker +
+            # embedder tails (which are no-ops for pure-Q but still
+            # consume time), and may LOOK to the user like "still
+            # analysing" even though there's nothing to do.
+            if not to_extract:
+                logger.info(
+                    "extract_book: pure-Q chapter — 0 Cat B sections to extract "
+                    "(book=%s). Fast-path: skip Gemini loop + linker/embedder "
+                    "tails, finalize immediately.",
+                    book_uuid,
+                )
+                from app.workers.orchestrator import cas_set_stage
+                if cas_set_stage(
+                    session, book_uuid, "theory", "done",
+                    from_states=("running",),
+                ):
+                    session.refresh(book)
+                    book.theory_finalized_at = datetime.utcnow()
+                    from app.services.book_status import derive_book_status
+                    derived = derive_book_status(book)
+                    book.status = "extracting" if derived == "queued" else derived
+                    session.commit()
+                else:
+                    logger.info(
+                        "extract_book pure-Q fast-path: CAS lost (theory_status "
+                        "no longer 'running') — terminal write dropped book=%s",
+                        book_uuid,
+                    )
+                # Fire coordinator so Q+F dispatch can proceed even though
+                # theory found nothing.
+                try:
+                    from app.workers.runner import dispatch
+                    dispatch("coordinate_extraction", str(book_uuid))
+                except Exception as e:
+                    logger.warning(
+                        "extract_book pure-Q: coordinator dispatch failed "
+                        "(continuing): %s", e,
+                    )
+                _update_job(
+                    session, job_uuid,
+                    status="succeeded", progress=100,
+                    message=(
+                        "Pure-Q chapter — no theory sections to extract. "
+                        "Question pipeline will handle the content."
+                    ),
+                    finished_at=datetime.utcnow(),
+                )
+                return {
+                    "ok": True,
+                    "book_id": str(book_uuid),
+                    "total": 0,
+                    "failed": [],
+                    "pure_q_fast_path": True,
+                }
 
             total = len(to_extract)
             failed_section_ids: list[str] = []
@@ -448,34 +594,64 @@ def extract_book_task(self, book_id: str, job_id: str) -> dict:
             #      sections complete — same invariant as the sequential loop.
             CONCURRENCY = max(1, int(os.environ.get("THEORY_SECTION_CONCURRENCY", "8")))
 
-            # Pre-compute per-section payloads sequentially (cheap — just
-            # arithmetic + schema lookups, no Gemini calls). Captures the
-            # current iteration-order-dependent effective_page_end values
-            # so the parallel phase has all the data it needs.
+            # Unit 1 — Page-Range Engine. Pre-compute deterministic
+            # SliceSpec per section via the single source-of-truth function
+            # in theory_slice. No more scattered effective_page_end formula;
+            # no more silent fallbacks. Sections whose slice can't be
+            # resolved get persisted as status="failed" with a clear
+            # diagnostic and are skipped from the parallel phase.
+            import pymupdf as _pymupdf
+            try:
+                _doc = _pymupdf.open(stream=pdf_bytes, filetype="pdf")
+                pdf_total_pages = len(_doc)
+                _doc.close()
+            except Exception:
+                pdf_total_pages = schema.total_pages or 0
+
             section_payloads: list[dict] = []
+            slice_failures: list[tuple[str, str]] = []
             for i, sec_schema in enumerate(to_extract, start=1):
-                next_sec = to_extract[i] if i < total else None
-                next_title = next_sec.title if next_sec else None
-                is_container = len(sec_schema.subsections) > 0
-                if is_container and next_sec and next_sec.page_start is not None:
-                    effective_page_end = min(
-                        sec_schema.page_end or next_sec.page_start,
-                        next_sec.page_start,
+                try:
+                    slice_spec = compute_extraction_slice(
+                        sec_schema, schema, pdf_total_pages
                     )
-                elif (not is_container) and next_sec and next_sec.page_start is not None:
-                    effective_page_end = max(
-                        sec_schema.page_end or 0,
-                        next_sec.page_start,
+                except SliceComputationError as e:
+                    logger.warning(
+                        "Slice computation failed for section=%s book=%s: %s",
+                        sec_schema.id, book_uuid, e.reason,
                     )
-                else:
-                    effective_page_end = sec_schema.page_end
+                    slice_failures.append((sec_schema.id, e.reason))
+                    continue
+                if slice_spec.diagnostics:
+                    logger.info(
+                        "Slice diagnostics for section=%s: %s",
+                        sec_schema.id, "; ".join(slice_spec.diagnostics),
+                    )
                 section_payloads.append({
                     "sec_schema": sec_schema,
-                    "next_title": next_title,
-                    "effective_page_end": effective_page_end,
-                    "is_container": is_container,
+                    "slice_spec": slice_spec,
                     "idx": i,
                 })
+
+            # Persist slice failures up-front so the user sees a clear
+            # status='failed' with a diagnostic rather than a stuck section.
+            if slice_failures:
+                with SyncSession() as _fail_session:
+                    for sid, reason in slice_failures:
+                        _sec = _fail_session.execute(
+                            select(Section).where(
+                                Section.book_id == book_uuid,
+                                Section.section_id == sid,
+                            )
+                        ).scalar_one_or_none()
+                        if _sec is not None:
+                            _sec.status = "failed"
+                            _sec.qc_local = {
+                                "pass": False,
+                                "failures": [f"slice_unresolvable: {reason}"],
+                            }
+                            _sec.attempts = (_sec.attempts or 0) + 1
+                    _fail_session.commit()
 
             # Shared mutable counter for monotonic progress reporting. Each
             # task increments under the lock and writes the new progress
@@ -488,17 +664,15 @@ def extract_book_task(self, book_id: str, job_id: str) -> dict:
                 persist the result. Returns (section_id, outcome) where
                 outcome is one of: ok / failed / skipped / crashed."""
                 sec_schema = payload["sec_schema"]
-                is_container = payload["is_container"]
+                slice_spec = payload["slice_spec"]
+                is_container = slice_spec.is_container
                 try:
                     result: ExtractionResult = await extract_section_with_qc(
                         section_id=sec_schema.id,
                         title=sec_schema.title,
                         level=sec_schema.level,
                         pdf_bytes=pdf_bytes,
-                        page_start=sec_schema.page_start,
-                        page_end=payload["effective_page_end"],
-                        next_title=payload["next_title"],
-                        is_container=payload["is_container"],
+                        slice_spec=slice_spec,
                     )
                 except Exception as e:
                     logger.exception(
@@ -645,6 +819,21 @@ def extract_book_task(self, book_id: str, job_id: str) -> dict:
             # here. Both deferred to the post-tail finalization block
             # below (after example_linker + figure_embedder).
 
+            # Theory Worker Unit 5 — parent/child block dedup. Strips
+            # any parent block whose content also appears in a descendant
+            # (direct child, grandchild, etc.). Replaces the 4 layered
+            # patches (`is_container` flag + PARENT vs LEAF prompt rule +
+            # container empty force-pass + tautological paranoid check)
+            # with one deterministic post-extraction pass. Runs BEFORE the
+            # linker so chips aren't inserted into blocks that are about
+            # to be stripped. Failure-safe: on exception, original blocks
+            # survive (no destructive write without successful completion).
+            try:
+                from app.services.theory_dedup import dedup_theory_blocks
+                dedup_theory_blocks(session, book_uuid, schema)
+            except Exception as e:
+                logger.warning("theory_dedup failed (book=%s): %s", book_uuid, e)
+
             # Inject example/exercise placeholder chips into parent theory
             # sections. Idempotent post-processing — does not modify
             # transcribed theory blocks beyond inserting `question_ref`
@@ -674,12 +863,34 @@ def extract_book_task(self, book_id: str, job_id: str) -> dict:
             # example_linker + figure_embedder have flushed; it's now
             # safe to mark theory truly done. theory_finalized_at is the
             # coordinator's gate field for dispatching questions+figures.
-            book.theory_status = _derived_theory_status
-            book.theory_finalized_at = datetime.utcnow()
-            from app.services.book_status import derive_book_status
-            derived = derive_book_status(book)
-            book.status = "extracting" if derived == "queued" else derived
-            session.commit()
+            #
+            # Atomic CAS — only commit the terminal status if we still
+            # own the "running" slot. Drops cleanly if /re-extract reset
+            # us or a duplicate worker is racing.
+            from app.workers.orchestrator import cas_set_stage
+            if cas_set_stage(
+                session, book_uuid, "theory", _derived_theory_status,
+                from_states=("running",),
+            ):
+                # Refresh in-memory book then write finalized_at + derive
+                # book.status. We won the race; do all the bookkeeping.
+                session.refresh(book)
+                book.theory_finalized_at = datetime.utcnow()
+                from app.services.book_status import derive_book_status
+                derived = derive_book_status(book)
+                book.status = "extracting" if derived == "queued" else derived
+                session.commit()
+            else:
+                logger.info(
+                    "extract_book: dropping theory terminal write — "
+                    "theory_status no longer 'running' book=%s",
+                    book_uuid,
+                )
+                # Still skip-fire the coordinator below — if we lost the
+                # race, the winning sibling/reset already triggered the
+                # next coordinator pass. Returning here would leave the
+                # job in a half-finished state for the caller, so fall
+                # through to the job-update + return block below.
 
             # Step the state machine forward — coordinator typically
             # dispatches extract_questions_v3 + extract_figures_v2 in
@@ -730,11 +941,20 @@ def extract_book_task(self, book_id: str, job_id: str) -> dict:
             )
             book = session.get(Book, book_uuid)
             if book is not None:
-                book.status = "failed"
-                # Phase 5d: extract_book failure = theory stage failure
-                # (questions/figures have their own tasks + status writes).
-                book.theory_status = "failed"
-                session.commit()
+                # Atomic CAS — same protection as analyse failure tail.
+                from app.workers.orchestrator import cas_set_stage
+                if cas_set_stage(
+                    session, book_uuid, "theory", "failed",
+                    from_states=("running",),
+                ):
+                    book.status = "failed"
+                    session.commit()
+                else:
+                    logger.info(
+                        "extract_book: dropping failure tail — "
+                        "theory_status no longer 'running' book=%s",
+                        book_uuid,
+                    )
             return {"ok": False, "error": str(e)}
 
 
@@ -775,39 +995,75 @@ def re_extract_section_task(self, section_id: str, job_id: str) -> dict:
             pdf_bytes = download_pdf(book.pdf_url)
 
             # Look up next section title AND page_start from schema for
-            # boundary-aware extraction. For leaf sections, extend page_end
-            # to next sibling's page_start so prose continuing onto the page
-            # where the next section starts is captured (next_title acts as
-            # the STOP anchor in the prompt). Mirrors the logic in
-            # extract_book_task.
-            next_title: str | None = None
-            next_page_start: int | None = None
-            sec_is_container = False
-            if book.schema:
-                from app.services.chunk_builder import flatten_sections as _flatten
-                book_schema_obj = BookSchema(**book.schema)
-                flat = _flatten(book_schema_obj)
-                for idx, s in enumerate(flat):
-                    if s.id == sec.section_id:
-                        sec_is_container = len(s.subsections) > 0
-                        if idx + 1 < len(flat):
-                            next_title = flat[idx + 1].title
-                            next_page_start = flat[idx + 1].page_start
-                        break
+            # Unit 1 — Compute deterministic SliceSpec via the single
+            # source-of-truth function. Locates this section in the schema
+            # and resolves page_start, page_end, and STOP anchor (title+page)
+            # with no silent fallbacks. Failures surface as status='failed'
+            # with a clear diagnostic instead of silently extracting
+            # wrong content.
+            if not book.schema:
+                raise RuntimeError("book.schema missing — cannot re-extract")
+            book_schema_obj = BookSchema(**book.schema)
 
-            # Same effective_page_end logic as extract_book_task.
-            if sec_is_container and next_page_start is not None:
-                effective_page_end = min(
-                    sec.page_end or next_page_start,
-                    next_page_start,
+            # Find the section in the schema (walks both sections + their
+            # children — re-extract may target any depth).
+            def _find_section_in_schema(parent, target_id):
+                if parent.id == target_id:
+                    return parent
+                for child in parent.subsections or []:
+                    found = _find_section_in_schema(child, target_id)
+                    if found is not None:
+                        return found
+                return None
+
+            target_sec = None
+            for top in book_schema_obj.sections or []:
+                target_sec = _find_section_in_schema(top, sec.section_id)
+                if target_sec is not None:
+                    break
+            if target_sec is None:
+                raise RuntimeError(
+                    f"section_id={sec.section_id} not found in book.schema"
                 )
-            elif (not sec_is_container) and next_page_start is not None:
-                effective_page_end = max(
-                    sec.page_end or 0,
-                    next_page_start,
+
+            # Compute pdf_total_pages from the actual PDF.
+            import pymupdf as _pymupdf
+            try:
+                _doc = _pymupdf.open(stream=pdf_bytes, filetype="pdf")
+                pdf_total_pages = len(_doc)
+                _doc.close()
+            except Exception:
+                pdf_total_pages = book_schema_obj.total_pages or 0
+
+            try:
+                slice_spec = compute_extraction_slice(
+                    target_sec, book_schema_obj, pdf_total_pages
                 )
-            else:
-                effective_page_end = sec.page_end
+            except SliceComputationError as e:
+                logger.warning(
+                    "Re-extract slice failed for section=%s: %s",
+                    sec.section_id, e.reason,
+                )
+                sec.status = "failed"
+                sec.qc_local = {
+                    "pass": False,
+                    "failures": [f"slice_unresolvable: {e.reason}"],
+                }
+                sec.attempts = (sec.attempts or 0) + 1
+                session.commit()
+                _update_job(
+                    session, job_uuid,
+                    status="failed",
+                    error=f"slice_unresolvable: {e.reason}",
+                    finished_at=datetime.utcnow(),
+                )
+                return {"ok": False, "section_id": sec.section_id, "error": e.reason}
+
+            if slice_spec.diagnostics:
+                logger.info(
+                    "Re-extract slice diagnostics section=%s: %s",
+                    sec.section_id, "; ".join(slice_spec.diagnostics),
+                )
 
             result: ExtractionResult = asyncio.run(
                 re_extract_with_fix(
@@ -815,10 +1071,7 @@ def re_extract_section_task(self, section_id: str, job_id: str) -> dict:
                     title=sec.title,
                     level=sec.level or 1,
                     pdf_bytes=pdf_bytes,
-                    page_start=sec.page_start,
-                    page_end=effective_page_end,
-                    next_title=next_title,
-                    is_container=sec_is_container,
+                    slice_spec=slice_spec,
                 )
             )
 
@@ -1396,11 +1649,55 @@ def extract_figures_task(self, book_id: str, job_id: str) -> dict:
                     logger.warning("Figure extraction failed for section %s: %s", sec.section_id, exc)
                     continue
 
+                # Pre-load all theory sections once for the resolver (anchor
+                # post-pass below). Cheap — same session, same book.
+                _all_theory_sections = session.execute(
+                    select(Section).where(Section.book_id == book_uuid)
+                ).scalars().all()
+                from app.services.figure_section_resolver import (
+                    resolve_section_by_anchor,
+                )
+
                 for fig_data in figures:
                     img_bytes = fig_data.pop("image_bytes", None)
+
+                    # Anchor-text-driven section resolution (post-Gemini,
+                    # code-only). Overrides Gemini's visual-proximity guess
+                    # when the figure's caption/description appears uniquely
+                    # in a different section's blocks. Same logic as v2
+                    # figures_tasks; applied here for the legacy v1 worker.
+                    # Captions in v1 path are the natural anchor signal.
+                    anchor_text = fig_data.get("caption") or fig_data.get("description") or ""
+                    gemini_section_ref = fig_data.get("section_id") or sec.section_id
+                    gemini_section_uuid = sec.id
+                    if anchor_text and not fig_data.get("figure_number"):
+                        resolved = resolve_section_by_anchor(
+                            anchor_text=anchor_text,
+                            page_number=fig_data.get("page_number"),
+                            fallback_section_ref=gemini_section_ref,
+                            fallback_section_uuid=gemini_section_uuid,
+                            theory_sections=list(_all_theory_sections),
+                        )
+                        if (
+                            resolved.resolved_section_ref
+                            and resolved.resolved_section_ref != gemini_section_ref
+                        ):
+                            logger.info(
+                                "figure_section_resolver (v1): book=%s anchor=%r "
+                                "%r → %r (reason=%s)",
+                                book_uuid,
+                                anchor_text[:60],
+                                gemini_section_ref,
+                                resolved.resolved_section_ref,
+                                resolved.reason,
+                            )
+                            gemini_section_ref = resolved.resolved_section_ref
+                            gemini_section_uuid = resolved.resolved_section_uuid
+
                     figure = Figure(
                         book_id=book_uuid,
-                        section_id=fig_data["section_id"],
+                        section_id=gemini_section_ref,
+                        section_uuid=gemini_section_uuid,
                         figure_number=fig_data.get("figure_number"),
                         caption=fig_data.get("caption"),
                         description=fig_data.get("description"),

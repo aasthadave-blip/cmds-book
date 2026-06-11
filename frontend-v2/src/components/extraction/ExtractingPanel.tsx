@@ -146,15 +146,28 @@ export function ExtractingPanel({ bookId, bookTitle, onComplete }: Props) {
           <div
             style={{
               marginTop: 14,
-              padding: '10px 14px',
+              padding: '12px 16px',
               background: 'var(--red-50)',
               border: '1px solid var(--red-100)',
               borderRadius: 10,
               color: 'var(--red-700)',
               fontSize: 13,
+              display: 'flex',
+              alignItems: 'center',
+              justifyContent: 'space-between',
+              gap: 12,
             }}
           >
-            {state.errorMessage}
+            <span style={{ flex: 1, minWidth: 0 }}>{state.errorMessage}</span>
+            {state.phase === 'error' && (
+              <button
+                className="btn btn-primary btn-sm"
+                onClick={() => void pipeline.retryStage('schema')}
+                title="Re-run analyse to rebuild the schema from scratch"
+              >
+                <Icon name="regen" size={12} /> Retry schema
+              </button>
+            )}
           </div>
         )}
       </div>

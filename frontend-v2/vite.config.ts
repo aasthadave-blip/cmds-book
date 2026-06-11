@@ -21,6 +21,15 @@ export default defineConfig(({ mode }) => {
 
   return {
     plugins: [react()],
+    // Force a SINGLE katex instance across the app and rehype-katex.
+    // Without this, `import 'katex/contrib/mhchem'` registers \ce on the
+    // app's hoisted katex while rehype-katex renders with its own nested
+    // copy — so chemistry (\ce{...}) never resolves at render time and
+    // falls back to raw "\ceKCl". Deduping collapses them to one instance
+    // so the mhchem side-effect import reaches the renderer.
+    resolve: {
+      dedupe: ['katex'],
+    },
     server: {
       port: 5175,
       strictPort: true,

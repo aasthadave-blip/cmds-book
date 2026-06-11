@@ -428,6 +428,9 @@ def _persist_regen_items(
         .all()
     )
 
+    from app.services.question_latex_normalizer import normalize_question_latex
+    from app.workers.questions_v3 import _finalize_solution_flag
+
     inserted = 0
     for it in items:
         text = (it.get("question") or "").strip()
@@ -437,7 +440,17 @@ def _persist_regen_items(
         # Structure-mirroring (prompt Rule 8) — see comments above
         solution = (it.get("solution") or "").strip() or None
         solution_text = solution or answer
-        has_solution = bool(solution_text) and bool(source.has_solution)
+        # Q5: regenerated text is fresh Gemini output — normalize LaTeX/
+        # chemistry so the variant renders the same as extracted questions.
+        # Without this, regenerated questions show raw $...$ / Unicode.
+        text, _ = normalize_question_latex(text)
+        if solution_text:
+            solution_text, _ = normalize_question_latex(solution_text)
+        # A variant only carries a solution if the SOURCE question did.
+        if not source.has_solution:
+            solution_text = None
+        # Q1 invariant: solution_text + has_solution finalized in lockstep.
+        solution_text, has_solution = _finalize_solution_flag(solution_text)
         model_says_options = bool(it.get("options"))
         has_options = model_says_options and bool(source.has_options)
         q_type = (it.get("question_type") or source.question_type or "").strip() or None
@@ -459,6 +472,7 @@ def _persist_regen_items(
             regen_id=regen.id,
             source_question_id=source.id,
             section_ref=source.section_ref,
+            section_uuid=source.section_uuid,
             section_title=source.section_title,
             page_start=source.page_start,
             page_end=source.page_end,
@@ -472,7 +486,7 @@ def _persist_regen_items(
             kind=kind,
             question_type=q_type,
             has_options=has_options,
-            solution_text=solution_text if has_solution else None,
+            solution_text=solution_text,
             has_solution=has_solution,
             identified_total=None,
             qc_status="pending",
@@ -491,6 +505,7 @@ def _persist_regen_items(
                 book_id=sref.book_id,
                 figure_id=sref.figure_id,
                 section_ref=sref.section_ref,
+                section_uuid=sref.section_uuid,
                 context="question",
                 question_id=row.id,
                 placeholder_text=sref.placeholder_text,

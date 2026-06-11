@@ -29,6 +29,7 @@ from app.models.question import Question
 from app.models.question_bank import QuestionBank
 from app.schemas.analyser import BookSchema
 from app.services.chunk_builder import flatten_sections
+from app.services.section_identity import build_section_uuid_map
 from app.services.prompt_loader import load_raw
 from app.utils.json_parse import parse_json
 from app.workers.celery_app import celery_app
@@ -248,6 +249,9 @@ def extract_questions_task(self, book_id: str, job_id: str) -> dict:
             total = len(sections)
             total_questions = 0
 
+            # Map slug -> Section UUID once for this book (CONTRACT.md §1)
+            section_uuid_map = build_section_uuid_map(session, book_uuid)
+
             for i, sec_schema in enumerate(sections, start=1):
                 progress = 10 + int(85 * (i - 1) / max(total, 1))
                 _update_job(
@@ -318,6 +322,7 @@ def extract_questions_task(self, book_id: str, job_id: str) -> dict:
                         bank_id=bank.id,
                         book_id=book_uuid,
                         section_ref=sec_schema.id,
+                        section_uuid=section_uuid_map.get(sec_schema.id),
                         section_title=sec_schema.title,
                         page_start=page_num if page_num is not None else sec_schema.page_start,
                         page_end=page_num if page_num is not None else effective_page_end,

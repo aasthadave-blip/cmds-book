@@ -130,6 +130,25 @@ def _select_variant(fig: Figure) -> str:
     return "original"
 
 
+def _question_body_target(fig: Figure, q: Any) -> tuple[str, int]:
+    """F1/F2 — route a question figure into raw_text vs solution_text.
+
+    Returns (context, char_offset) for building a FigureReference:
+      body_type == "solution" → ("solution", len(q.solution_text))
+                                 (figure sits inside the worked solution)
+      else (body_type == "question" or None / legacy)
+                              → ("question", len(q.raw_text))
+                                 (figure sits inside the question stem)
+
+    The position is the END of the body — the renderer / composer treats
+    figure_references as appended placeholders at that offset.
+    """
+    body_type = getattr(fig, "body_type", None)
+    if body_type == "solution":
+        return ("solution", len(q.solution_text or ""))
+    return ("question", len(q.raw_text or ""))
+
+
 def _find_inline_block_index(
     blocks: list[Any],
     normalized_label: str,
@@ -409,14 +428,14 @@ def _compute_figure_placements(
                 if want:
                     for q in questions:
                         if _norm_qno(q.question_number) == want:
-                            char_end = len((q.raw_text or ""))
+                            q_ctx, q_off = _question_body_target(fig, q)
                             new_refs.append(FigureReference(
                                 figure_id=fig.id, book_id=book_id,
                                 section_ref=(q.section_ref or target_sid),
-                                context="question", question_id=q.id,
+                                context=q_ctx, question_id=q.id,
                                 placeholder_text=None, link_method="auto",
                                 placement_kind="inline", placement_block_idx=None,
-                                placement_char_offset=char_end,
+                                placement_char_offset=q_off,
                             ))
                             counters["question_inline"] += 1
                             placed = True
@@ -443,15 +462,15 @@ def _compute_figure_placements(
                         # Match patterns like "...-example-9.11", "...-9.11"
                         if (sref.endswith(f"-{want}")
                                 or sref.endswith(f"-example-{want}")):
-                            char_end = len((q.raw_text or ""))
+                            q_ctx, q_off = _question_body_target(fig, q)
                             new_refs.append(FigureReference(
                                 figure_id=fig.id, book_id=book_id,
                                 section_ref=(q.section_ref or target_sid),
-                                context="question", question_id=q.id,
+                                context=q_ctx, question_id=q.id,
                                 placeholder_text=None, link_method="auto",
                                 placement_kind="inline",
                                 placement_block_idx=None,
-                                placement_char_offset=char_end,
+                                placement_char_offset=q_off,
                             ))
                             counters["question_inline"] += 1
                             placed = True
@@ -487,14 +506,14 @@ def _compute_figure_placements(
                             r"\s+", " ", q.raw_text.strip().lower()
                         )
                         if _anchor_norm_q in q_norm:
-                            char_end = len(q.raw_text or "")
+                            q_ctx, q_off = _question_body_target(fig, q)
                             new_refs.append(FigureReference(
                                 figure_id=fig.id, book_id=book_id,
                                 section_ref=(q.section_ref or target_sid),
-                                context="question", question_id=q.id,
+                                context=q_ctx, question_id=q.id,
                                 placeholder_text=None, link_method="auto",
                                 placement_kind="inline", placement_block_idx=None,
-                                placement_char_offset=char_end,
+                                placement_char_offset=q_off,
                             ))
                             counters["question_inline"] += 1
                             placed = True
@@ -855,22 +874,44 @@ def _compute_figure_placements(
             continue
 
         # target_kind == "question"
-        # Label-first global match in question text (raw_text + solution_text)
+        # Label-first global match in question text. F1: route by
+        # body_type — solution figs search solution_text only (and land
+        # with context="solution"), all others search raw_text first
+        # then fall back to combined (legacy behaviour).
         if label_norm and label_pattern is not None:
+            body_type = getattr(fig, "body_type", None)
             global_hit = None
             for q in questions:
-                combined = (q.raw_text or "") + "\n" + (getattr(q, "solution_text", "") or "")
-                offset = _find_inline_char_offset(combined, label_pattern)
-                if offset is not None:
-                    global_hit = (q, offset)
-                    break
+                if body_type == "solution":
+                    # F1 — solution figure: only match in solution_text
+                    sol = getattr(q, "solution_text", "") or ""
+                    offset = _find_inline_char_offset(sol, label_pattern)
+                    if offset is not None:
+                        global_hit = (q, offset, "solution")
+                        break
+                else:
+                    # body_type == "question" OR legacy (None) — search
+                    # raw_text first, then combined for backward compat.
+                    raw = q.raw_text or ""
+                    offset = _find_inline_char_offset(raw, label_pattern)
+                    if offset is not None:
+                        global_hit = (q, offset, "question")
+                        break
+                    if body_type is None:
+                        combined = raw + "\n" + (
+                            getattr(q, "solution_text", "") or ""
+                        )
+                        offset = _find_inline_char_offset(combined, label_pattern)
+                        if offset is not None:
+                            global_hit = (q, offset, "question")
+                            break
             if global_hit is not None:
-                q, offset = global_hit
+                q, offset, ctx_out = global_hit
                 resolved_sec = q.section_ref or section_id
                 new_refs.append(FigureReference(
                     figure_id=fig.id, book_id=book_id,
                     section_ref=resolved_sec,
-                    context="question", question_id=q.id,
+                    context=ctx_out, question_id=q.id,
                     placeholder_text=fig.figure_number, link_method="auto",
                     placement_kind="inline", placement_block_idx=None,
                     placement_char_offset=offset,

@@ -3,6 +3,7 @@
 
 import { useState } from 'react';
 import { Icon } from '../Icon';
+import { MathMarkdown } from '../MathMarkdown';
 import { API_BASE } from '../../api/client';
 import { stripFigPlaceholders } from '../../lib/questionText';
 import { restoreAllRejected } from '../../api/questions';
@@ -281,10 +282,12 @@ function QuestionCard({ q }: { q: ExtractedQuestion }) {
           fontSize: 14.5,
           lineHeight: 1.65,
           color: 'var(--ink-900)',
-          whiteSpace: 'pre-wrap',
         }}
       >
-        {stripFigPlaceholders(q.raw_text || '')}
+        {/* Q5: render question body through MathMarkdown → KaTeX + mhchem.
+            $...$ math, \ce{} chemistry, $$...$$ display all render properly.
+            stripFigPlaceholders removes {{fig:...}} markers first. */}
+        <MathMarkdown>{stripFigPlaceholders(q.raw_text || '')}</MathMarkdown>
       </div>
       {/* Embedded figures — render at the BOTTOM of the question text
           (closest the UI can get without doing char-offset splicing).
@@ -359,7 +362,7 @@ function QuestionCard({ q }: { q: ExtractedQuestion }) {
                     lineHeight: 1.5,
                   }}
                 >
-                  {ef.caption}
+                  <MathMarkdown inline>{ef.caption}</MathMarkdown>
                 </div>
               )}
             </div>
@@ -399,11 +402,10 @@ function QuestionCard({ q }: { q: ExtractedQuestion }) {
               fontSize: 13.5,
               lineHeight: 1.65,
               color: 'var(--ink-800)',
-              whiteSpace: 'pre-wrap',
-              fontFamily: 'var(--font-mono)',
             }}
           >
-            {q.solution_text}
+            {/* Q5: solution text through MathMarkdown → KaTeX + mhchem */}
+            <MathMarkdown>{stripFigPlaceholders(q.solution_text || '')}</MathMarkdown>
           </div>
         </details>
       )}
