@@ -481,15 +481,14 @@ export interface RegenerateQuestionsParams {
   label?: string | null;
   // R4 — v3 regen params. All optional with worker-side defaults.
   similarity_level?:
-    | "numbers_only"
     | "numbers_and_rephrase"
+    | "numbers_rephrase_add_concept"
     | "new_question_same_topic"
     | "same_topic_add_one_concept"
     | "same_chapter_any_topic"
     | null;
-  count?: number | null;
   question_type?: string | null;
-  priority_mode?: "override" | "layer_on_top" | "specific_aspects" | null;
+  priority_mode?: "override" | null;
 }
 
 // R10 — section-level retry params

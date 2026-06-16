@@ -60,61 +60,41 @@ SyncSession = sessionmaker(bind=_sync_engine, class_=Session, autoflush=False)
 
 # Defaults for R2 — R4/R5 make these configurable per regen run via API/UI.
 DEFAULT_SIMILARITY = "numbers_and_rephrase"
-DEFAULT_COUNT = 3
+DEFAULT_COUNT = 1
 DEFAULT_QUESTION_TYPE = "same_as_source"
 DEFAULT_PRIORITY_MODE = "override"
 
-# Valid priority modes (R3).
-_VALID_PRIORITY_MODES = {"override", "layer_on_top", "specific_aspects"}
+# Priority mode is locked to override only.
+_VALID_PRIORITY_MODES = {"override"}
+
+# Valid similarity levels.
+_VALID_SIMILARITY_LEVELS = {
+    "numbers_and_rephrase",
+    "numbers_rephrase_add_concept",
+    "new_question_same_topic",
+    "same_topic_add_one_concept",
+    "same_chapter_any_topic",
+}
 
 
 def _priority_mode_block(mode: str, custom_instructions: str) -> str:
     """Build the framing block that tells Gemini HOW to apply custom
-    instructions, per the user-selected priority mode.
+    instructions. Mode is always override; parameter kept for compatibility.
 
-    Returns "" if custom_instructions is empty/None — mode is irrelevant
-    without instructions to apply.
+    Returns "" if custom_instructions is empty/None.
     """
     txt = (custom_instructions or "").strip()
     if not txt:
         return ""
-    mode = (mode or "").strip().lower()
-    if mode not in _VALID_PRIORITY_MODES:
-        mode = DEFAULT_PRIORITY_MODE
-
-    if mode == "override":
-        header = (
-            "PRIORITY MODE: OVERRIDE\n"
-            "The custom_instructions below COMPLETELY REPLACE the default "
-            "similarity-level behavior. Follow them above all other rules "
-            "EXCEPT factual correctness (which always wins). The similarity "
-            "level still selects which aspects are conceptually LOCKED, but "
-            "every other generation choice (tone, structure, language, "
-            "style, pattern) is dictated by these instructions."
-        )
-    elif mode == "layer_on_top":
-        header = (
-            "PRIORITY MODE: LAYER_ON_TOP\n"
-            "Apply the default similarity-level behavior FIRST (following "
-            "the LOCKED / CHANGES rules for the selected similarity level). "
-            "THEN, on top of the resulting question, apply the "
-            "custom_instructions below as ADDITIONAL constraints. Both must "
-            "be honoured. If the custom_instructions conflict with the "
-            "similarity-level locks, the similarity locks win (e.g. "
-            "similarity 'numbers_only' still requires sentence structure "
-            "to remain unchanged)."
-        )
-    else:  # specific_aspects
-        header = (
-            "PRIORITY MODE: SPECIFIC_ASPECTS\n"
-            "The custom_instructions below modify ONLY the aspects the user "
-            "has listed in the instructions text. Preserve all other aspects "
-            "of the source question. If the user did NOT enumerate which "
-            "aspects to modify, default to changing ONLY wording and "
-            "scenario; preserve numbers, concept, sentence-level structure, "
-            "and question_type. Do NOT introduce changes beyond the listed "
-            "aspects."
-        )
+    header = (
+        "PRIORITY MODE: OVERRIDE\n"
+        "The custom_instructions below COMPLETELY REPLACE the default "
+        "similarity-level behavior. Follow them above all other rules "
+        "EXCEPT factual correctness (which always wins). The similarity "
+        "level still selects which aspects are conceptually LOCKED, but "
+        "every other generation choice (tone, structure, language, "
+        "style, pattern) is dictated by these instructions."
+    )
     return header + "\n\nCustom instructions:\n" + txt
 
 GEMINI_MODEL = "gemini-2.5-flash"
@@ -230,7 +210,6 @@ def _build_user_prompt(
 
     parts.extend([
         f"similarity_level    : {similarity_level}",
-        f"count               : {count}",
         f"question_type       : {question_type}",
         f"subject             : {_maybe(subject)}",
         f"chapter             : {_maybe(chapter)}",
@@ -434,10 +413,15 @@ def _persist_regen_items(
         if not text:
             continue
         answer = (it.get("answer") or "").strip() or None
-        # Structure-mirroring (prompt Rule 8) — see comments above
+        # Structure-mirroring (prompt Rule 8) — see comments above.
+        # SOLUTION is the deliberate exception: the prompt ALWAYS generates a
+        # full worked solution for regenerated questions (Category A), even
+        # when the source had no printed solution (e.g. exercise questions).
+        # So we keep whatever solution the model produced and no longer gate
+        # on source.has_solution. The ANSWER field still mirrors the source.
         solution = (it.get("solution") or "").strip() or None
         solution_text = solution or answer
-        has_solution = bool(solution_text) and bool(source.has_solution)
+        has_solution = bool(solution_text)
         model_says_options = bool(it.get("options"))
         has_options = model_says_options and bool(source.has_options)
         q_type = (it.get("question_type") or source.question_type or "").strip() or None
@@ -526,21 +510,14 @@ async def _run_regen_v3(regen_id: UUID, job_id: UUID) -> dict[str, Any]:
             (getattr(regen, "similarity_level", None) or "").strip()
             or DEFAULT_SIMILARITY
         )
-        count_raw = getattr(regen, "count", None)
-        try:
-            count = int(count_raw) if count_raw else DEFAULT_COUNT
-        except (TypeError, ValueError):
-            count = DEFAULT_COUNT
+        if similarity_level == "numbers_only" or similarity_level not in _VALID_SIMILARITY_LEVELS:
+            similarity_level = DEFAULT_SIMILARITY
+        count = DEFAULT_COUNT  # always 1, locked
         question_type = (
             (getattr(regen, "question_type", None) or "").strip()
             or DEFAULT_QUESTION_TYPE
         )
-        priority_mode = (
-            (getattr(regen, "priority_mode", None) or "").strip().lower()
-            or DEFAULT_PRIORITY_MODE
-        )
-        if priority_mode not in _VALID_PRIORITY_MODES:
-            priority_mode = DEFAULT_PRIORITY_MODE
+        priority_mode = DEFAULT_PRIORITY_MODE  # always override
         custom_instructions = (regen.custom_instructions or "").strip() or None
 
         # Snapshot for downstream use.
@@ -842,21 +819,14 @@ async def _run_regen_one_section_v3(
             (getattr(regen, "similarity_level", None) or "").strip()
             or DEFAULT_SIMILARITY
         )
-        count_raw = getattr(regen, "count", None)
-        try:
-            count = int(count_raw) if count_raw else DEFAULT_COUNT
-        except (TypeError, ValueError):
-            count = DEFAULT_COUNT
+        if similarity_level == "numbers_only" or similarity_level not in _VALID_SIMILARITY_LEVELS:
+            similarity_level = DEFAULT_SIMILARITY
+        count = DEFAULT_COUNT  # always 1, locked
         question_type = (
             (getattr(regen, "question_type", None) or "").strip()
             or DEFAULT_QUESTION_TYPE
         )
-        priority_mode = (
-            (getattr(regen, "priority_mode", None) or "").strip().lower()
-            or DEFAULT_PRIORITY_MODE
-        )
-        if priority_mode not in _VALID_PRIORITY_MODES:
-            priority_mode = DEFAULT_PRIORITY_MODE
+        priority_mode = DEFAULT_PRIORITY_MODE  # always override
         # Section-level instructions OVERRIDE the regen's persisted custom
         # instructions for this single retry. The regen record stays clean.
         if section_custom_instructions and section_custom_instructions.strip():

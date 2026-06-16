@@ -21,7 +21,7 @@ import re
 import shutil
 import tempfile
 from pathlib import Path
-from typing import Any
+from typing import Any, Literal
 from uuid import UUID
 
 from fastapi import APIRouter, Body, Depends, HTTPException, Query, Response, status
@@ -50,19 +50,15 @@ class RegenerateRequest(BaseModel):
     label: str | None = None
 
     # R4 — v3 regen params. All optional with worker-side defaults.
-    similarity_level: str | None = Field(
-        default=None,
-        pattern=(
-            "^(numbers_only|numbers_and_rephrase|new_question_same_topic"
-            "|same_topic_add_one_concept|same_chapter_any_topic)$"
-        ),
-    )
-    count: int | None = Field(default=None, ge=1, le=20)
+    similarity_level: Literal[
+        "numbers_and_rephrase",
+        "numbers_rephrase_add_concept",
+        "new_question_same_topic",
+        "same_topic_add_one_concept",
+        "same_chapter_any_topic",
+    ] | None = Field(default=None)
     question_type: str | None = Field(default=None, max_length=64)
-    priority_mode: str | None = Field(
-        default=None,
-        pattern="^(override|layer_on_top|specific_aspects)$",
-    )
+    priority_mode: Literal["override"] = "override"
 
 
 def _regen_dict(r: QuestionRegeneration, question_count: int = 0) -> dict:
@@ -156,7 +152,6 @@ async def start_regeneration(
         custom_instructions=(payload.custom_instructions or None),
         # R4 — v3 regen params (all optional; worker uses defaults if None)
         similarity_level=payload.similarity_level,
-        count=payload.count,
         question_type=payload.question_type,
         priority_mode=payload.priority_mode,
         status="pending",

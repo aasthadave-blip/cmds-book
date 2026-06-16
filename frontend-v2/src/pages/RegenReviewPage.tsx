@@ -74,7 +74,9 @@ export default function RegenReviewPage() {
   // re-run with custom instructions).
   const [questionRegen, setQuestionRegen] =
     useState<RegenQuestionsResponse | null>(null);
-  const [questionRegenLoading, setQuestionRegenLoading] = useState(false);
+  // Start true — we always fetch on mount, so we never flash the empty-state
+  // before the question-regen load completes.
+  const [questionRegenLoading, setQuestionRegenLoading] = useState(true);
   const loadQuestionRegen = useCallback(async () => {
     if (!bookId) return;
     setQuestionRegenLoading(true);
@@ -100,6 +102,14 @@ export default function RegenReviewPage() {
   }, [loadQuestionRegen]);
 
   const [topTab, setTopTab] = useState<TopTab>('theory');
+
+  // Auto-switch to Questions tab when there's no theory regen but question
+  // regen is available — avoids landing on a blank Theory tab.
+  useEffect(() => {
+    if (regenState.kind === 'empty' && !questionRegenLoading && questionRegen) {
+      setTopTab('questions');
+    }
+  }, [regenState.kind, questionRegenLoading, questionRegen]);
 
   // Refetch fresh data when the user lands on a tab. The hooks only fetch
   // once on mount otherwise — if a background regen completes after mount
@@ -155,7 +165,7 @@ export default function RegenReviewPage() {
   const [error, setError] = useState<string | null>(null);
 
   // ── Schema walk for ordering + Cat A/B ─────────────────────────
-  const { schemaOrder, catBIds, catAIds, excludedQs } = useMemo(() => {
+  const { schemaOrder, catBIds, catAIds } = useMemo(() => {
     const order: Record<string, number> = {};
     const catB = new Set<string>();
     const catA = new Set<string>();
@@ -222,39 +232,33 @@ export default function RegenReviewPage() {
         .filter((s) => catAIds.has(s.section_id))
         .sort(sortBySchema);
 
-      // ONLY add end-of-chapter excluded BANKS (CLASSROOM WING, COMPETITION
-      // WING, JEE SPECIAL WING, Unit Exercise, MCQ Bank, etc.) — NOT every
-      // theory section that happens to have an entry in the bank.
-      // Source: schema.excluded_sections (collected as excludedQs in the
-      // earlier schema walk). Match on either:
-      //   (a) the excluded title appearing as a bank section_ref, OR
-      //   (b) the excluded section_id appearing as a bank section_ref.
-      const knownIds = new Set(realCatA.map((s) => s.section_id));
-      const bankRefSet = new Set(
-        (banksDetail?.sections ?? []).map((s) => s.section_ref),
-      );
-      const syntheticExcluded: Section[] = excludedQs
-        .filter((eq) => {
-          if (knownIds.has(eq.section_id)) return false;
-          return bankRefSet.has(eq.section_id) || bankRefSet.has(eq.title);
-        })
-        .map((eq) => {
-          // Bank uses title as section_ref if id isn't keyed.
-          const refUsedInBank = bankRefSet.has(eq.section_id)
-            ? eq.section_id
-            : eq.title;
-          return {
-            id: `syn-${refUsedInBank}`,
+      // Also include ALL bank sections not already in realCatA.
+      // This ensures CLASSROOM WING, COMPETITION WING, JEE SPECIAL WING, etc.
+      // show up even when they live in schema.excluded_sections as parent
+      // containers whose sub-section_refs don't match the container title.
+      const seenRefs = new Set(realCatA.map((s) => s.section_id));
+      const sectionById = new Map(allSections.map((s) => [s.section_id, s]));
+      const extraFromBank: Section[] = [];
+      for (const bs of banksDetail?.sections ?? []) {
+        if (seenRefs.has(bs.section_ref)) continue;
+        seenRefs.add(bs.section_ref);
+        const existing = sectionById.get(bs.section_ref);
+        // Skip theory-bearing sections — they belong in the Theory tab only.
+        if (existing && catBIds.has(existing.section_id)) continue;
+        extraFromBank.push(
+          existing ?? ({
+            id: `syn-${bs.section_ref}`,
             book_id: bookId,
-            section_id: refUsedInBank,
-            title: eq.title,
+            section_id: bs.section_ref,
+            title: bs.section_title ?? bs.section_ref,
             blocks: [],
             attempts: 0,
             status: 'passed' as const,
             level: 2,
-          } as unknown as Section;
-        });
-      return [...realCatA, ...syntheticExcluded];
+          } as unknown as Section),
+        );
+      }
+      return [...realCatA, ...extraFromBank].sort(sortBySchema);
     }
     // figures
     if (!figuresData) return [];
@@ -264,7 +268,7 @@ export default function RegenReviewPage() {
         .map((s) => s.section_ref),
     );
     return allSections.filter((s) => slugs.has(s.section_id)).sort(sortBySchema);
-  }, [topTab, allSections, catBIds, catAIds, sortBySchema, figuresData]);
+  }, [topTab, allSections, catBIds, catAIds, sortBySchema, figuresData, banksDetail, bookId]);
 
   // ── Regen blocks by section (for "Regenerated" + "Compare") ──────
   const regenBlocksBySection: Record<string, Array<{ t: string; [k: string]: unknown }>> =
@@ -465,7 +469,10 @@ export default function RegenReviewPage() {
       </div>
     );
   }
-  if (regenState.kind === 'empty') {
+  // Only show the full empty-state when BOTH theory regen and question regen
+  // are absent. If only question regen was run (no theory regen), the page
+  // should still open and auto-switch to the Questions tab below.
+  if (regenState.kind === 'empty' && !questionRegenLoading && !questionRegen) {
     return (
       <div className="content fade-up">
         <div className="content-narrow" style={{ maxWidth: 720 }}>
@@ -1552,7 +1559,145 @@ function QuestionsBody({
     );
   }
 
-  // Regenerated (default) and Original tabs — single view.
+  // Regenerated tab with regen data — show original + variants stacked below
+  // each source question so the reviewer can see what changed.
+  if (subTab === 'regenerated' && regenQs) {
+    const origList = originalQs?.questions ?? [];
+    const regenList = regenQs.questions ?? [];
+    const variantsByOriginal = new Map<string, typeof regenList>();
+    for (const rq of regenList) {
+      const srcId = (rq as { source_question_id?: string }).source_question_id;
+      if (srcId) {
+        const arr = variantsByOriginal.get(srcId) ?? [];
+        arr.push(rq);
+        variantsByOriginal.set(srcId, arr);
+      }
+    }
+    return (
+      <>
+        {retryButton}
+        <div
+          style={{
+            padding: '16px 20px 56px',
+            display: 'flex',
+            flexDirection: 'column',
+            gap: 20,
+            background: 'var(--bg)',
+          }}
+        >
+          {origList.length === 0 && (
+            <div style={{ padding: 32, textAlign: 'center', color: 'var(--ink-500)', fontSize: 13 }}>
+              No original questions for this section.
+            </div>
+          )}
+          {origList.map((oq, idx) => {
+            const variants = variantsByOriginal.get(oq.id) ?? [];
+            return (
+              <div
+                key={oq.id}
+                className="card"
+                style={{ padding: '14px 18px' }}
+              >
+                {/* Original question */}
+                <div
+                  style={{
+                    fontSize: 10,
+                    fontWeight: 700,
+                    letterSpacing: '0.1em',
+                    textTransform: 'uppercase',
+                    color: 'var(--ink-500)',
+                    marginBottom: 6,
+                    display: 'flex',
+                    alignItems: 'center',
+                    gap: 8,
+                  }}
+                >
+                  <span>Q{idx + 1} · Original</span>
+                  {oq.question_number && (
+                    <span>· #{oq.question_number}</span>
+                  )}
+                  {oq.page_start && (
+                    <span>· p.{oq.page_start}</span>
+                  )}
+                  <span style={{ marginLeft: 'auto', color: 'var(--indigo-700)' }}>
+                    {variants.length} variant{variants.length === 1 ? '' : 's'}
+                  </span>
+                </div>
+                <QuestionContent question={oq} />
+
+                {/* Regen variants below */}
+                {variants.length > 0 && (
+                  <div
+                    style={{
+                      marginTop: 14,
+                      paddingTop: 12,
+                      borderTop: '1px solid var(--line)',
+                      paddingLeft: 14,
+                      borderLeft: '3px solid var(--indigo-200)',
+                      display: 'flex',
+                      flexDirection: 'column',
+                      gap: 10,
+                    }}
+                  >
+                    <div
+                      style={{
+                        fontSize: 10,
+                        fontWeight: 700,
+                        letterSpacing: '0.1em',
+                        textTransform: 'uppercase',
+                        color: 'var(--indigo-700)',
+                        marginBottom: 4,
+                      }}
+                    >
+                      ✨ Regenerated variant{variants.length > 1 ? 's' : ''}
+                    </div>
+                    {variants.map((rq, vidx) => (
+                      <div
+                        key={rq.id}
+                        style={{
+                          paddingTop: vidx === 0 ? 0 : 10,
+                          borderTop: vidx === 0 ? 'none' : '1px dashed var(--line)',
+                        }}
+                      >
+                        {variants.length > 1 && (
+                          <div
+                            style={{
+                              fontSize: 11,
+                              fontWeight: 700,
+                              color: 'var(--indigo-700)',
+                              marginBottom: 4,
+                            }}
+                          >
+                            Variant {vidx + 1}
+                          </div>
+                        )}
+                        <QuestionContent question={rq} />
+                      </div>
+                    ))}
+                  </div>
+                )}
+                {variants.length === 0 && (
+                  <div
+                    style={{
+                      marginTop: 10,
+                      fontSize: 12,
+                      color: 'var(--ink-400)',
+                      fontStyle: 'italic',
+                    }}
+                  >
+                    No regenerated variants for this question.
+                  </div>
+                )}
+              </div>
+            );
+          })}
+        </div>
+        {retryDialog}
+      </>
+    );
+  }
+
+  // Original tab or no regen yet — flat single view.
   return (
     <>
       {retryButton}

@@ -1747,17 +1747,14 @@ function RegenerateModal({
   const [customInstructions, setCustomInstructions] = useState("");
   // R9 — v3 regen params
   const [similarityLevel, setSimilarityLevel] = useState<
-    | "numbers_only"
     | "numbers_and_rephrase"
+    | "numbers_rephrase_add_concept"
     | "new_question_same_topic"
     | "same_topic_add_one_concept"
     | "same_chapter_any_topic"
   >("numbers_and_rephrase");
-  const [count, setCount] = useState<number>(3);
   const [questionType, setQuestionType] = useState<string>("same_as_source");
-  const [priorityMode, setPriorityMode] = useState<
-    "override" | "layer_on_top" | "specific_aspects"
-  >("override");
+  const priorityMode = "override";
   const start = useStartQuestionRegeneration();
 
   const allSections = detail.sections.map((s) => ({
@@ -1777,7 +1774,6 @@ function RegenerateModal({
           label: label.trim() || null,
           // R9 — v3 regen params
           similarity_level: similarityLevel,
-          count: count,
           question_type: questionType,
           priority_mode: priorityMode,
         },
@@ -1933,15 +1929,8 @@ function RegenerateModal({
           </div>
         )}
 
-        {/* R9 — v3 regen params (similarity / count / question type) */}
-        <div
-          style={{
-            display: "grid",
-            gridTemplateColumns: "1fr 1fr",
-            gap: 12,
-            marginBottom: 12,
-          }}
-        >
+        {/* R9 — v3 regen params (similarity / question type) */}
+        <div style={{ marginBottom: 12 }}>
           <label style={{ display: "block" }}>
             <span style={{ fontSize: "0.7rem", color: "var(--text2)" }}>Similarity level</span>
             <select
@@ -1960,35 +1949,12 @@ function RegenerateModal({
                 color: "var(--text1)",
               }}
             >
-              <option value="numbers_only">Numbers only</option>
               <option value="numbers_and_rephrase">Numbers + rephrase</option>
+              <option value="numbers_rephrase_add_concept">Numbers + rephrase + concept</option>
               <option value="new_question_same_topic">New Q, same topic</option>
               <option value="same_topic_add_one_concept">Same topic + 1 concept</option>
               <option value="same_chapter_any_topic">Same chapter, any topic</option>
             </select>
-          </label>
-          <label style={{ display: "block" }}>
-            <span style={{ fontSize: "0.7rem", color: "var(--text2)" }}>Variants per source (1–20)</span>
-            <input
-              type="number"
-              min={1}
-              max={20}
-              value={count}
-              onChange={(e) => {
-                const n = parseInt(e.target.value || "0", 10);
-                if (!Number.isNaN(n) && n >= 1 && n <= 20) setCount(n);
-              }}
-              style={{
-                width: "100%",
-                padding: "6px 8px",
-                fontSize: "0.78rem",
-                marginTop: 4,
-                border: "1px solid var(--border)",
-                borderRadius: 4,
-                background: "var(--bg1)",
-                color: "var(--text1)",
-              }}
-            />
           </label>
         </div>
 
@@ -2034,12 +2000,8 @@ function RegenerateModal({
             </select>
           </label>
           <label style={{ display: "block" }}>
-            <span style={{ fontSize: "0.7rem", color: "var(--text2)" }}>Priority mode (when custom instruction set)</span>
-            <select
-              value={priorityMode}
-              onChange={(e) =>
-                setPriorityMode(e.target.value as typeof priorityMode)
-              }
+            <span style={{ fontSize: "0.7rem", color: "var(--text2)" }}>Priority mode</span>
+            <div
               style={{
                 width: "100%",
                 padding: "6px 8px",
@@ -2048,13 +2010,11 @@ function RegenerateModal({
                 border: "1px solid var(--border)",
                 borderRadius: 4,
                 background: "var(--bg1)",
-                color: "var(--text1)",
+                color: "var(--text2)",
               }}
             >
-              <option value="override">Override — replace default behavior</option>
-              <option value="layer_on_top">Layer on top — default + custom</option>
-              <option value="specific_aspects">Specific aspects only</option>
-            </select>
+              Override — replace default behavior
+            </div>
           </label>
         </div>
 

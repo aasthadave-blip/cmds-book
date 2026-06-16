@@ -112,29 +112,24 @@ export const postRegenTheory = (
 //   section_refs:    string[] | null
 //   custom_instructions: string | null
 //   similarity_level: enum | null
-//   count:           int 1-20 | null
 //   question_type:   string | null  (max 64 chars)
-//   priority_mode:   'override' | 'layer_on_top' | 'specific_aspects' | null
+//   priority_mode:   'override' (locked)
 //   label:           string | null
 
 export type QuestionsSimilarity =
-  | 'numbers_only'
   | 'numbers_and_rephrase'
+  | 'numbers_rephrase_add_concept'
   | 'new_question_same_topic'
   | 'same_topic_add_one_concept'
   | 'same_chapter_any_topic';
 
-export type QuestionsPriorityMode =
-  | 'override'
-  | 'layer_on_top'
-  | 'specific_aspects';
+export type QuestionsPriorityMode = 'override';
 
 export type QuestionsRegenParams = {
   scope: 'bank' | 'sections';
   section_refs?: string[] | null;
   custom_instructions?: string | null;
   similarity_level?: QuestionsSimilarity | null;
-  count?: number | null;
   question_type?: string | null;
   priority_mode?: QuestionsPriorityMode | null;
   label?: string | null;
@@ -145,9 +140,8 @@ export const defaultQuestionsParams: QuestionsRegenParams = {
   section_refs: null,
   custom_instructions: null,
   similarity_level: 'numbers_and_rephrase',
-  count: 2,
   question_type: null,
-  priority_mode: 'layer_on_top',
+  priority_mode: 'override',
   label: null,
 };
 
