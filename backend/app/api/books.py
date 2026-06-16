@@ -296,6 +296,7 @@ async def delete_book(book_id: UUID, session: AsyncSession = Depends(get_session
 )
 async def analyse_book(
     book_id: UUID,
+    force: bool = False,
     session: AsyncSession = Depends(get_session),
 ) -> BookUploadResponse:
     book = await session.get(Book, book_id)
@@ -304,9 +305,60 @@ async def analyse_book(
     if not book.pdf_url:
         raise HTTPException(400, detail="Book has no associated PDF")
 
-    # Reset downstream stages on a fresh analyse cycle. schema_status is
-    # reset to "pending" so the orchestrator's CAS allows the dispatch
-    # (it accepts "pending" or "failed" as starting states).
+    # ─── Pipeline state invariant guard ──────────────────────────────
+    # The previous unconditional reset of ALL stages to "pending" caused
+    # the analyse #3 bug: when this endpoint fired AFTER downstream stages
+    # had completed (e.g. orchestrator retry, double-click, reconciliation
+    # poke), it wiped theory_status / questions_status / figures_status =
+    # "done" → orchestrator saw schema=pending → dispatched ANOTHER
+    # analyse → duplicate Gemini call + corrupted UI showing schema 30%
+    # while theory/questions already complete.
+    #
+    # Architectural fix: enforce monotonic-forward state. Refuse the
+    # reset when downstream is in flight or has data. Re-extraction is
+    # an EXPLICIT user action — exposed via /re-extract endpoint (full
+    # cascade) or this endpoint with ?force=true (acknowledged intent).
+    #
+    # Three cases:
+    #   1. Any stage `running` → 409. Pipeline in motion; restart would
+    #      orphan in-flight workers.
+    #   2. Downstream stage `done` and not `force=true` → 409. Caller
+    #      must opt in to destroying completed work.
+    #   3. All stages pending OR schema-only states → safe to dispatch,
+    #      no reset needed.
+    in_flight = (
+        book.schema_status == "running"
+        or book.theory_status == "running"
+        or book.questions_status == "running"
+        or book.figures_status == "running"
+    )
+    if in_flight:
+        raise HTTPException(
+            status_code=409,
+            detail=(
+                "Pipeline already in motion (a stage is running). Wait for "
+                "completion before re-analysing, or call /re-extract for a "
+                "full cascading reset."
+            ),
+        )
+
+    downstream_done = (
+        book.theory_status in ("done", "partial", "needs_review")
+        or book.questions_status in ("done", "partial")
+        or book.figures_status in ("done", "partial")
+    )
+    if downstream_done and not force:
+        raise HTTPException(
+            status_code=409,
+            detail=(
+                "Downstream stages already extracted. Re-analysing would "
+                "destroy completed work. Call /re-extract for a full cascading "
+                "reset, or POST /analyse?force=true to confirm this intent."
+            ),
+        )
+
+    # Only reset when safe — all pending, OR force=true was explicitly
+    # passed (caller acknowledged destroying downstream work).
     book.schema_status = "pending"
     book.theory_status = "pending"
     book.questions_status = "pending"
@@ -665,12 +717,12 @@ async def _retry_stage_endpoint(
         raise HTTPException(400, detail="Book has no schema — run /analyse first")
 
     current = getattr(book, f"{stage}_status", None)
-    if current != "failed":
+    if current not in ("failed", "partial"):
         raise HTTPException(
             status.HTTP_409_CONFLICT,
             detail=(
-                f"{stage}_status is {current!r}, not 'failed' — nothing "
-                f"to retry. Use /re-extract for a full reset."
+                f"{stage}_status is {current!r}, not 'failed'/'partial' — "
+                f"nothing to retry. Use /re-extract for a full reset."
             ),
         )
 
@@ -688,9 +740,10 @@ async def retry_theory(
 ) -> BookUploadResponse:
     """Retry just theory extraction, preserving questions + figures data.
 
-    409 if theory_status is not 'failed'. Resets theory_status, clears
-    theory_finalized_at, zeros theory_retries (so auto-retry budget is
-    fresh), then dispatches the coordinator.
+    409 if theory_status is not 'failed' or 'partial'. Resets theory_status,
+    clears theory_finalized_at, zeros theory_retries (so auto-retry budget is
+    fresh), then dispatches the coordinator. 'partial' is accepted so a book
+    left incomplete by a soft section failure can be re-driven to 'done'.
     """
     return await _retry_stage_endpoint(book_id, "theory", session)
 
@@ -706,10 +759,10 @@ async def retry_questions(
 ) -> BookUploadResponse:
     """Retry just questions extraction, preserving theory + figures data.
 
-    409 if questions_status is not 'failed'. Resets questions_status,
-    zeros questions_retries, dispatches coordinator. The coordinator's
-    _dispatch_questions handler creates a fresh QuestionBank row +
-    supersedes prior pending banks.
+    409 if questions_status is not 'failed' or 'partial'. Resets
+    questions_status, zeros questions_retries, dispatches coordinator. The
+    coordinator's _dispatch_questions handler creates a fresh QuestionBank row
+    + supersedes prior pending banks.
     """
     return await _retry_stage_endpoint(book_id, "questions", session)
 
@@ -725,8 +778,8 @@ async def retry_figures(
 ) -> BookUploadResponse:
     """Retry just figure extraction, preserving theory + questions data.
 
-    409 if figures_status is not 'failed'. Resets figures_status, zeros
-    figures_retries, dispatches coordinator.
+    409 if figures_status is not 'failed' or 'partial'. Resets figures_status,
+    zeros figures_retries, dispatches coordinator.
     """
     return await _retry_stage_endpoint(book_id, "figures", session)
 

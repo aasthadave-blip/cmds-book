@@ -10,53 +10,53 @@ from pydantic import BaseModel, ConfigDict, Field
 
 
 class RegenParams(BaseModel):
-    intensity: Literal["light", "moderate", "heavy"] = "moderate"
-    tone: Literal["academic", "conversational", "simplified"] = "academic"
+    # Defaulting to "heavy" as requested
+    intensity: Literal["light", "moderate", "heavy"] = "heavy"
+    # All three modes are now calibrated around the "academic" register
+    tone: Literal["academic_rigorous", "academic_pedagogical", "academic_interactive"] = "academic_pedagogical"
     equations_handling: Literal["preserve", "explain"] = "preserve"
     diagrams_handling: Literal["preserve", "describe"] = "preserve"
     analogies: Literal["none", "add_one", "add_multiple"] = "none"
     structure: Literal["identical", "reorganize"] = "identical"
-    language: str = "en"
+    # Restricted to English ("en") and Hindi ("hi")
+    language: Literal["en", "hi"] = "en"
     target_audience: str | None = None
     custom_instructions: str | None = None
-    # v3 recap rules (opt-in). Empty = no recap behavior.
-    # Only consumed when THEORY_REGEN_PROMPT_VERSION=v3.
     recap_rule_ids: list[str] = Field(default_factory=list)
 
 
 INTENSITY_MAP: dict[str, str] = {
     "light": (
-        "LIGHT — 30-40% change (floor: never less than 30% surface change). "
-        "Swap synonyms, vary sentence openings, restructure about 1 in 3 "
-        "sentences. Even at 'light', honor the Original Rephrasing Mandate's "
-        "30% minimum — no near-verbatim output."
+        "LIGHT — Minimum 30-40% surface change. Swap basic vocabulary and restructure "
+        "minor clauses while preserving core sentence flows. Must meet plagiarism-avoidance floors."
     ),
     "moderate": (
-        "MODERATE — 40-60% change. Restructure sentences, vary vocabulary significantly, "
-        "reorder clauses, and change paragraph transitions. "
-        "The output should feel noticeably different from the original while covering the same ideas."
+        "MODERATE — 40-60% structural change. Sentence paths, passive/active voice, and transition "
+        "structures are completely rewritten. Fact-retention remains absolute, but syntax is novel."
     ),
     "heavy": (
-        "HEAVY — 70-90% change. FULLY REWRITE every sentence from scratch. "
-        "No sentence should match the original wording. "
-        "Change structure, phrasing, sentence length, and paragraph organisation completely. "
-        "The content must be unrecognisable as a paraphrase while remaining factually identical."
+        "HEAVY (Default) — 70-90% change. Complete re-architecting of sentence structures. "
+        "No original sentence rhythm remains. Highly effective for preventing plagiarism, using entirely "
+        "independent academic prose while keeping facts, formulas, and laws perfectly aligned."
     ),
 }
 
+# 3 Academic-centric tone variations replacing the legacy modes
 TONE_MAP: dict[str, str] = {
-    "academic": (
-        "ACADEMIC — formal third-person prose, passive voice where appropriate, "
-        "precise technical vocabulary, no colloquialisms."
+    "academic_rigorous": (
+        "ACADEMIC RIGOROUS — Highly formal, precise, and authoritative third-person register. "
+        "Uses precise technical nomenclature, passive voice where customary, and a dense, standard "
+        "scientific layout ideal for competitive exam preparation."
     ),
-    "conversational": (
-        "CONVERSATIONAL — friendly second-person tone ('you'), short accessible sentences, "
-        "rhetorical questions, relatable phrasing. Avoid jargon where a plain word works."
+    "academic_pedagogical": (
+        "ACADEMIC PEDAGOGICAL (Default) — Balanced academic tone optimized for comprehension. "
+        "Maintains complete technical correctness and formal terminology, but delivers explanations "
+        "with optimal structural transitions to help students build clear mental models."
     ),
-    "simplified": (
-        "SIMPLIFIED — very short sentences (max 15 words each), everyday vocabulary only, "
-        "define every technical term immediately after use, add a brief real-world example "
-        "after every abstract concept."
+    "academic_interactive": (
+        "ACADEMIC INTERACTIVE — A formal academic register that strategically introduces "
+        "professional active voice, directed transitions, and rhetorical anchoring to sustain engagement "
+        "without sacrificing any technical accuracy or exam-level precision."
     ),
 }
 
@@ -87,33 +87,48 @@ STRUCTURE_MAP: dict[str, str] = {
     "reorganize": "minor reorganization allowed for better pedagogical flow",
 }
 
-
+# Narrowed down to English and Hindi only as requested
 LANGUAGE_MAP: dict[str, str] = {
     "en": "English",
     "hi": "Hindi",
-    "ta": "Tamil",
-    "te": "Telugu",
-    "mr": "Marathi",
-    "bn": "Bengali",
-    "gu": "Gujarati",
-    "kn": "Kannada",
-    "ml": "Malayalam",
-    "pa": "Punjabi",
-    "ur": "Urdu",
-    "fr": "French",
-    "de": "German",
-    "es": "Spanish",
-    "zh": "Chinese (Simplified)",
-    "ja": "Japanese",
-    "ar": "Arabic",
 }
+
+
+# Legacy → current value maps. The tone enum was renamed to three academic
+# variants and language was narrowed to en/hi; Regeneration rows created
+# before that change still carry the previous values in their params JSON.
+# These maps keep such rows re-runnable instead of failing validation.
+_LEGACY_TONE_MAP: dict[str, str] = {
+    "academic": "academic_rigorous",
+    "conversational": "academic_interactive",
+    "simplified": "academic_pedagogical",
+}
+_CURRENT_LANGS = set(LANGUAGE_MAP)
+
+
+def normalize_legacy_params(params: dict) -> dict:
+    """Map deprecated tone/language values to current schema-valid ones.
+
+    Returns a new dict; does not mutate the input. Current-value inputs and
+    unknown keys pass through unchanged. Applied wherever a stored params
+    blob is rehydrated into RegenParams (per-section rerun + worker execution,
+    which also covers startup orphan recovery).
+    """
+    out = dict(params)
+    tone = out.get("tone")
+    if tone in _LEGACY_TONE_MAP:
+        out["tone"] = _LEGACY_TONE_MAP[tone]
+    lang = out.get("language")
+    if lang is not None and lang not in _CURRENT_LANGS:
+        out["language"] = "en"
+    return out
 
 
 def param_descriptors(
     params: RegenParams,
     assigned_keypoints: list[str] | None = None,
 ) -> dict[str, str]:
-    lang_name = LANGUAGE_MAP.get(params.language, params.language)
+    lang_name = LANGUAGE_MAP.get(params.language, "English")
     audience_line = (
         f"TARGET AUDIENCE: Write specifically for {params.target_audience}. "
         f"Calibrate vocabulary, examples, and depth accordingly."
@@ -127,7 +142,6 @@ def param_descriptors(
     )
     extra = "\n\n".join(filter(None, [audience_line, custom_line]))
 
-    # Recap directives (v3 prompt only — v1 ignores these via _SafeDict).
     from app.services.recap_config import (
         render_active_ids,
         render_keypoints_directive,
@@ -157,18 +171,11 @@ class PostRegenQCResult(BaseModel):
     pass_: bool = Field(alias="pass", default=True)
     drifted_values: list[str] = Field(default_factory=list)
     original_number_count: int = 0
-
-    # New defensive structural checks (R1.4 — quality safety net without
-    # an extra LLM call). Block-count drift signals the LLM under- or
-    # over-produced free blocks; word-ratio drift signals truncation or
-    # runaway expansion beyond the prompt's ±15% length integrity rule.
     block_count_original: int = 0
     block_count_regenerated: int = 0
     word_count_original: int = 0
     word_count_regenerated: int = 0
-    word_ratio: float = 1.0  # regen / original
-
-    # Free-form warning strings the UI can surface to reviewers.
+    word_ratio: float = 1.0
     warnings: list[str] = Field(default_factory=list)
 
     model_config = ConfigDict(populate_by_name=True)

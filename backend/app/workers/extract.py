@@ -47,6 +47,23 @@ _sync_engine = create_engine(settings.SYNC_DATABASE_URL, pool_pre_ping=True)
 SyncSession = sessionmaker(bind=_sync_engine, class_=Session, autoflush=False)
 
 
+# Outcome classification — a QC failure is "soft" when the section still
+# carries real content and the only signal is a completeness heuristic
+# (low density / suspected truncation). Density retries have ALREADY run
+# inside extract_section_with_qc; this governs the FINAL disposition only.
+# Hard failures (empty result, normalizer drop-ratio, solution/question
+# bleed, OCR error) still mark the section failed. Invariant: a section
+# that extracted real content is never a hard "failed" that poisons
+# theory_status — it is accepted and flagged for review instead.
+_SOFT_QC_SIGNALS = ("Content density too low",)
+
+
+def _is_soft_qc_failure(failures: list[str]) -> bool:
+    return bool(failures) and all(
+        any(sig in f for sig in _SOFT_QC_SIGNALS) for f in failures
+    )
+
+
 def _update_job(session: Session, job_id: UUID, **fields) -> None:
     job = session.get(Job, job_id)
     if job is None:
@@ -250,7 +267,6 @@ def analyse_book_task(self, book_id: str, job_id: str) -> dict:
             new_analyser = analyser_result.model_dump()
             if is_multi_column:
                 new_analyser["is_multi_column"] = True
-            book.analyser = new_analyser
 
             # Lock previously-extracted section_ids when re-analysing an
             # existing book. The freshly generated schema can carry new IDs
@@ -278,28 +294,20 @@ def analyse_book_task(self, book_id: str, job_id: str) -> dict:
                     "schema_alignment failed (continuing with fresh IDs): %s", e
                 )
 
-            book.schema = schema.model_dump()
-            # SCHEMA Rebalance — surface validator warnings + preserve
-            # the last failed attempt (if any) for offline diagnosis.
-            if schema_warnings_payload:
-                book.schema_warnings = schema_warnings_payload
-            else:
-                book.schema_warnings = None
-            if last_failed_attempt is not None:
-                book.last_failed_schema = last_failed_attempt
-            # Preserve the user-supplied title. Only fall back to the schema's
-            # guessed title if the upload had none (or it's a bare filename stub).
-            if not (book.title and book.title.strip()):
-                book.title = schema.document_title or "Untitled"
-            book.subject = schema.subject or book.subject
-            session.commit()  # persist schema data first
-
-            # Atomic CAS on schema_status — only mark "done" if we still
-            # own the "running" slot. If /re-extract reset us to "pending"
-            # mid-flight, or a stale duplicate worker is racing, our write
-            # is dropped silently. Prevents the failure-tail-clobber bug
-            # where a duplicate's late failure wrote schema_status="failed"
-            # on top of a sibling's successful "done".
+            # ── ATOMIC SCHEMA PUBLISH (race-safe) ──────────────────────
+            # Schema content + status flip MUST happen as one transaction.
+            # Two analyse jobs racing on the same book both set
+            # schema_status="running" at start; the first to finish
+            # CAS-flips it to "done" and dispatches theory. Previously the
+            # loser still wrote book.schema BEFORE the CAS check, clobbering
+            # the winner's schema while theory was already running against
+            # the winner's version. Result: schema in DB diverged from the
+            # schema theory consumed (Unit-and-Measurement bug — 17
+            # sections silently lost).
+            #
+            # Fix: gate EVERY write (analyser, schema, warnings, title,
+            # subject, status) on owning the "running" slot. If we lost the
+            # race, drop the entire result. The winner's writes stand.
             from app.workers.orchestrator import cas_set_stage
             # SCHEMA Rebalance — needs_review is a non-blocking outcome:
             # schema is saved + lifecycle continues, but the schema_status
@@ -311,14 +319,41 @@ def analyse_book_task(self, book_id: str, job_id: str) -> dict:
             if cas_set_stage(
                 session, book_uuid, "schema", target_status, from_states=("running",),
             ):
+                # We own the slot — publish ALL the content atomically.
+                book.analyser = new_analyser
+                book.schema = schema.model_dump()
+                if schema_warnings_payload:
+                    book.schema_warnings = schema_warnings_payload
+                else:
+                    book.schema_warnings = None
+                if last_failed_attempt is not None:
+                    book.last_failed_schema = last_failed_attempt
+                # Preserve the user-supplied title. Only fall back to the
+                # schema's guessed title if the upload had none.
+                if not (book.title and book.title.strip()):
+                    book.title = schema.document_title or "Untitled"
+                book.subject = schema.subject or book.subject
                 book.status = "schema_ready"
                 session.commit()
             else:
                 logger.info(
                     "analyse_book: schema_status no longer 'running' — "
-                    "dropping terminal write (sibling/reset won) book=%s",
+                    "dropping schema write entirely (sibling/reset won) "
+                    "book=%s. NOT writing book.schema, book.analyser, "
+                    "or any related fields — winner's values stand.",
                     book_uuid,
                 )
+                # Don't dispatch the coordinator either — the winner
+                # already did at its own completion. Return early.
+                _update_job(
+                    session,
+                    job_uuid,
+                    status="succeeded",
+                    progress=100,
+                    message="Schema race lost — winner's schema preserved",
+                    finished_at=datetime.utcnow(),
+                )
+                return {"ok": True, "book_id": str(book_uuid), "lost_race": True}
 
             success_message = (
                 f"Schema saved with {len(schema_warnings_payload)} validator "
@@ -720,9 +755,26 @@ def extract_book_task(self, book_id: str, job_id: str) -> dict:
                     if is_container and not result.blocks:
                         sec.status = "passed"
                         outcome = "passed"
+                    elif result.qc.pass_:
+                        sec.status = "passed"
+                        outcome = "passed"
+                    elif result.blocks and _is_soft_qc_failure(result.qc.failures):
+                        # Section extracted real content but tripped ONLY a
+                        # soft completeness signal (low density / suspected
+                        # truncation). Density retries already ran inside
+                        # extract_section_with_qc. Accept the content and flag
+                        # it for review rather than marking the section failed
+                        # — a hard failure here would poison theory_status to
+                        # "partial" even though the content is present.
+                        sec.status = "passed"
+                        sec.qc_local = {
+                            **result.qc.to_dict(),
+                            "low_density_review": True,
+                        }
+                        outcome = "passed"
                     else:
-                        sec.status = "passed" if result.qc.pass_ else "failed"
-                        outcome = "passed" if result.qc.pass_ else "failed"
+                        sec.status = "failed"
+                        outcome = "failed"
                     own_session.commit()
                     # PARANOID: verify section_id matches after commit. If
                     # something somehow corrupted the write, fail LOUDLY.
@@ -899,6 +951,32 @@ def extract_book_task(self, book_id: str, job_id: str) -> dict:
             try:
                 from app.workers.runner import dispatch
                 dispatch("coordinate_extraction", str(book_uuid))
+
+                # ── FAIR QUEUE WAKE-UP ───────────────────────────────
+                # We just freed a theory slot. Wake the oldest pending
+                # book so the queue advances. Coordinator is idempotent
+                # — if no book is queued, the dispatch is a no-op.
+                # Without this, queued books would sit forever until
+                # something else (frontend poll, watchdog) poked them.
+                try:
+                    queued = session.execute(
+                        select(Book.id).where(
+                            Book.theory_status == "pending",
+                            Book.id != book_uuid,
+                        ).order_by(Book.created_at.asc()).limit(1)
+                    ).scalars().first()
+                    if queued is not None:
+                        dispatch("coordinate_extraction", str(queued))
+                        logger.info(
+                            "extract_book: fair-queue wake — poked "
+                            "queued book=%s after book=%s finished",
+                            queued, book_uuid,
+                        )
+                except Exception as _qe:
+                    logger.warning(
+                        "extract_book: fair-queue wake failed (non-fatal): %s",
+                        _qe,
+                    )
                 logger.info(
                     "extract_book: theory finalized for book=%s status=%s "
                     "— dispatched coordinator",
@@ -1170,82 +1248,67 @@ def regenerate_book_task(
             )
             return {"ok": False, "reason": "regen_row_missing"}
 
-        # Build container-section set from schema — these are skipped always.
-        container_ids: set[str] = set()
-        book_row = session.get(Book, book_uuid)
-        if book_row is not None and book_row.schema:
-            try:
-                from app.schemas.analyser import BookSchema as _BookSchema
-                schema_obj = _BookSchema(**book_row.schema)
-
-                def _walk(nodes):
-                    for n in nodes:
-                        if any(c.type != "excluded" for c in (n.subsections or [])):
-                            container_ids.add(n.id)
-                        _walk(n.subsections or [])
-
-                _walk(schema_obj.sections)
-            except Exception as e:
-                logger.warning("Could not parse schema to find containers: %s", e)
-
         all_sections = session.execute(
             select(Section).where(Section.book_id == book_uuid).order_by(Section.section_id)
         ).scalars().all()
 
-        # Container + example sections are dropped from "regen all" so we
-        # don't waste a Gemini call on parent sections whose content is fully
-        # covered by their children, or on worked-example sections that
-        # belong to the questions pipeline. When the user EXPLICITLY picks
-        # section_ids, honor their choice regardless — they know what they
-        # want and silently dropping the selection is hostile.
-        _EX_PREFIXES = (
-            "example ", "worked example", "exercise ", "problem ",
-            "question ", "illustration ", "solved example",
-        )
-        def _is_example_section(s) -> bool:
-            t = (getattr(s, "title", None) or "").strip().lower()
-            return any(t.startswith(p) for p in _EX_PREFIXES)
-
+        # ─── CONTENT-PRESENCE SCOPE — NEVER MISS A THEORY SECTION ───────────
+        # Goal (locked): every extracted theory (Cat B) section gets
+        # regenerated. The old logic dropped sections on TWO wrong signals:
+        #   • "has children" (container) — but nested parents carry their own
+        #     theory (Ch5 §basic-concepts = 37 own blocks + a child → dropped).
+        #   • title prefix "Illustration/Example/…" — but Illustrations ARE
+        #     Cat B theory and must regenerate.
+        #
+        # The ONLY correct test is: does the section have ANY extracted block?
+        #   • Cat B theory sections (prose, definitions, illustrations, nested
+        #     parents with own intro) → have blocks → INCLUDED.
+        #   • Cat A questions sections were never theory-extracted → 0 blocks
+        #     → naturally excluded (no title heuristic needed).
+        #   • Empty structural wrappers (0 blocks, e.g. the bare chapter node)
+        #     → nothing to rewrite → excluded.
+        # Sections whose blocks are all-invariant (pure figure/equation) are
+        # still INCLUDED — the regenerator no-ops them (returns originals, no
+        # Gemini call), so they appear in the regen view exactly as extracted.
+        # Nothing with content is ever dropped.
         if section_ids is None:
-            # "Regen all" — drop containers + example sections
-            sections = [s for s in all_sections if s.section_id not in container_ids]
-            before_n = len(sections)
-            sections = [s for s in sections if not _is_example_section(s)]
-            skipped_n = before_n - len(sections)
-            if skipped_n:
-                logger.info(
-                    "regenerate_book_task: skipping %d example/exercise sections "
-                    "from theory regen 'all' scope",
-                    skipped_n,
-                )
+            # "Regen all" — every section that has at least one extracted block.
+            sections = [s for s in all_sections if bool(s.blocks)]
+            dropped = len(all_sections) - len(sections)
+            logger.info(
+                "regenerate_book_task: 'all' scope — %d/%d sections have "
+                "extracted blocks (skipped %d empty structural wrappers)",
+                len(sections), len(all_sections), dropped,
+            )
         else:
-            # Explicit selection — honor whatever the user picked, even
-            # containers / examples. They asked for it.
-            sections = list(all_sections)
-
-        # If the caller specified section_ids, further filter to those
-        if section_ids is not None:
+            # Explicit selection — honor whatever the user picked verbatim.
             wanted = set(section_ids)
-            unknown = wanted - {s.section_id for s in sections}
+            sections = [s for s in all_sections if s.section_id in wanted]
+            unknown = wanted - {s.section_id for s in all_sections}
             if unknown:
                 logger.warning(
-                    "regenerate_book_task: ignoring unknown/container section_ids: %s",
+                    "regenerate_book_task: ignoring unknown section_ids: %s",
                     sorted(unknown),
                 )
-            sections = [s for s in sections if s.section_id in wanted]
 
         if not sections:
             _update_job(
                 session,
                 job_uuid,
                 status="failed",
-                error="No sections to regenerate (after container + selection filter)",
+                error="No sections to regenerate (no sections with extracted blocks)",
                 finished_at=datetime.utcnow(),
             )
             return {"ok": False, "reason": "no_sections"}
 
         try:
-            rp = RegenParams(**params)
+            # Normalize deprecated tone/language values from older stored regen
+            # rows (intern's regen-param overhaul renamed the tone enum +
+            # narrowed languages). Covers normal dispatch + startup orphan
+            # recovery — without this, old rows 422 against the new schema.
+            from app.schemas.regen import normalize_legacy_params
+
+            rp = RegenParams(**normalize_legacy_params(params))
         except Exception as e:
             _update_job(
                 session,
@@ -1835,5 +1898,23 @@ def _regenerate_figures(book_id: str, job_id: str) -> dict:
     return regenerate_figures_task(None, book_id, job_id)  # type: ignore[arg-type]
 
 
-register_task("extract_figures", _extract_figures)
+# ─── DECOMMISSIONED ──────────────────────────────────────────────────────
+# The v1 figure worker (extract_figures) is no longer dispatched anywhere.
+# All callers (orchestrator's _dispatch_figures, main.py orphan recovery)
+# route to extract_figures_v2 (registered in workers/figures_tasks.py).
+#
+# The v2 worker carries all today's figure improvements: PATH 0
+# (placeholder match), PATH A (anchor_text via pylatexenc normalizer),
+# PATH B (question_no PRIORITY 1, section_uuid PRIORITY 2), PATH C
+# (body_type append), label_pattern.search() canonical matcher,
+# diff/upsert into figure_references, section-end fallback, orphan
+# section recovery via nearest-section page lookup. Keeping v1
+# registered would silently bypass all of that if any caller
+# accidentally dispatched it.
+#
+# The v1 code is kept in this file for archaeology only — function bodies
+# remain importable so historical tests can still construct rows, but
+# `register_task` is deliberately commented out so the dispatcher cannot
+# reach v1 via the runner.
+# register_task("extract_figures", _extract_figures)   # DEAD CODE — do not re-enable
 register_task("regenerate_figures", _regenerate_figures)
