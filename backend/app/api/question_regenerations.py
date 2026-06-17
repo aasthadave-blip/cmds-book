@@ -93,7 +93,29 @@ def _regen_dict(r: QuestionRegeneration, question_count: int = 0) -> dict:
     }
 
 
-def _question_dict(q: Question) -> dict:
+def _question_dict(
+    q: Question,
+    figs_by_qid: dict[str, list[dict]] | None = None,
+) -> dict:
+    """Serialize a question (source OR regen variant).
+
+    ``figs_by_qid`` is the canonical question-figure map
+    ({question_id_str: [figure_dict]}) from
+    figure_serializer.serialize_embedded_figures(context="question").
+    Figure resolution:
+      • a SOURCE/original question → its own figures (by q.id)
+      • a REGEN VARIANT → it has no figure_references of its own (the
+        embedder only runs on the original extraction), so it INHERITS
+        its source question's figures (by q.source_question_id).
+    Each figure_dict carries body_target so the frontend renders it
+    under the question stem vs inside the solution block — identical to
+    the extracted-content question view.
+    """
+    embedded: list[dict] = []
+    if figs_by_qid is not None:
+        embedded = figs_by_qid.get(str(q.id)) or []
+        if not embedded and q.source_question_id is not None:
+            embedded = figs_by_qid.get(str(q.source_question_id)) or []
     return {
         "id": str(q.id),
         "regen_id": str(q.regen_id) if q.regen_id else None,
@@ -119,6 +141,7 @@ def _question_dict(q: Question) -> dict:
         "solution_text": q.solution_text,
         "has_solution": q.has_solution,
         "kind": q.kind or "exercise",
+        "embedded_figures": embedded,
     }
 
 
@@ -244,6 +267,18 @@ async def list_regen_questions(
     if r is None:
         raise HTTPException(404, detail="Regeneration not found")
 
+    # Canonical question-figure map for the book. Regen variants inherit
+    # their source question's figures (the embedder runs only on the
+    # original extraction, so variants have no figure_references of their
+    # own). _question_dict resolves own-then-source per question. Identical
+    # serializer the extract-content question view uses → figures render
+    # the same in the regen review, including body_target (question vs
+    # solution) routing.
+    from app.services.figure_serializer import serialize_embedded_figures
+    figs_by_qid = await serialize_embedded_figures(
+        session, r.book_id, context="question", variant="auto",
+    )
+
     # Regen questions (rows with regen_id set on this run).
     # Skip hidden ones — ✕ button on a regen variant must remove it from view.
     rows = (
@@ -293,7 +328,7 @@ async def list_regen_questions(
                 "sources": [],
             },
         )
-        bucket["questions"].append(_question_dict(q))
+        bucket["questions"].append(_question_dict(q, figs_by_qid))
 
     # Second pass to assemble the `sources` groups deterministically.
     for sec in grouped.values():
@@ -309,7 +344,10 @@ async def list_regen_questions(
                 src_q = source_map.get(UUID(sid_str)) if isinstance(sid_str, str) else None
                 per_source[sid_str] = {
                     "source_id": sid_str,
-                    "source": _question_dict(src_q) if src_q is not None else None,
+                    "source": (
+                        _question_dict(src_q, figs_by_qid)
+                        if src_q is not None else None
+                    ),
                     "variants": [],
                 }
             per_source[sid_str]["variants"].append(qd)

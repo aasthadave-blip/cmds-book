@@ -5,7 +5,7 @@ from __future__ import annotations
 from typing import Any
 from uuid import UUID
 
-from fastapi import APIRouter, Depends, HTTPException
+from fastapi import APIRouter, Depends, HTTPException, Query
 from sqlalchemy import select
 from sqlalchemy.ext.asyncio import AsyncSession
 
@@ -23,63 +23,110 @@ router = APIRouter(tags=["sections"])
 async def _load_embedded_figures(
     session: AsyncSession,
     book_id: UUID,
+    variant: str = "auto",
 ) -> dict[str, list[dict[str, Any]]]:
     """Build a {section_ref: [figure_dict, ...]} map for theory-context
-    figure_references on this book. Each figure_dict carries the data
-    the frontend needs to render the figure inline.
+    figure_references on this book.
 
-    Variant is chosen per Q1 rule: regen if approved_at IS NOT NULL,
-    else original.
+    Thin delegate to the canonical serializer (services/figure_serializer.py)
+    — there is exactly ONE figure-dict shape + regen-visibility rule shared
+    by theory/question extract readers AND theory/question regen readers, so
+    figures render identically everywhere. ``variant`` controls which image
+    the URL serves: "auto" (regen-if-exists, default — the extract review
+    page), "original", or "regenerated" (regen-with-fallback).
     """
-    # Join figure_references → figures, theory context only,
-    # excluding hidden + unattached (those live in a separate tray).
-    refs = (
-        await session.execute(
-            select(FigureReference)
-            .where(FigureReference.book_id == book_id)
-            .where(FigureReference.context == "theory")
-            .where(FigureReference.is_hidden.is_(False))
-            .where(FigureReference.placement_kind != "unattached")
-        )
-    ).scalars().all()
-    if not refs:
-        return {}
+    from app.services.figure_serializer import serialize_embedded_figures
 
-    fig_ids = {r.figure_id for r in refs}
-    figs = (
-        await session.execute(
-            select(Figure).where(Figure.id.in_(fig_ids))
-        )
-    ).scalars().all()
-    fig_by_id = {f.id: f for f in figs}
+    return await serialize_embedded_figures(
+        session, book_id, context="theory", variant=variant,  # type: ignore[arg-type]
+    )
 
-    out: dict[str, list[dict[str, Any]]] = {}
-    for r in refs:
-        f = fig_by_id.get(r.figure_id)
-        if f is None:
-            continue
-        variant = "regen" if (f.regen_image_bytes and f.approved_at) else "original"
-        out.setdefault(r.section_ref, []).append({
-            "ref_id": str(r.id),               # needed for hide/unhide
-            "figure_id": str(f.id),
-            "label": f.figure_number or r.placeholder_text or "",
-            "caption": f.caption or "",
-            "variant": variant,
-            "image_url": f"/api/figures/{f.id}/image?variant=auto",
-            "placement_kind": r.placement_kind or "appended",
-            "placement_block_idx": r.placement_block_idx,
-        })
-    # Order each section's figures by placement_block_idx (None → end)
-    for k, lst in out.items():
-        lst.sort(key=lambda d: (
-            d.get("placement_block_idx") if d.get("placement_block_idx") is not None else 10**9
-        ))
-    return out
+
+def _order_sections_by_tree(
+    all_sections: list[Section],
+    schema_flat: list,
+) -> list[Section]:
+    """Return every section in correct reading order — robustly.
+
+    The previous approach matched each schema node to a Section row by
+    UUID-then-slug and appended UNMATCHED rows at the end in lexicographic
+    order. That broke badly because the schema generator and the section
+    worker build slugs DIFFERENTLY for nested sections (schema:
+    ``6-tidal-volume`` vs DB: ``6-capacities-of-the-lungs-tidal-volume``)
+    AND their UUIDs diverge — deep sections never matched and got
+    dumped alphabetically at the end → jumbled order.
+
+    This instead derives the tree from section_id slugs themselves
+    (which DO form a clean parent→child hierarchy in the DB), and only
+    USES the schema for SIBLING ORDER when a node happens to match.
+    Every section is placed under its real parent. Nothing is ever
+    dumped at the end. No dependency on slug==schema-id or
+    uuid==schema-uuid.
+
+    Sibling order at each level:
+        1. schema position (if that sibling matches a schema node), else
+        2. page_start, else
+        3. section_id (stable tiebreak)
+    """
+    schema_pos: dict[tuple[str, str], int] = {}
+    for i, ss in enumerate(schema_flat):
+        if getattr(ss, "uuid", None):
+            schema_pos[("uuid", str(ss.uuid))] = i
+        if getattr(ss, "id", None):
+            schema_pos[("slug", ss.id)] = i
+
+    by_sid: dict[str, Section] = {s.section_id: s for s in all_sections}
+
+    def direct_pos(s: Section) -> int | None:
+        p = schema_pos.get(("uuid", str(s.id)))
+        if p is None:
+            p = schema_pos.get(("slug", s.section_id))
+        return p
+
+    def parent_sid(sid: str) -> str | None:
+        # Parent = the longest OTHER section_id that is a segment-prefix.
+        parts = sid.split("-")
+        for cut in range(len(parts) - 1, 0, -1):
+            cand = "-".join(parts[:cut])
+            if cand != sid and cand in by_sid:
+                return cand
+        return None
+
+    children: dict[str, list[str]] = {sid: [] for sid in by_sid}
+    roots: list[str] = []
+    for sid in by_sid:
+        p = parent_sid(sid)
+        if p is not None:
+            children[p].append(sid)
+        else:
+            roots.append(sid)
+
+    _BIG = 10 ** 9
+
+    def sib_key(sid: str) -> tuple:
+        s = by_sid[sid]
+        dp = direct_pos(s)
+        ps = s.page_start if s.page_start is not None else _BIG
+        return (dp if dp is not None else _BIG, ps, sid)
+
+    ordered: list[Section] = []
+
+    def dfs(sid: str) -> None:
+        ordered.append(by_sid[sid])
+        for c in sorted(children[sid], key=sib_key):
+            dfs(c)
+
+    for r in sorted(roots, key=sib_key):
+        dfs(r)
+    return ordered
 
 
 @router.get("/api/books/{book_id}/sections", response_model=list[SectionOut])
 async def list_sections(
     book_id: UUID,
+    variant: str = Query(
+        "auto", pattern="^(auto|original|regenerated)$",
+    ),
     session: AsyncSession = Depends(get_session),
 ) -> list[SectionOut]:
     """Return the book's sections ordered by the schema's hierarchical
@@ -105,55 +152,24 @@ async def list_sections(
         select(Section).where(Section.book_id == book_id)
     )
     all_sections = list(result.scalars().all())
-    secs_by_id = {s.section_id: s for s in all_sections}
-    # UUID-keyed map — canonical identity (CONTRACT.md §1).
-    # Schema sections carry `uuid` per SchemaSection.uuid; Section rows
-    # use `id` (UUID PK). When both align, lookup is drift-proof.
-    secs_by_uuid = {str(s.id): s for s in all_sections}
-    embedded_by_section = await _load_embedded_figures(session, book_id)
+    embedded_by_section = await _load_embedded_figures(session, book_id, variant)
 
-    # Build the canonical schema order. Same helper used by books.py
-    # export ordering — keep the two paths consistent.
-    # Lookup priority: UUID (canonical) → slug (legacy).
-    # For new books (post-UUID migration), UUID matches → correct order.
-    # For legacy books with drifted slugs AND no matching UUID, the section
-    # falls through to the lexicographic fallback at the bottom (broken
-    # order — a pre-existing data issue, not fixed here).
-    ordered_sections: list[Section] = []
-    seen_section_pks: set = set()
+    # Robust tree-based ordering. See _order_sections_by_tree docstring
+    # for the rationale (replaces the old match-then-lexicographic-tail
+    # path that jumbled deep sections whose slugs/UUIDs diverged from
+    # the schema).
+    schema_flat: list = []
     book = await session.get(Book, book_id)
     if book is not None and book.schema:
         try:
-            schema_obj = BookSchema(**book.schema)
-            for ss in _flatten(schema_obj):
-                matched: Section | None = None
-                # 1. UUID (canonical, drift-proof)
-                if ss.uuid and ss.uuid in secs_by_uuid:
-                    matched = secs_by_uuid[ss.uuid]
-                # 2. Slug (works when slugs happen to align)
-                elif ss.id in secs_by_id:
-                    matched = secs_by_id[ss.id]
-                if matched is None or matched.id in seen_section_pks:
-                    continue
-                ordered_sections.append(matched)
-                seen_section_pks.add(matched.id)
+            schema_flat = list(_flatten(BookSchema(**book.schema)))
         except Exception:
-            ordered_sections = []
-            seen_section_pks = set()
+            schema_flat = []
 
-    # Build the output list in schema order, then append any DB-only
-    # sections (defensive — orphans that aren't in the schema but exist
-    # in the sections table) at the end in lexicographic order so they
-    # remain visible to the user / editor.
+    ordered_sections = _order_sections_by_tree(all_sections, schema_flat)
+
     out: list[SectionOut] = []
     for s in ordered_sections:
-        d = SectionOut.model_validate(s)
-        d.embedded_figures = embedded_by_section.get(s.section_id, [])
-        out.append(d)
-    for sid in sorted(secs_by_id):
-        s = secs_by_id[sid]
-        if s.id in seen_section_pks:
-            continue
         d = SectionOut.model_validate(s)
         d.embedded_figures = embedded_by_section.get(s.section_id, [])
         out.append(d)

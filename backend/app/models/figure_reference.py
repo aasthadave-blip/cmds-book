@@ -85,3 +85,16 @@ class FigureReference(Base):
         default=False,
         server_default=sa.text("0"),
     )
+    # Explicit body target for question-context refs:
+    #   "question" → fig renders in Question.raw_text (question stem)
+    #   "solution" → fig renders in Question.solution_text (worked solution)
+    #   NULL       → theory context (not applicable) OR legacy data
+    #
+    # Removes the frontend's need to INFER which body a fig belongs to by
+    # searching placeholder text or guessing from char_offset. The embedder
+    # computes body_target during PATH 0 (placeholder match) or from
+    # body_type and writes it here. The frontend reads ef.body_target
+    # directly — no string matching, no offset heuristics.
+    body_target: Mapped[str | None] = mapped_column(
+        sa.String(16), nullable=True,
+    )

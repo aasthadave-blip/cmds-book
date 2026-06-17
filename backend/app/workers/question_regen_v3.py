@@ -121,6 +121,17 @@ GEMINI_MODEL = "gemini-2.5-flash"
 GEMINI_TIMEOUT_S = 150
 MAX_OUTPUT_TOKENS = 32768
 
+# Completeness contract for question regen — every source question MUST get
+# at least one variant. A single Gemini call sometimes returns empty (esp.
+# multimodal/figure questions) or transiently fails; without a retry the
+# source was silently skipped (0 variants), and a section-reseed even
+# wiped the existing variants first, leaving the section blank. Bounded
+# retry per source closes both gaps. Mirrors the extraction-side Pass-3
+# philosophy: retry empties, never silently drop. Cost is bounded — extra
+# calls only fire on sources that came back empty the first time.
+_REGEN_SOURCE_MAX_ATTEMPTS = 3
+_REGEN_SOURCE_BACKOFF_S = (1.0, 2.0)  # waits between attempts 1→2, 2→3
+
 # Question kind enum allowed in the DB (matches Question.kind column).
 _LEGACY_KINDS = {"exercise", "example", "problem", "mcq", "review", "other"}
 
@@ -344,55 +355,85 @@ async def _regen_one_source(
         and settings.MULTIMODAL_REGEN_ENABLED
     )
 
-    try:
-        if use_multimodal:
-            # Append the image-addendum rules to the standard system prompt
-            full_system = system_prompt
-            if image_addendum_prompt:
-                full_system = system_prompt + "\n\n" + image_addendum_prompt
-            raw = await asyncio.to_thread(
-                call_gemini_text_with_images,
-                system_prompt=full_system,
-                user_prompt=user_prompt,
-                image_bytes_list=image_bytes_list,
-                # Pro for multimodal — better visual reasoning than Flash
-                model="gemini-2.5-pro",
-                timeout_s=GEMINI_TIMEOUT_S,
-                max_output_tokens=MAX_OUTPUT_TOKENS,
-                temperature=0.4,
+    # Bounded retry: a source MUST yield ≥1 variant. Retry on transient
+    # failure OR a valid-but-empty response (0 usable items). Only after
+    # exhausting attempts do we report failure — at which point the caller
+    # records a visible gap in stats (never a silent drop).
+    last_err = ""
+    for attempt in range(1, _REGEN_SOURCE_MAX_ATTEMPTS + 1):
+        try:
+            if use_multimodal:
+                # Append the image-addendum rules to the standard system prompt
+                full_system = system_prompt
+                if image_addendum_prompt:
+                    full_system = system_prompt + "\n\n" + image_addendum_prompt
+                raw = await asyncio.to_thread(
+                    call_gemini_text_with_images,
+                    system_prompt=full_system,
+                    user_prompt=user_prompt,
+                    image_bytes_list=image_bytes_list,
+                    # Pro for multimodal — better visual reasoning than Flash
+                    model="gemini-2.5-pro",
+                    timeout_s=GEMINI_TIMEOUT_S,
+                    max_output_tokens=MAX_OUTPUT_TOKENS,
+                    temperature=0.4,
+                )
+            else:
+                raw = await asyncio.to_thread(
+                    call_gemini_text_only,
+                    system_prompt=system_prompt,
+                    user_prompt=user_prompt,
+                    model=GEMINI_MODEL,
+                    timeout_s=GEMINI_TIMEOUT_S,
+                    max_output_tokens=MAX_OUTPUT_TOKENS,
+                    temperature=0.4,
+                )
+            data = parse_json(raw)
+            if not isinstance(data, dict):
+                last_err = "response was not a JSON object"
+            else:
+                items = list(data.get("regenerated") or [])
+                notes = str(data.get("notes") or "")
+                # Keep only items that have a non-empty question string.
+                items = [it for it in items if isinstance(it, dict)
+                         and (it.get("question") or "").strip()]
+                if items:
+                    # Normalise multimodal-only fields so they always exist.
+                    for it in items:
+                        if "image_needs_regen" not in it:
+                            it["image_needs_regen"] = False
+                        if "image_regen_reason" not in it:
+                            it["image_regen_reason"] = ""
+                    if attempt > 1:
+                        logger.info(
+                            "regen-v3 source q=%s recovered on attempt %d",
+                            source.id, attempt,
+                        )
+                    return {"ok": True, "items": items, "notes": notes, "error": ""}
+                # Valid JSON but zero usable items → retry.
+                last_err = "empty result (0 usable variants)"
+        except Exception as e:
+            last_err = str(e)
+            logger.warning(
+                "regen-v3 single-source call failed (q=%s, multimodal=%s, "
+                "attempt=%d/%d): %s",
+                source.id, use_multimodal, attempt,
+                _REGEN_SOURCE_MAX_ATTEMPTS, e,
             )
-        else:
-            raw = await asyncio.to_thread(
-                call_gemini_text_only,
-                system_prompt=system_prompt,
-                user_prompt=user_prompt,
-                model=GEMINI_MODEL,
-                timeout_s=GEMINI_TIMEOUT_S,
-                max_output_tokens=MAX_OUTPUT_TOKENS,
-                temperature=0.4,
+        # Backoff before the next attempt (skip after the final one).
+        if attempt < _REGEN_SOURCE_MAX_ATTEMPTS:
+            await asyncio.sleep(
+                _REGEN_SOURCE_BACKOFF_S[
+                    min(attempt - 1, len(_REGEN_SOURCE_BACKOFF_S) - 1)
+                ]
             )
-        data = parse_json(raw)
-        if not isinstance(data, dict):
-            return {"ok": False, "items": [], "notes": "",
-                    "error": "response was not a JSON object"}
-        items = list(data.get("regenerated") or [])
-        notes = str(data.get("notes") or "")
-        # Keep only items that have a non-empty question string.
-        items = [it for it in items if isinstance(it, dict)
-                 and (it.get("question") or "").strip()]
-        # Normalise the multimodal-only fields so they always exist downstream
-        for it in items:
-            if "image_needs_regen" not in it:
-                it["image_needs_regen"] = False
-            if "image_regen_reason" not in it:
-                it["image_regen_reason"] = ""
-        return {"ok": True, "items": items, "notes": notes, "error": ""}
-    except Exception as e:
-        logger.warning(
-            "regen-v3 single-source call failed (q=%s, multimodal=%s): %s",
-            source.id, use_multimodal, e,
-        )
-        return {"ok": False, "items": [], "notes": "", "error": str(e)}
+
+    logger.warning(
+        "regen-v3 source q=%s produced NO variants after %d attempts: %s",
+        source.id, _REGEN_SOURCE_MAX_ATTEMPTS, last_err,
+    )
+    return {"ok": False, "items": [], "notes": "",
+            "error": f"no variants after {_REGEN_SOURCE_MAX_ATTEMPTS} attempts: {last_err}"}
 
 
 def _persist_regen_items(

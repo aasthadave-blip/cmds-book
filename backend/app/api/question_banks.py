@@ -138,6 +138,11 @@ def _question_dict(q: Question) -> dict:
     return {
         "id": str(q.id),
         "section_ref": q.section_ref,
+        # Canonical UUID FK to Section row (Phase 3 of migration). Frontend
+        # joins on this; section_ref slug is display-only. None on legacy
+        # rows written before the resolver was wired — those still join on
+        # slug as a fallback path.
+        "section_uuid": str(q.section_uuid) if q.section_uuid else None,
         "section_title": q.section_title,
         "page_start": q.page_start,
         "page_end": q.page_end,
@@ -164,10 +169,18 @@ def _question_dict(q: Question) -> dict:
     }
 
 
-def _rejected_dict(r: RejectedQuestion) -> dict:
+def _rejected_dict(
+    r: RejectedQuestion,
+    section_uuid: str | None = None,
+) -> dict:
     return {
         "id": str(r.id),
         "section_ref": r.section_ref,
+        # Phase 3 — canonical FK derived at API time (no DB column yet on
+        # rejected_questions; full migration is option (a)). Caller passes
+        # the resolved UUID from the slug→uuid map it already built for
+        # questions. Null when slug can't be resolved (legacy / drift).
+        "section_uuid": section_uuid,
         "section_title": r.section_title,
         "page_start": r.page_start,
         "page_end": r.page_end,
@@ -589,66 +602,23 @@ async def link_examples(
 async def _load_question_embedded_figures(
     session: AsyncSession,
     book_id: UUID,
+    variant: str = "auto",
 ) -> dict[str, list[dict]]:
     """Build {question_id_str: [figure_dict, ...]} for question-context
-    figure_references on this book. Variant choice: regen-if-approved
-    else original.
+    figure_references on this book.
+
+    Thin delegate to the canonical serializer (services/figure_serializer.py)
+    — identical figure-dict shape + regen-visibility rule as the theory
+    reader and both regen readers. ``variant`` controls which image the URL
+    serves ("auto" default = regen-if-exists). ``body_target`` on each dict
+    still tells the frontend whether the figure renders under the question
+    stem or inside the solution block.
     """
-    from app.models.figure import Figure
-    from app.models.figure_reference import FigureReference
+    from app.services.figure_serializer import serialize_embedded_figures
 
-    refs = (
-        await session.execute(
-            select(FigureReference)
-            .where(FigureReference.book_id == book_id)
-            .where(FigureReference.context == "question")
-            .where(FigureReference.is_hidden.is_(False))
-            .where(FigureReference.placement_kind != "unattached")
-        )
-    ).scalars().all()
-    if not refs:
-        return {}
-    fig_ids = {r.figure_id for r in refs}
-    figs = (
-        await session.execute(
-            select(Figure).where(Figure.id.in_(fig_ids))
-        )
-    ).scalars().all()
-    fig_by_id = {f.id: f for f in figs}
-
-    out: dict[str, list[dict]] = {}
-    for r in refs:
-        if r.question_id is None:
-            continue
-        f = fig_by_id.get(r.figure_id)
-        if f is None:
-            continue
-        # Skip ghost figures — references that point to a Figure row whose
-        # bytes never got persisted (figure extraction crashed mid-flight
-        # before image_bytes were committed). Including them produces broken
-        # <img> tags in the reviewer that confuse "is this regen working?".
-        if not f.regen_image_bytes and not f.image_bytes:
-            continue
-        # Default to the regen variant whenever it exists — no approval gate.
-        # Reviewer wants regenerated figure to appear automatically inside the
-        # regenerated question; the explicit Approve step is for the Figures
-        # tab QA workflow, not a precondition for display here.
-        variant = "regen" if f.regen_image_bytes else "original"
-        out.setdefault(str(r.question_id), []).append({
-            "ref_id": str(r.id),
-            "figure_id": str(f.id),
-            "label": f.figure_number or r.placeholder_text or "",
-            "caption": f.caption or "",
-            "variant": variant,
-            "image_url": f"/api/figures/{f.id}/image?variant=auto",
-            "placement_kind": r.placement_kind or "appended",
-            "placement_char_offset": r.placement_char_offset,
-        })
-    for k, lst in out.items():
-        lst.sort(key=lambda d: (
-            d.get("placement_char_offset") if d.get("placement_char_offset") is not None else 10**9
-        ))
-    return out
+    return await serialize_embedded_figures(
+        session, book_id, context="question", variant=variant,  # type: ignore[arg-type]
+    )
 
 
 @banks_router.get("/{bank_id}/questions")
@@ -696,6 +666,20 @@ async def list_questions(
         except Exception:
             pass
 
+    # Phase 3 migration — build {section_slug → Section UUID} for this
+    # book so the response can include a stable UUID per section_out.
+    # Frontend matches on this UUID (not slug) so schema/db slug divergence
+    # can never produce a blank Questions tab again. Slug stays in the
+    # response only for display + legacy fallback.
+    from app.models.section import Section as _Section
+    sec_rows = (await session.execute(
+        select(_Section.id, _Section.section_id)
+        .where(_Section.book_id == bank.book_id)
+    )).all()
+    slug_to_uuid: dict[str, str] = {
+        slug: str(sid) for sid, slug in sec_rows if slug
+    }
+
     grouped: dict[str, list[dict]] = {sid: [] for sid in order}
     for q in questions:
         qd = _question_dict(q)
@@ -713,7 +697,13 @@ async def list_questions(
     rejected_rows = rej_result.scalars().all()
     rejected_grouped: dict[str, list[dict]] = {}
     for r in rejected_rows:
-        rejected_grouped.setdefault(r.section_ref or "", []).append(_rejected_dict(r))
+        # Derive section_uuid via the same slug→uuid map used for questions.
+        # When slug differs from any DB section_id (drift case), uuid is None
+        # and the frontend's slug fallback path keeps the item visible.
+        sec_uuid = slug_to_uuid.get(r.section_ref) if r.section_ref else None
+        rejected_grouped.setdefault(r.section_ref or "", []).append(
+            _rejected_dict(r, section_uuid=sec_uuid)
+        )
 
     def _group_by_kind(items: list[dict]) -> dict[str, list[dict]]:
         buckets: dict[str, list[dict]] = {}
@@ -728,6 +718,7 @@ async def list_questions(
         items = grouped.get(sid, [])
         sections_out.append({
             "section_ref": sid,
+            "section_uuid": slug_to_uuid.get(sid),  # Phase 3 — canonical FK
             "section_title": titles.get(sid, sid),
             "questions": items,
             "by_kind": _group_by_kind(items),
@@ -739,6 +730,7 @@ async def list_questions(
             continue
         sections_out.append({
             "section_ref": sid,
+            "section_uuid": slug_to_uuid.get(sid),  # Phase 3 — canonical FK
             "section_title": sid,
             "questions": items,
             "by_kind": _group_by_kind(items),
@@ -751,6 +743,7 @@ async def list_questions(
             continue
         sections_out.append({
             "section_ref": sid,
+            "section_uuid": slug_to_uuid.get(sid),  # Phase 3 — canonical FK
             "section_title": titles.get(sid, sid),
             "questions": [],
             "by_kind": {},

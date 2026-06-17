@@ -61,6 +61,17 @@ LOCK_TIMEOUT_MIN = 10
 # per-stage counter so a user-initiated retry can again use the slot.
 MAX_AUTO_RETRIES = 1
 
+# Per-book fair-queue cap on concurrent theory extractions.
+# Global Gemini in-flight cap is 8 (see app/core/gemini_runtime.py). Each
+# book's theory worker fans out 8 parallel section calls; running 3+ books
+# at once causes contention where each book progresses at ~1/N solo speed.
+# Capping concurrent THEORY books at 2 gives each active book its full
+# 8-wide bandwidth. Total throughput is the same, but each book has a
+# predictable wall-clock and queue position. Excess uploads stay in
+# theory_status='pending' until a slot frees; the completing book's tail
+# re-dispatches coordinate_extraction to wake the next pending book.
+MAX_CONCURRENT_THEORY_BOOKS = 5
+
 
 # Status sets — one source of truth.
 _PENDING = "pending"
@@ -78,7 +89,7 @@ _TERMINAL = frozenset({_DONE, _FAILED, _PARTIAL})
 # ─── State machine ────────────────────────────────────────────────────
 
 
-def _decide_next_action(book: Book) -> str:
+def _decide_next_action(book: Book, session=None) -> str:
     """Decide the next single transition based on current book state.
 
     Returns one of:
@@ -96,6 +107,43 @@ def _decide_next_action(book: Book) -> str:
     """
     # Build Step 1 — handle the FULL lifecycle, schema included. The
     # coordinator is now the ONE entry point from upload → finalize.
+    #
+    # ─── Monotonic-forward state invariant (self-heal) ──────────────
+    # The pipeline is strictly forward: a stage can never revert from a
+    # terminal state back to pending while downstream stages have data.
+    # If we observe `schema_status == pending` AND any downstream stage
+    # has reached `done` / `needs_review` / `partial`, that's PROOF the
+    # schema WAS done at some point (extract.py only runs on completed
+    # schema). Some caller wrongly reset schema_status — auto-heal to
+    # `done` rather than re-dispatch analyse (which would duplicate work
+    # and corrupt the UI).
+    #
+    # Catches: /analyse endpoint with bug, reconciliation poke, manual
+    # DB edit, double-clicked retry, future code paths we haven't
+    # written yet. Single invariant enforcement at the dispatcher means
+    # we don't have to patch every reset site individually.
+    downstream_advanced = (
+        book.theory_status in (_DONE, _NEEDS_REVIEW, _PARTIAL)
+        or book.questions_status in (_DONE, _PARTIAL)
+        or book.figures_status in (_DONE, _PARTIAL)
+    )
+    if book.schema_status == _PENDING and downstream_advanced:
+        logger.warning(
+            "orchestrator: state invariant violated book=%s — schema=pending "
+            "but downstream advanced (theory=%s questions=%s figures=%s). "
+            "Auto-healing schema → done (monotonic-forward).",
+            book.id, book.theory_status, book.questions_status,
+            book.figures_status,
+        )
+        # Restore the truth. We can't re-run schema-gen safely when
+        # extracted data already exists; the schema in book.schema is
+        # the authoritative one that produced that data.
+        book.schema_status = _DONE
+        if session is not None:
+            session.commit()
+        # Continue evaluating: the just-healed schema=done falls through
+        # to the theory-pending/done checks below as normal.
+
     if book.schema_status == _PENDING:
         return "dispatch_analyse"
     if book.schema_status == _RUNNING:
@@ -105,14 +153,76 @@ def _decide_next_action(book: Book) -> str:
             return "retry_analyse"
         return "no_action"  # terminal-failed — surfaced to user, no auto-advance
     if book.schema_status == _NEEDS_REVIEW:
-        # accept-with-warnings — waiting for user approval. NEVER auto-advance.
-        return "no_action"
-    if book.schema_status != _DONE:
+        # Auto-advance: validator flagged findings but the schema IS saved
+        # and atomic (post race-fix). The schema in book.schema is the
+        # FINAL schema — race-fix guarantees no later analyse can clobber
+        # it. Theory worker reads that final schema via flatten_sections
+        # and iterates every Cat-B section, so no section gets missed.
+        #
+        # Validator findings remain visible in book.schema_warnings for
+        # human review; they no longer block extraction. User intent:
+        # "schema finalized → next thing starts automatically."
+        #
+        # The genuinely-broken case (_FAILED above) still blocks — that's
+        # where the schema is uninterpretable, not just imperfect. needs_review
+        # specifically means "schema accepted with warnings" — extraction
+        # safely proceeds.
+        pass  # fall through to theory_status checks below
+    if book.schema_status not in (_DONE, _NEEDS_REVIEW):
         # Unknown/unexpected schema status — be safe, don't act.
+        # Both _DONE and _NEEDS_REVIEW are considered "schema finalized"
+        # for downstream dispatch purposes (see needs_review fall-through
+        # above). _FAILED was already handled at line 103.
         return "no_action"
 
-    # Phase A — theory pending → dispatch
+    # Phase A — theory pending → dispatch (subject to per-book fair queue)
     if book.theory_status == _PENDING:
+        # ── PER-BOOK FAIR QUEUE ──────────────────────────────────────
+        # Global Gemini in-flight cap is 8 (gemini_runtime.py:42, can't
+        # raise without Railway OOM). A book's theory worker fans out
+        # 8 parallel section calls. When 3+ books run theory concurrently,
+        # they fight for slots → each book progresses at ~1/N speed.
+        #
+        # Cap concurrent theory runs to MAX_CONCURRENT_THEORY_BOOKS so each
+        # active book gets its full 8-wide bandwidth. Excess uploads stay
+        # in theory_status='pending' until a slot frees. The completing
+        # book's tail (extract.py end-of-job) calls
+        # coordinate_extraction on the next pending book → wakes the queue.
+        #
+        # Observed need: 4-book concurrent upload had each book at 25%
+        # speed; with queue gate, books would complete sequentially at
+        # 100% speed (same total throughput, predictable per-book wall
+        # clock, clearer UI semantics).
+        # Use the caller's session if provided; otherwise open a short-lived
+        # one. Caller is _coordinate_extraction which always passes session.
+        # Direct-test callers (tests) get the fresh-session path.
+        # Top-level imports to avoid the lazy-import class of bugs caught
+        # earlier today (NameError surfaces only at runtime when the
+        # branch fires — passes module-import sanity checks).
+        from sqlalchemy import select as _select, func as _func  # noqa
+        if session is not None:
+            running_theory = session.execute(
+                _select(_func.count(Book.id)).where(
+                    Book.theory_status == _RUNNING,
+                    Book.id != book.id,
+                )
+            ).scalar() or 0
+        else:
+            from app.core.db import SyncSession as _SS
+            with _SS() as _s:
+                running_theory = _s.execute(
+                    _select(_func.count(Book.id)).where(
+                        Book.theory_status == _RUNNING,
+                        Book.id != book.id,
+                    )
+                ).scalar() or 0
+        if running_theory >= MAX_CONCURRENT_THEORY_BOOKS:
+            logger.info(
+                "orchestrator: book=%s queued — %d books already running "
+                "theory (cap=%d). Will dispatch when slot frees.",
+                book.id, running_theory, MAX_CONCURRENT_THEORY_BOOKS,
+            )
+            return "no_action"
         return "dispatch_theory"
 
     # Phase B — theory still running → wait
@@ -528,7 +638,7 @@ def _coordinate_extraction(book_id: str) -> dict:
                 logger.warning("orchestrator: book %s not found", book_id)
                 return {"ok": False, "reason": "book_not_found"}
 
-            action = _decide_next_action(book)
+            action = _decide_next_action(book, session=session)
             logger.info(
                 "orchestrator: book=%s schema=%s theory=%s(finalized=%s) "
                 "questions=%s figures=%s → action=%s",

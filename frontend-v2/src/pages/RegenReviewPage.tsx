@@ -45,7 +45,8 @@ import { useLatestRegeneration } from '../api/regenerations';
 
 import { Icon } from '../components/Icon';
 import { TheoryView } from '../components/review/TheoryView';
-import { QuestionsView } from '../components/review/QuestionsView';
+import { QuestionsView, FigureCard } from '../components/review/QuestionsView';
+import { stripFigPlaceholders } from '../lib/questionText';
 import { FiguresView } from '../components/review/FiguresView';
 
 type TopTab = 'theory' | 'questions' | 'figures';
@@ -64,7 +65,17 @@ export default function RegenReviewPage() {
   const navigate = useNavigate();
 
   const bookState = useBook(bookId);
-  const sectionsState = useSections(bookId);
+  // Two figure variants of the SAME sections so each sub-tab renders the
+  // correct image without any client-side URL logic (the backend serializer
+  // owns variant→URL composition):
+  //   • sectionsState  (variant=original)    → Original tab + Comparison-left
+  //   • regenFigState  (variant=regenerated) → Regenerated tab + Comparison-right
+  // Section blocks are identical across both fetches; only embedded_figures'
+  // image_url differs. Theory text comes from blocks_by_section (regen) or
+  // section.blocks (original) — figures ride on whichever section object the
+  // column uses.
+  const sectionsState = useSections(bookId, 'original');
+  const regenFigState = useSections(bookId, 'regenerated');
   const questionsState = useBookQuestions(bookId);
   const figuresState = useBookFigures(bookId);
   const regenState = useLatestRegeneration(bookId);
@@ -198,8 +209,31 @@ export default function RegenReviewPage() {
   }, [bookState]);
 
   const allSections = sectionsState.kind === 'ready' ? sectionsState.sections : [];
+  // Regen-variant copy of each section, keyed by section_id. Same blocks,
+  // but embedded_figures resolve to the regenerated image (with fallback to
+  // original when no regen exists). The regen/comparison-right columns read
+  // figures off this object so they show ↻ regenerated images while the
+  // original/comparison-left columns keep the originals.
+  const regenSectionById = useMemo(() => {
+    const m = new Map<string, Section>();
+    if (regenFigState.kind === 'ready') {
+      for (const s of regenFigState.sections) m.set(s.section_id, s);
+    }
+    return m;
+  }, [regenFigState]);
   const banksDetail = questionsState.kind === 'ready' ? questionsState.detail : null;
   const figuresData = figuresState.kind === 'ready' ? figuresState.data : null;
+  // Full Figure[] for the whole book — the SAME prop the extract review
+  // page (ReviewPage) feeds TheoryView. LABELLED theory figures render as
+  // `{t:'fig', label}` blocks that TheoryView resolves to an image via this
+  // `figures` list (figureByLabel → figureImageUrl). Without it, labelled
+  // theory figures fall through to "Figure not available inline". Passing
+  // it makes theory figures render in the regen review identically to the
+  // extract page — no logic, same data source.
+  const allFigures = useMemo(
+    () => (figuresData ? figuresData.sections.flatMap((s) => s.figures) : []),
+    [figuresData],
+  );
 
   const sortBySchema = useCallback(
     (a: Section, b: Section) => {
@@ -832,6 +866,8 @@ export default function RegenReviewPage() {
             <SectionBlock
               key={section.id}
               section={section}
+              regenSection={regenSectionById.get(section.section_id)}
+              allFigures={allFigures}
               topTab={topTab}
               subTab={subTab}
               regenBlocks={regenBlocksBySection[section.section_id]}
@@ -920,6 +956,8 @@ export default function RegenReviewPage() {
 
 function SectionBlock({
   section,
+  regenSection,
+  allFigures,
   topTab,
   subTab,
   regenBlocks,
@@ -935,6 +973,10 @@ function SectionBlock({
   onPreview,
 }: {
   section: Section;
+  regenSection: Section | undefined;
+  // Full book Figure[] — passed straight to TheoryView so labelled theory
+  // `fig` blocks resolve to images (same prop the extract page uses).
+  allFigures: BookFigures['sections'][number]['figures'];
   topTab: TopTab;
   subTab: SubTab;
   regenBlocks: Array<{ t: string; [k: string]: unknown }> | undefined;
@@ -1068,6 +1110,8 @@ function SectionBlock({
         {topTab === 'theory' && (
           <TheoryBody
             section={section}
+            regenSection={regenSection}
+            allFigures={allFigures}
             regenBlocks={regenBlocks}
             subTab={subTab}
           />
@@ -1101,27 +1145,47 @@ function SectionBlock({
 
 function TheoryBody({
   section,
+  regenSection,
+  allFigures,
   regenBlocks,
   subTab,
 }: {
   section: Section;
+  // Same section_id, figures resolved to the regenerated image variant.
+  // Used for the Regenerated tab + Comparison-right column so they show
+  // ↻ regenerated figures while Original/Comparison-left keep originals.
+  // Falls back to `section` (original-variant figures) until the regen
+  // fetch loads.
+  regenSection: Section | undefined;
+  // Full book Figure[] → TheoryView's `figures` prop. Labelled theory
+  // `fig` blocks resolve their image through this (figureByLabel). Same
+  // data the extract review page passes, so theory figures render here
+  // exactly as they do post-extraction.
+  allFigures: BookFigures['sections'][number]['figures'];
   regenBlocks: Array<{ t: string; [k: string]: unknown }> | undefined;
   subTab: SubTab;
 }) {
   const origBlocks = (section.blocks || []) as Array<{ t: string; [k: string]: unknown }>;
   const hasRegen = Array.isArray(regenBlocks) && regenBlocks.length > 0;
+  // Section object whose embedded_figures carry the regenerated image URLs.
+  const regenFigSection = regenSection ?? section;
   // Local alias for TheoryView's Block union — its actual definition is in
   // the TheoryView module; we treat blocks as opaque here.
   type Block = { t: string; [k: string]: unknown };
 
+  // Original tab (or no regen yet): original blocks + original-variant
+  // figures. `section` is the variant=original fetch, so figures here are
+  // always the originals even when a regen image exists.
   if (subTab === 'original' || !hasRegen) {
-    return <TheoryView section={section} hideHeader flat />;
+    return <TheoryView section={section} figures={allFigures} hideHeader flat />;
   }
 
+  // Regenerated tab: regen blocks + regenerated-variant figures.
   if (subTab === 'regenerated') {
     return (
       <TheoryView
-        section={section}
+        section={regenFigSection}
+        figures={allFigures}
         blocksOverride={regenBlocks as Block[]}
         hideHeader
         flat
@@ -1164,6 +1228,7 @@ function TheoryBody({
         </div>
         <TheoryView
           section={section}
+          figures={allFigures}
           blocksOverride={origBlocks as Block[]}
           hideHeader
           flat
@@ -1199,7 +1264,8 @@ function TheoryBody({
           ✨ Regenerated
         </div>
         <TheoryView
-          section={section}
+          section={regenFigSection}
+          figures={allFigures}
           blocksOverride={regenBlocks as Block[]}
           hideHeader
           flat
@@ -1569,6 +1635,16 @@ function QuestionsBody({
 // Per-question content renderer — question text + collapsible SOLUTION
 // (matches the look of QuestionsView.QuestionCard so the compare view is
 // consistent with the regular single-tab view).
+type RegenQEmbeddedFigure = {
+  ref_id: string;
+  label?: string;
+  caption?: string;
+  description?: string;
+  image_url: string;
+  variant?: 'original' | 'regen';
+  body_target?: 'question' | 'solution' | null;
+};
+
 function QuestionContent({
   question,
 }: {
@@ -1576,8 +1652,21 @@ function QuestionContent({
     raw_text?: string;
     has_solution?: boolean;
     solution_text?: string | null;
+    embedded_figures?: RegenQEmbeddedFigure[];
   };
 }) {
+  // Same STRUCTURAL split as the extracted-content question view
+  // (QuestionsView): body_target routes each figure under the question
+  // stem vs inside the solution block. No inference — the data carries its
+  // own routing. NULL body_target (legacy) defaults to the question side.
+  const allFigs = question.embedded_figures ?? [];
+  const figsForQuestion: RegenQEmbeddedFigure[] = [];
+  const figsForSolution: RegenQEmbeddedFigure[] = [];
+  for (const ef of allFigs) {
+    if (ef.body_target === 'solution') figsForSolution.push(ef);
+    else figsForQuestion.push(ef);
+  }
+
   return (
     <>
       <div
@@ -1588,11 +1677,29 @@ function QuestionContent({
         }}
       >
         {question.raw_text ? (
-          <MathMarkdown>{question.raw_text}</MathMarkdown>
+          <MathMarkdown>{stripFigPlaceholders(question.raw_text)}</MathMarkdown>
         ) : (
           <em style={{ color: 'var(--ink-400)' }}>(no text)</em>
         )}
       </div>
+
+      {/* Question-body figures — under the stem, identical card/placement
+          to the extract review page (reuses the exported FigureCard). */}
+      {figsForQuestion.length > 0 && (
+        <div
+          style={{
+            marginTop: 10,
+            display: 'flex',
+            flexDirection: 'column',
+            gap: 10,
+          }}
+        >
+          {figsForQuestion.map((ef) => (
+            <FigureCard key={ef.ref_id} ef={ef} />
+          ))}
+        </div>
+      )}
+
       {question.has_solution && question.solution_text && (
         <details
           style={{
@@ -1628,7 +1735,23 @@ function QuestionContent({
               color: 'var(--ink-800)',
             }}
           >
-            <MathMarkdown>{question.solution_text || ''}</MathMarkdown>
+            <MathMarkdown>{stripFigPlaceholders(question.solution_text || '')}</MathMarkdown>
+            {/* Solution-body figures — inside the solution block, same as
+                the extract review page. */}
+            {figsForSolution.length > 0 && (
+              <div
+                style={{
+                  marginTop: 10,
+                  display: 'flex',
+                  flexDirection: 'column',
+                  gap: 10,
+                }}
+              >
+                {figsForSolution.map((ef) => (
+                  <FigureCard key={ef.ref_id} ef={ef} />
+                ))}
+              </div>
+            )}
           </div>
         </details>
       )}

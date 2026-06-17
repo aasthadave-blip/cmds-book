@@ -246,6 +246,15 @@ def build_link_candidates(
             "placeholder_text": fig.get("figure_label"),
             "page": page,
             "caption": fig.get("caption"),
+            # Preserve Gemini's 2-3 sentence figure description so the
+            # downstream writer can persist it on the Figure row. Without
+            # this, figures_tasks.py:_extract_figures_v2 reads
+            # head.get("description") → None → description column NULL on
+            # every figure (observed today: 0/25 description populated on
+            # the test book despite the writer fix at line 406). The
+            # description is required for UNLABELLED figure placeholder
+            # rendering and for figure regen prompts.
+            "description": fig.get("description"),
             "bounding_box": fig.get("bounding_box"),
             "type": fig.get("type"),
             "raw_context": raw_ctx,

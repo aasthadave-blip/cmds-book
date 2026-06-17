@@ -32,9 +32,20 @@ logger = logging.getLogger(__name__)
 CHECK_INTERVAL_S = 60
 # A running job is stale if its heartbeat (or started_at, when heartbeat is
 # NULL — e.g. a job started before this column existed) is older than this.
-# The Gemini timeout is 150s; a heartbeat is written every 10s. 5 minutes is
-# 30+ missed heartbeats — a confident "this is stuck", not a slow call.
-STALE_AFTER_S = 300
+#
+# Threshold raised 300 → 900s (15 min): the previous 300s was killing
+# legitimate work under concurrent upload pressure. Observed: 2 PDFs
+# uploaded simultaneously → both books fired schema-gen Gemini calls
+# → each call queued behind the 8-slot in-flight semaphore + slower
+# individual Gemini response under contention → schema call took 341s
+# → watchdog killed at 341s (just past 300s threshold) → schema marked
+# failed, user had to click Retry. The Gemini per-call hard timeout is
+# 150s, retries 2x with backoff = 1+2+4 = ~157s + 3×150 = ~607s
+# worst-case for a single section attempt under retries. 15 min covers
+# this plus headroom for queue waits during multi-book contention.
+# True hangs (worker crashed mid-call) still get caught — 15 min of
+# zero heartbeat is unambiguous.
+STALE_AFTER_S = 900
 
 # ORCH Day 11 — how long to wait before force-releasing an
 # extraction_lock_at. Matches MAX orchestrator lock timeout

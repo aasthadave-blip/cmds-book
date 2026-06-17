@@ -289,10 +289,35 @@ function QuestionCard({ q }: { q: ExtractedQuestion }) {
             stripFigPlaceholders removes {{fig:...}} markers first. */}
         <MathMarkdown>{stripFigPlaceholders(q.raw_text || '')}</MathMarkdown>
       </div>
-      {/* Embedded figures — render at the BOTTOM of the question text
-          (closest the UI can get without doing char-offset splicing).
-          Each figure shows its label, image, and caption. */}
-      {(q.embedded_figures ?? []).length > 0 && (
+      {/* Question vs Solution figure split — STRUCTURAL.
+          Embedder writes body_target on every figure_reference:
+            'question' → render under question stem
+            'solution' → render inside solution <details> block
+            null       → default to question (legacy / pre-body_target data)
+          No inference, no string matching, no offset heuristics.
+          The data carries its own routing. */}
+      {(() => {
+        const allFigs = q.embedded_figures ?? [];
+        if (allFigs.length === 0) return null;
+        const figsForQuestion: typeof allFigs = [];
+        const figsForSolution: typeof allFigs = [];
+        for (const ef of allFigs) {
+          if (ef.body_target === 'solution') {
+            figsForSolution.push(ef);
+          } else {
+            figsForQuestion.push(ef);
+          }
+        }
+        // Stash on the parent scope-via-closure pattern. React JSX can't
+        // declare vars, so we render below by reading from these arrays
+        // (closure over render branch).
+        (q as unknown as Record<string, unknown>).__figsQ = figsForQuestion;
+        (q as unknown as Record<string, unknown>).__figsS = figsForSolution;
+        return null;
+      })()}
+
+      {/* Question-body figures render here (under the question text). */}
+      {(((q as unknown as Record<string, unknown>).__figsQ as typeof q.embedded_figures) ?? []).length > 0 && (
         <div
           style={{
             marginTop: 14,
@@ -301,71 +326,8 @@ function QuestionCard({ q }: { q: ExtractedQuestion }) {
             gap: 12,
           }}
         >
-          {(q.embedded_figures ?? []).map((ef) => (
-            <div
-              key={ef.ref_id}
-              style={{
-                border: '1px solid var(--line)',
-                borderRadius: 10,
-                overflow: 'hidden',
-                background: 'var(--surface)',
-              }}
-            >
-              <div
-                style={{
-                  padding: '6px 12px',
-                  fontSize: 11,
-                  fontWeight: 700,
-                  letterSpacing: '0.06em',
-                  color: 'var(--ink-700)',
-                  background: 'var(--surface-2)',
-                  borderBottom: '1px solid var(--line)',
-                  display: 'flex',
-                  alignItems: 'center',
-                  gap: 6,
-                }}
-              >
-                {ef.label || 'Figure'}
-                {ef.variant === 'regen' && (
-                  <span
-                    style={{
-                      fontSize: 10,
-                      color: 'var(--indigo-700)',
-                      fontWeight: 700,
-                    }}
-                  >
-                    ✨ regen
-                  </span>
-                )}
-              </div>
-              <img
-                src={
-                  ef.image_url.startsWith('http')
-                    ? ef.image_url
-                    : `${API_BASE}${ef.image_url}`
-                }
-                alt={ef.caption || ef.label || 'Figure'}
-                style={{
-                  width: '100%',
-                  maxHeight: 360,
-                  objectFit: 'contain',
-                  background: 'var(--surface-2)',
-                  display: 'block',
-                }}
-              />
-              {ef.caption && (
-                <div
-                  style={{
-                    padding: '8px 12px',
-                    fontSize: 12.5,
-                    color: 'var(--ink-700)',
-                    lineHeight: 1.5,
-                  }}
-                >
-                  <MathMarkdown inline>{ef.caption}</MathMarkdown>
-                </div>
-              )}
-            </div>
+          {(((q as unknown as Record<string, unknown>).__figsQ as typeof q.embedded_figures) ?? []).map((ef) => (
+            <FigureCard key={ef.ref_id} ef={ef} />
           ))}
         </div>
       )}
@@ -406,8 +368,107 @@ function QuestionCard({ q }: { q: ExtractedQuestion }) {
           >
             {/* Q5: solution text through MathMarkdown → KaTeX + mhchem */}
             <MathMarkdown>{stripFigPlaceholders(q.solution_text || '')}</MathMarkdown>
+            {/* Solution-only figures rendered INSIDE the solution block
+                (the embedder identified these via PATH 0 placeholder
+                match in solution_text, or body_type=solution). */}
+            {(((q as unknown as Record<string, unknown>).__figsS as typeof q.embedded_figures) ?? []).length > 0 && (
+              <div
+                style={{
+                  marginTop: 12,
+                  display: 'flex',
+                  flexDirection: 'column',
+                  gap: 12,
+                }}
+              >
+                {(((q as unknown as Record<string, unknown>).__figsS as typeof q.embedded_figures) ?? []).map((ef) => (
+                  <FigureCard key={ef.ref_id} ef={ef} />
+                ))}
+              </div>
+            )}
           </div>
         </details>
+      )}
+    </div>
+  );
+}
+
+
+/** Single embedded figure card (label / image / caption / description).
+ *  Used by QuestionsView's question-figure and solution-figure renders. */
+// Exported so the regen review page (RegenReviewPage → QuestionContent)
+// renders question figures with the EXACT same card + placement as the
+// extracted-content question view — figures land in the identical spot
+// (under the stem for body_target=question, inside the solution block for
+// body_target=solution). One component, no divergence.
+export function FigureCard({
+  ef,
+}: {
+  ef: {
+    ref_id: string;
+    label?: string;
+    caption?: string;
+    description?: string;
+    image_url: string;
+    variant?: 'original' | 'regen';
+  };
+}) {
+  return (
+    <div
+      style={{
+        border: '1px solid var(--line)',
+        borderRadius: 10,
+        overflow: 'hidden',
+        background: 'var(--surface)',
+      }}
+    >
+      <div
+        style={{
+          padding: '6px 12px',
+          fontSize: 11,
+          fontWeight: 700,
+          letterSpacing: '0.06em',
+          color: 'var(--ink-700)',
+          background: 'var(--surface-2)',
+          borderBottom: '1px solid var(--line)',
+          display: 'flex',
+          alignItems: 'center',
+          gap: 6,
+        }}
+      >
+        {ef.label || (ef.description ? 'Figure (unlabelled)' : 'Figure')}
+        {ef.variant === 'regen' && (
+          <span style={{ fontSize: 10, color: 'var(--indigo-700)', fontWeight: 700 }}>
+            ✨ regen
+          </span>
+        )}
+      </div>
+      <img
+        src={ef.image_url.startsWith('http') ? ef.image_url : `${API_BASE}${ef.image_url}`}
+        alt={ef.caption || ef.label || ef.description || 'Figure'}
+        style={{
+          width: '100%',
+          maxHeight: 360,
+          objectFit: 'contain',
+          background: 'var(--surface-2)',
+          display: 'block',
+        }}
+      />
+      {(ef.caption || ef.description) && (
+        <div style={{ padding: '8px 12px', fontSize: 12.5, color: 'var(--ink-700)', lineHeight: 1.5 }}>
+          {ef.caption && <MathMarkdown inline>{ef.caption}</MathMarkdown>}
+          {ef.description && (
+            <div
+              style={{
+                fontSize: ef.caption ? 11.5 : 12.5,
+                color: ef.caption ? 'var(--ink-500)' : 'var(--ink-700)',
+                marginTop: ef.caption ? 6 : 0,
+                fontStyle: ef.caption ? 'italic' : 'normal',
+              }}
+            >
+              {ef.description}
+            </div>
+          )}
+        </div>
       )}
     </div>
   );

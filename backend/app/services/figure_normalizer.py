@@ -68,6 +68,11 @@ _UNICODE_TO_NAME: dict[str, str] = {
     "⇒": "Rightarrow", "⇐": "Leftarrow", "⇔": "Leftrightarrow",
     # Misc
     "∞": "infty", "°": "degree",
+    # \circ LaTeX command renders to U+2218 ∘ (RING OPERATOR), distinct
+    # from the U+00B0 ° (DEGREE SIGN) Gemini uses for the visual rendering.
+    # Both must canonicalize to "degree" so "90°" anchor matches
+    # "90^{\circ}" block.
+    "∘": "degree",
 }
 _UNICODE_REPLACE = {ord(k): f" {v} " for k, v in _UNICODE_TO_NAME.items()}
 

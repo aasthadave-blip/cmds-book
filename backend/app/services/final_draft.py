@@ -42,19 +42,86 @@ async def seed_draft_items_from_merge(
     """Build the ordered list of items for a fresh draft.
 
     Mirrors what the Final view shows:
-      - Chips whose target section is in the doc are dropped.
+      - Chips with an in-doc target section render the CHILD SECTION
+        inline at the chip's exact position — a small sub-heading, then
+        the child's blocks, figures, and numbered questions. The child
+        is removed from the standalone section sequence (no duplicate
+        render later) and "consumed" tracking is global.
+      - Chips whose target is missing/already-consumed render as a label
+        pill fallback (no silent drop).
+      - Children referenced by NO chip render at the END of their declared
+        parent (schema order) — never dropped.
       - Section heading echo (first h3 matching section title) is dropped.
       - Embedded figures are interleaved with theory blocks by
         placement_block_idx.
-      - Questions come after the theory body of their section.
+      - Standalone (orphan) questions still come after the theory body.
     """
     doc = await build_final_merge(session, book_id, prefer_regen=prefer_regen)
     section_ids_in_doc: set[str] = {s["section_id"] for s in doc["sections"]}
+    sec_by_id: dict[str, dict[str, Any]] = {
+        s["section_id"]: s for s in doc["sections"]
+    }
     items: list[dict[str, Any]] = []
 
-    for sec in doc["sections"]:
+    # Derive chip-based parent→children mapping. A chip in section X
+    # pointing to in-doc section Y declares Y as a child of X. First
+    # claim wins (cycle guard — a child section can have at most one
+    # parent). Children NOT referenced by any chip fall through to the
+    # top-level emit loop and render in their natural schema position.
+    parent_of_child: dict[str, str] = {}
+    ordered_children_of: dict[str, list[str]] = {}
+    for parent_sec in doc["sections"]:
+        psid = parent_sec["section_id"]
+        for b in (parent_sec.get("blocks") or []):
+            if not _is_chip(b):
+                continue
+            target = (b.get("section_id") or "").strip()
+            if (
+                target
+                and target != psid
+                and target in section_ids_in_doc
+                and target not in parent_of_child
+            ):
+                parent_of_child[target] = psid
+                ordered_children_of.setdefault(psid, []).append(target)
+
+    # Tracks section_ids already emitted via inline-at-chip recursion so
+    # the top-level emit loop skips them (would otherwise duplicate).
+    consumed: set[str] = set()
+
+    def _emit_section(
+        sec: dict[str, Any],
+        *,
+        depth: int,
+        parent_render_level: int = 0,
+    ) -> None:
+        """Emit one section's full content. Recurses on chips to inline
+        child sections; safe against cycles via the `consumed` set.
+
+        Heading level math:
+          - depth == 0 (top-level call from outer loop) → use the
+            section's schema-declared `level` so the doc's natural
+            hierarchy is preserved.
+          - depth >= 1 (inline render at parent's chip position) →
+            render exactly one level under the parent's render level.
+            Decoupling from `sec.level` here protects against schemas
+            where a child's declared level is over-deep relative to its
+            parent (illustrations declared at level 3 nested under a
+            level-2 section would otherwise render as h4; user expects
+            h3 — one level under parent's h2).
+        Capped at h6 so Markdown heading limits aren't exceeded.
+        """
         section_id = sec["section_id"]
+        if section_id in consumed:
+            return
+        consumed.add(section_id)
+
         title = sec.get("section_title") or section_id
+        if depth <= 0:
+            base_level = int(sec.get("level") or 0)
+            level = max(1, min(6, base_level))
+        else:
+            level = max(1, min(6, parent_render_level + 1))
 
         items.append({
             "id": _new_id(),
@@ -62,7 +129,7 @@ async def seed_draft_items_from_merge(
             "parent_section_id": section_id,
             "section_id": section_id,
             "title": title,
-            "level": sec.get("level", 0),
+            "level": level,
             "regen": sec.get("block_source") == "regen",
         })
 
@@ -72,6 +139,42 @@ async def seed_draft_items_from_merge(
         blocks: list[dict[str, Any]] = list(sec.get("blocks") or [])
         figures = list(sec.get("embedded_figures") or [])
         inlined_by_idx = dict(sec.get("inlined_questions_by_block_idx") or {})
+
+        # Helper — emit inlined questions at an anchor key, but for each
+        # question whose `section_ref` points to an in-doc CHILD section,
+        # render the FULL child section in its place (heading + blocks +
+        # remaining questions) at this anchor. This is the real "chip
+        # at exact position" behaviour:
+        #   - The chip blocks themselves are stripped from `blocks` by
+        #     `build_final_merge`'s chip↔question merge before we get
+        #     them, so chip-position can no longer be detected via
+        #     iteration of `blocks`.
+        #   - Instead, the merge anchors one of the child's questions
+        #     into `inlined_by_idx` at the parent's surviving block
+        #     index AT/BEFORE the original chip. That anchor IS the
+        #     chip's position; the migrated question carries the child
+        #     section_ref. We use it as the trigger to inline the
+        #     child here, in place of the migrated question.
+        #   - Multiple inlined questions at the same anchor pointing to
+        #     the same child collapse into one child render (consumed
+        #     tracking prevents duplicate emit).
+        def _emit_inlined_at(anchor_key: str) -> None:
+            for q in inlined_by_idx.get(anchor_key, []):
+                child_ref = (q.get("section_ref") or "").strip()
+                if (
+                    child_ref
+                    and child_ref != section_id
+                    and child_ref in sec_by_id
+                    and child_ref not in consumed
+                ):
+                    _emit_section(sec_by_id[child_ref], depth=depth + 1, parent_render_level=level)
+                    continue
+                items.append({
+                    "id": _new_id(),
+                    "type": "question",
+                    "parent_section_id": section_id,
+                    "question": q,
+                })
 
         if blocks and blocks[0].get("t") == "h3":
             h3_text = (blocks[0].get("c") or "").strip().lower()
@@ -112,22 +215,54 @@ async def seed_draft_items_from_merge(
             else:
                 figures_by_idx.setdefault(int(idx), []).append(f)
 
-        # Inlined questions BEFORE any block (anchor "-1")
-        for q in inlined_by_idx.get("-1", []):
-            items.append({
-                "id": _new_id(),
-                "type": "question",
-                "parent_section_id": section_id,
-                "question": q,
-            })
+        # Inlined questions BEFORE any block (anchor "-1") — each one
+        # gets the child-inlining treatment via `_emit_inlined_at`.
+        _emit_inlined_at("-1")
 
         for i, b in enumerate(blocks):
-            # Drop chips whose target is in the doc (the standalone section
-            # renders separately; the chip is just placeholder noise).
+            # Chip handling — render the TARGET child section's full
+            # content inline at the chip's exact position (small sub-
+            # heading + child's blocks + figures + numbered questions).
+            # The child is added to `consumed` so the outer loop won't
+            # re-emit it as a standalone section. Fallback to a chip
+            # label item when target is missing or already consumed
+            # (cycle / multi-parent guard — never silently drops the
+            # chip's existence).
             if _is_chip(b):
-                target = b.get("section_id")
-                if target and target in section_ids_in_doc:
+                target = (b.get("section_id") or "").strip()
+
+                # Emit any FIGURE anchored at this chip's index regardless
+                # of inline-vs-fallback path — figures placed by the
+                # embedder at the chip's position are not duplicated by
+                # the child-section emit.
+                def _emit_chip_figures() -> None:
+                    for f in figures_by_idx.get(i, []):
+                        items.append({
+                            "id": _new_id(),
+                            "type": "figure",
+                            "parent_section_id": section_id,
+                            "figure": f,
+                        })
+
+                if target and target in sec_by_id and target not in consumed:
+                    # INLINE PATH — render the full child section at the
+                    # chip position. Keep parent-anchored figures.
+                    _emit_section(sec_by_id[target], depth=depth + 1, parent_render_level=level)
+                    _emit_chip_figures()
                     continue
+                # FALLBACK PATH — chip's target missing / already
+                # consumed elsewhere. Emit the chip block (renders as a
+                # label pill on the frontend) + any anchored figures and
+                # inlined questions (child-aware via `_emit_inlined_at`).
+                items.append({
+                    "id": _new_id(),
+                    "type": "block",
+                    "parent_section_id": section_id,
+                    "block": b,
+                })
+                _emit_chip_figures()
+                _emit_inlined_at(str(i))
+                continue
             # Conditional fig-block suppression: drop the theory
             # extractor's `fig` placeholder block when a figure item is
             # already rendering ADJACENT to it (at this index OR the
@@ -161,13 +296,7 @@ async def seed_draft_items_from_merge(
                             "parent_section_id": section_id,
                             "figure": f,
                         })
-                    for q in inlined_by_idx.get(str(i), []):
-                        items.append({
-                            "id": _new_id(),
-                            "type": "question",
-                            "parent_section_id": section_id,
-                            "question": q,
-                        })
+                    _emit_inlined_at(str(i))
                     continue
                 # No adjacent figure → keep the fig block as a visible
                 # placeholder. Fall through to the normal emit-block path.
@@ -184,13 +313,7 @@ async def seed_draft_items_from_merge(
                     "parent_section_id": section_id,
                     "figure": f,
                 })
-            for q in inlined_by_idx.get(str(i), []):
-                items.append({
-                    "id": _new_id(),
-                    "type": "question",
-                    "parent_section_id": section_id,
-                    "question": q,
-                })
+            _emit_inlined_at(str(i))
 
         for f in trailing_figs:
             items.append({
@@ -207,6 +330,26 @@ async def seed_draft_items_from_merge(
                 "parent_section_id": section_id,
                 "question": q,
             })
+
+        # End-of-section trailing children — any section declared as a
+        # child of THIS section (via a chip pointer above) that wasn't
+        # already consumed inline gets emitted here at depth+1. Catches
+        # the case where the schema declares a child but the parent's
+        # theory doesn't carry a chip pointer to it — we still render
+        # it visibly inside its parent, never silently drop. Preserves
+        # chip-declared schema order via `ordered_children_of`.
+        for child_sid in ordered_children_of.get(section_id, []):
+            if child_sid not in consumed and child_sid in sec_by_id:
+                _emit_section(sec_by_id[child_sid], depth=depth + 1, parent_render_level=level)
+
+    # Top-level emit — walk the doc's section order; `_emit_section`
+    # skips any section already pulled in via inline-at-chip recursion
+    # (consumed set is global to this draft seed). Children declared
+    # by chips render under their parents; children declared only by
+    # schema (no chip) render in their natural schema position OR via
+    # the parent's end-of-section trailing emit above.
+    for sec in doc["sections"]:
+        _emit_section(sec, depth=0)
 
     # Emit unattached figures at the END of the items list so they
     # remain visible in Preview / Composer / DOCX / Markdown. These are

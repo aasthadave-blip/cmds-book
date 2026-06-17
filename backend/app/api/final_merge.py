@@ -134,12 +134,13 @@ def _block_to_md(block: dict[str, Any]) -> str:
         label = block.get("label") or ""
         return f"*{label}* {c}".strip()
     if t in ("example_ref", "exercise_ref", "question_ref"):
-        kind = (
-            "Worked example" if t == "example_ref"
-            else "Exercise" if t == "exercise_ref"
-            else "Question"
-        )
-        return f"→ *{kind}: {block.get('label') or block.get('number') or ''}*"
+        # Render the chip label verbatim — no "Worked example: / Exercise: /
+        # Question:" prefix. The label is already the verbatim section title
+        # (e.g. "Self Test 1 (5 Q)", "Illustration 1", "EXAMPLE 9.1") set
+        # by example_linker._label_for, and prepending a generic kind
+        # defeats that intent + diverges from TheoryView rendering, which
+        # also drops the prefix.
+        return f"→ *{block.get('label') or block.get('number') or ''}*"
     return c or ""
 
 

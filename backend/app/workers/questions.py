@@ -370,4 +370,24 @@ def _extract_questions(book_id: str, job_id: str) -> dict:
     return extract_questions_task(None, book_id, job_id)  # type: ignore[arg-type]
 
 
-register_task("extract_questions", _extract_questions)
+# ─── DECOMMISSIONED ──────────────────────────────────────────────────────
+# The v1 question worker is no longer dispatched anywhere. All callers
+# (orchestrator's _dispatch_questions, /api/question_banks dispatch, and
+# main.py orphan recovery) route to extract_questions_v3.
+#
+# The v3 worker (app.workers.questions_v3) carries all today's question
+# improvements: Cat B section skip (the architectural guarantee that
+# theory sections never get scanned for questions), Tier A completeness
+# threshold (1.0), verification loop after Pass-3, wrapper rule for
+# Cat A parents, page-by-page Pass-3 fallback, latex_normalize logging.
+# Keeping v1 registered would silently bypass all of that if any caller
+# accidentally dispatched it.
+#
+# The v1 code is kept in this file for archaeology only — function bodies
+# remain importable so historical tests can still construct rows, but
+# `register_task` is deliberately commented out so the dispatcher cannot
+# reach v1 via the runner. If you ever need to truly resurrect v1, you'd
+# have to consciously re-enable the registration AND update orphan
+# recovery routing — both safety nets agree on "v3 only".
+# register_task("extract_questions", _extract_questions)   # DEAD CODE — do not re-enable
+

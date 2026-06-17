@@ -799,6 +799,24 @@ export function useExtractionPipeline(): UseExtractionPipeline {
                 if (prev.phase !== 'extracting') {
                   patch.phase = 'extracting';
                 }
+              } else if (
+                bstat === 'ready'
+                || bstat === 'extracted'
+                || bstat === 'partial'
+                || bstat === 'approved'
+                || bstat === 'done'
+              ) {
+                // Backend itself reached a TERMINAL state — advance the
+                // client phase directly so "View extracted" / "Start
+                // regeneration" CTAs render WITHOUT waiting for the
+                // tick-level reconcile (whose allTerm check uses stale
+                // prev state due to React's setState batching, costing
+                // one extra polling tick before CTAs appear and feeling
+                // like "needs refresh"). Direct handoff = instant CTAs
+                // the moment the book-poll learns extraction is done.
+                patch.phase = bstat === 'partial' ? 'partial' : 'done';
+              } else if (bstat === 'failed') {
+                patch.phase = 'error';
               }
             }
             return patch;

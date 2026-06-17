@@ -130,6 +130,69 @@ def _select_variant(fig: Figure) -> str:
     return "original"
 
 
+def _block_text_pool(b: Any) -> str:
+    """Flatten EVERY searchable text field of a theory block into one
+    concatenated string for anchor / label matching.
+
+    Covers all block types from the theory extractor schema:
+
+      body / heading / key_point / list_item        → c
+      equation (single)                              → c
+      equation (multi-line)                          → eqs[]
+      definition                                     → term + c
+      figure (placeholder in theory body)            → label + c (caption)
+      table                                          → caption + headers[]
+                                                       + rows[][]
+      example_ref / exercise_ref / question_ref      → label + number
+      generic legacy / future blocks                 → content + ref + items[]
+
+    Without this pool, the embedder's anchor-match only saw block.c —
+    so anchors referring to table cells, equation arrays, ref numbers,
+    or definition terms silently fell through to page_fallback.
+    """
+    if not isinstance(b, dict):
+        return ""
+    parts: list[str] = []
+    # Scalar string fields (every block type's primary text)
+    for k in ("c", "content", "label", "term", "caption", "number", "ref"):
+        v = b.get(k)
+        if isinstance(v, str) and v:
+            parts.append(v)
+        elif isinstance(v, (int, float)):
+            parts.append(str(v))
+    # Multi-line equation array
+    eqs = b.get("eqs")
+    if isinstance(eqs, list):
+        for x in eqs:
+            if isinstance(x, str) and x:
+                parts.append(x)
+    # List items (when stored as array instead of individual list_item blocks)
+    items = b.get("items")
+    if isinstance(items, list):
+        for x in items:
+            if isinstance(x, str) and x:
+                parts.append(x)
+    # Table headers (array of column names)
+    headers = b.get("headers")
+    if isinstance(headers, list):
+        for x in headers:
+            if isinstance(x, str) and x:
+                parts.append(x)
+            elif isinstance(x, (int, float)):
+                parts.append(str(x))
+    # Table rows (2D array of cell values)
+    rows = b.get("rows")
+    if isinstance(rows, list):
+        for row in rows:
+            if isinstance(row, list):
+                for x in row:
+                    if isinstance(x, str) and x:
+                        parts.append(x)
+                    elif isinstance(x, (int, float)):
+                        parts.append(str(x))
+    return " ".join(parts)
+
+
 def _question_body_target(fig: Figure, q: Any) -> tuple[str, int]:
     """F1/F2 — route a question figure into raw_text vs solution_text.
 
@@ -318,14 +381,745 @@ def _pick_label_match(
     return section_id, block_idx
 
 
-# ─── PURE PLACEMENT LOGIC ─────────────────────────────────────────
-# Single source of truth for Pass 1 (labelled) + Pass 2 (unlabelled)
-# figure placement decisions. Called by both the async and sync
-# wrappers below. Pure function — no DB I/O. Eliminates the
-# duplication that previously caused async/sync drift bugs (e.g.
-# bf73339 + 3950df8 had to be fixed in both variants separately).
+# ─── DIFF / UPSERT (debt #44) ─────────────────────────────────────
+# Replaces the legacy wipe-and-rebuild pattern in both wrappers.
+# Compares computed target placements against existing DB rows and
+# emits only the deltas (insert/update/delete). Benefits:
+#   1. Eliminates the 600ms wipe window where API reads return zero
+#      figures (the "figures flicker" symptom on uploads with 6 tail
+#      embedder calls).
+#   2. Preserves user manual placements (link_method='manual') so QA
+#      work survives subsequent embedder runs — debt #55.
+#   3. Preserves is_hidden flag (user-clicked-X stays hidden through
+#      re-embed cycles).
+#   4. Idempotent — re-run with no changes = zero DB writes.
+#
+# Identity key per ref: (figure_id, context, question_id)
+#   figure_id    : the underlying Figure row
+#   context      : 'theory' vs 'question' — dual-context figures have
+#                  TWO refs (one in theory body, one beside its question)
+#   question_id  : distinguishes per-question refs (None for theory)
+
+def _apply_placement_diff(
+    existing_refs: list[FigureReference],
+    target_refs: list[FigureReference],
+) -> tuple[
+    list[FigureReference],
+    list[tuple[FigureReference, FigureReference]],
+    list[FigureReference],
+]:
+    """Diff target placements against existing refs. Returns
+    (to_insert, to_update_pairs, to_delete). Caller persists.
+
+    Preservation rules:
+      - link_method='manual'  → never touched (insert/update/delete)
+      - is_hidden carries across updates
+    """
+    def _key(r):
+        return (r.figure_id, r.context, r.question_id)
+
+    existing_by_key = {_key(r): r for r in existing_refs}
+    target_by_key = {_key(r): r for r in target_refs}
+
+    to_insert: list[FigureReference] = []
+    to_update: list[tuple[FigureReference, FigureReference]] = []
+    to_delete: list[FigureReference] = []
+
+    # New + updated
+    for k, target in target_by_key.items():
+        existing = existing_by_key.get(k)
+        if existing is None:
+            to_insert.append(target)
+            continue
+        if existing.link_method == "manual":
+            # User-placed — never overwrite their decision
+            continue
+        # Compare placement fields
+        if (
+            existing.section_ref != target.section_ref
+            or existing.section_uuid != target.section_uuid
+            or existing.placement_kind != target.placement_kind
+            or existing.placement_block_idx != target.placement_block_idx
+            or existing.placement_char_offset != target.placement_char_offset
+            or existing.placeholder_text != target.placeholder_text
+            or existing.body_target != target.body_target
+        ):
+            to_update.append((existing, target))
+
+    # Removed (existing refs not in target)
+    for k, existing in existing_by_key.items():
+        if k in target_by_key:
+            continue
+        if existing.link_method == "manual":
+            # Computed target dropped it BUT user placed it manually —
+            # preserve. They get a "stale manual placement" badge in
+            # the UI if/when we ship that, but data stays.
+            continue
+        to_delete.append(existing)
+
+    return to_insert, to_update, to_delete
+
+
+def _apply_update(existing: FigureReference, target: FigureReference) -> None:
+    """Copy mutable placement fields from target onto existing in place.
+    Preserves identity (id), is_hidden, created_at. Caller commits."""
+    existing.section_ref = target.section_ref
+    existing.section_uuid = target.section_uuid
+    existing.placement_kind = target.placement_kind
+    existing.placement_block_idx = target.placement_block_idx
+    existing.placement_char_offset = target.placement_char_offset
+    existing.placeholder_text = target.placeholder_text
+    existing.body_target = target.body_target
+    existing.link_method = "auto"  # explicit — this run is from the embedder
+
+
+# ─── DETERMINISTIC TOP-DOWN PLACEMENT (v2) ────────────────────────
+# Replaces the legacy multi-pass _compute_figure_placements_legacy
+# (kept below, deprecated). Same input/output shape so call sites
+# are unchanged. Logic uses the user's stated mental model:
+#
+# For ctx=question figures (labelled OR unlabelled):
+#   Step 0  Identify section (Cat A)
+#   Step 1  Identify question_id  (via question_ref or question_no
+#                                  scoped to section's questions)
+#   Step 2  Identify target text  (body_type "solution" → solution_text,
+#                                  else raw_text)
+#   Step 3  Identify position     (normalized_label match OR anchor_text
+#                                  substring OR append)
+#
+# For ctx=theory figures (labelled OR unlabelled):
+#   Step 0  Identify section (Cat B)
+#   Step 1  Identify block        (label match → cross-section index →
+#                                  anchor_text substring)
+#   Step 2  Position relative to block (above / below per anchor_position)
+#   Step 3  Fallback to page_fallback (section end) if nothing matched
+#
+# Key invariants this enforces:
+#   - EVERY figure produces a FigureReference row (no silent drops).
+#     Unresolvable cases get placement_kind="unattached" with a logged
+#     reason — debt #43 satisfied.
+#   - Per-figure try/except — one bad figure can't crash the whole run.
+#   - Question resolution scoped to the section first (section_uuid →
+#     questions); falls back to bank-wide search only if scoped fails.
+#   - Stem-vs-solution routing actually uses body_type (now populated
+#     after the raw_context fix in figures_tasks.py:_derive_body_type).
 
 def _compute_figure_placements(
+    figures,
+    sections_by_id,
+    questions,
+    questions_by_section,
+    label_index,
+    book_id: UUID,
+):
+    """TOP-DOWN deterministic placement — see module-level comment above."""
+    counters: dict[str, int] = {
+        "figures_seen": 0,
+        "theory_inline": 0,
+        "theory_appended": 0,
+        "question_inline": 0,
+        "question_appended": 0,
+        "unattached": 0,
+        "skipped_no_section": 0,
+        "theory_relinked_by_label": 0,
+        # Per-reason failure tallies — debt #43 observability foundation.
+        "failed_section_not_found": 0,
+        "failed_question_not_found": 0,
+        "failed_exception": 0,
+    }
+    new_refs: list[FigureReference] = []
+    failure_log: list[dict] = []
+
+    # ── helpers ────────────────────────────────────────────────────
+    def _norm_qno(s) -> str:
+        if not s:
+            return ""
+        t = str(s).strip().lower()
+        t = re.sub(r"^q\.?\s*", "", t)   # drop leading "Q" / "q."
+        t = t.strip("().[]{} \t.")
+        return t
+
+    def _resolve_section(fig):
+        """Step 0 — identify the section (slug + Section row).
+
+        Resolution priority (E1 — orphan recovery):
+          1. fig.section_id is set + matches a known section → use it.
+          2. Page-based EXACT match: find section whose [page_start,
+             page_end] contains fig.page_number.
+          3. Page-based NEAREST match: pick section with smallest
+             distance from fig.page_number to its range. Closes the
+             "_orphan" gap when figure_section_resolver couldn't pick
+             the right section but the figure clearly belongs near a
+             specific page (observed: Quadratic Equations had section_id
+             "_orphan" on ~22% of figs; the page_number was always set,
+             schema's section page ranges didn't cleanly cover the page
+             due to extraction quirks).
+          4. Returns (None, None) only when neither slug nor page is
+             available — true orphan, can't be recovered.
+        """
+        sid = (fig.section_id or "").strip()
+        if sid and sid != "_orphan" and sid in sections_by_id:
+            return sid, sections_by_id[sid]
+        page = fig.page_number
+        if page is None:
+            return None, None
+        # Exact page-range match first
+        best_exact: tuple[str, Any] | None = None
+        # Track nearest-by-distance for fallback
+        nearest: tuple[int, str, Any] | None = None
+        for sid_iter, sec_iter in sections_by_id.items():
+            ps = getattr(sec_iter, "page_start", None)
+            pe = getattr(sec_iter, "page_end", None)
+            if not (isinstance(ps, int) and isinstance(pe, int)):
+                continue
+            if ps <= page <= pe:
+                # Exact hit — prefer the section whose range is TIGHTEST
+                # (smallest span). Avoids picking the chapter wrapper
+                # when a tighter subsection also contains the page.
+                span = pe - ps
+                if best_exact is None or span < (
+                    getattr(best_exact[1], "page_end", 0)
+                    - getattr(best_exact[1], "page_start", 0)
+                ):
+                    best_exact = (sid_iter, sec_iter)
+                continue
+            # Compute distance from page to this section's range
+            if page < ps:
+                dist = ps - page
+            else:
+                dist = page - pe
+            if nearest is None or dist < nearest[0]:
+                nearest = (dist, sid_iter, sec_iter)
+        if best_exact is not None:
+            return best_exact
+        if nearest is not None:
+            # Nearest-section recovery — guards against schema page
+            # range gaps. Distance >5 is suspiciously far; still return
+            # but caller can choose to mark for review.
+            return nearest[1], nearest[2]
+        return None, None
+
+    def _find_question(sec_slug: str, identifier: str):
+        """Step 1 for ctx=question — find the question by identifier
+        (question_ref e.g. "Q3" / "Example 5" OR question_no e.g. "3")
+        scoped to the section's questions FIRST, then bank-wide, then
+        section_ref slug suffix as the rescue path.
+
+        Section-scoped lookup avoids false positives when chapters share
+        question numbers (Ch5 Q3 vs Ch6 Q3). Bank-wide is the legacy path
+        kept for cross-section references. Slug-suffix rescue handles the
+        observed prod failure where question_number was empty but
+        section_ref encoded the number ("...-example-9.11" → Q9.11).
+        """
+        want = _norm_qno(identifier)
+        if not want:
+            return None
+        # Section-scoped (correct case)
+        for q in questions_by_section.get(sec_slug, []):
+            if _norm_qno(q.question_number) == want:
+                return q
+        # Bank-wide (legacy / cross-section refs)
+        for q in questions:
+            if _norm_qno(q.question_number) == want:
+                return q
+        # Section_ref slug suffix rescue
+        for q in questions:
+            sref = (q.section_ref or "").lower()
+            if not sref:
+                continue
+            if sref.endswith(f"-example-{want}") or sref.endswith(f"-{want}") or sref.endswith(f"::{want}"):
+                return q
+        return None
+
+    def _emit_unattached(fig, sec_slug, reason: str, ctx: str = "theory"):
+        """Always-emit an unattached ref so no figure goes ref-less. The
+        reason is logged for the per-figure failure log (debt #43)."""
+        counters["unattached"] += 1
+        counters[f"failed_{reason}"] = counters.get(f"failed_{reason}", 0) + 1
+        failure_log.append({
+            "figure_id": str(fig.id),
+            "context_hint": getattr(fig, "context_hint", None),
+            "page": getattr(fig, "page_number", None),
+            "section_id": getattr(fig, "section_id", None),
+            "reason": reason,
+        })
+        return FigureReference(
+            figure_id=fig.id, book_id=book_id,
+            section_ref=sec_slug or fig.section_id or "",
+            context=ctx, question_id=None,
+            placeholder_text=None, link_method="auto",
+            placement_kind="unattached",
+            placement_block_idx=None,
+            placement_char_offset=None,
+        )
+
+    # ── per-figure loop ────────────────────────────────────────────
+    for fig in figures:
+        counters["figures_seen"] += 1
+        try:
+            ctx = (fig.context_hint or "theory").lower()
+            sec_slug, sec_row = _resolve_section(fig)
+
+            normalized_label = (
+                fig.normalized_label
+                or _normalize_label(fig.figure_number)
+                or ""
+            ).strip()
+            label_pattern = (
+                _build_label_pattern(normalized_label)
+                if normalized_label else None
+            )
+            pos_meta = fig.regen_meta if isinstance(fig.regen_meta, dict) else {}
+
+            # ═══════════════════════════════════════════════════════
+            # ctx = question  →  find question, route by body_type
+            # ═══════════════════════════════════════════════════════
+            if ctx == "question":
+                # Step 1: identify question — TOP-DOWN with FOUR paths:
+                #
+                # PATH 0 — PLACEHOLDER MATCH (highest confidence).
+                #          The question worker captures the figure's
+                #          inline position as "{{fig: Figure X.Y}}" or
+                #          "{{fig: (unlabelled diagram) — <desc>}}" in
+                #          question.raw_text or question.solution_text.
+                #          These placeholders are GROUND TRUTH from the
+                #          PDF — they say "Figure 6.15 belongs here in
+                #          this exact question's body or solution."
+                #          We scan all questions for the placeholder
+                #          BEFORE falling back to section_uuid / id paths.
+                #          This corrects for figure_section_resolver
+                #          misassignments where a page hosts multiple
+                #          example sections (observed on Geometry 5 Pgs:
+                #          Page 4 has both Ex 6.1 + Ex 6.2; resolver put
+                #          all page-4 figs on Ex 6.1).
+                #
+                #
+                # PATH A — UUID-direct (catches LABELLED figs without
+                #          question_ref captured). When the figure sits
+                #          in a single-question section (e.g.
+                #          "...-example-6.1") its section_uuid uniquely
+                #          maps to that ONE question. No identifier
+                #          needed. This is the case the labelled-figure
+                #          embedder failed before (Figures 6.15-6.18
+                #          all section_id="...-example-X" but never
+                #          attached because question_ref was missing).
+                #
+                # PATH B — identifier match (current behavior). Gemini
+                #          sets question_ref ("Q3", "Example 5") for
+                #          LABELLED figs and question_no ("3") for
+                #          UNLABELLED. _find_question normalises both.
+                #
+                # PATH C — single-question section by slug ending
+                #          (rescue for legacy data where section_uuid
+                #          might be missing on the figure).
+                q = None
+                # Pre-computed placement from PATH 0 (placeholder match)
+                # — when this fires, body_type is overridden by where the
+                # placeholder was actually found (raw_text vs solution_text)
+                # AND placement_char_offset is pinned to the placeholder's
+                # exact char position (no need to re-scan in Step 3).
+                forced_target = None  # "question" | "solution" | None
+                forced_offset: int | None = None
+
+                # PATH 0: LABELLED QUESTION — find the figure's label
+                # anywhere in any question's raw_text or solution_text
+                # using the SAME canonical matcher the theory PATH uses
+                # (`_build_label_pattern(normalized_label)`). This is the
+                # simple consistent rule: label + content_type → place
+                # wherever the label appears in the appropriate text pool.
+                #
+                # The canonical matcher tolerates:
+                #   - Wrapped placeholder:   `{{fig: Figure 6.16}}`
+                #   - With description:      `{{fig: Figure 6.16 — desc}}`
+                #     (the bug that mis-routed Figure 6.16 → Q 6.1 instead
+                #     of Q 6.2 — exact-needle `{{fig: Figure 6.16}}` missed
+                #     the description suffix)
+                #   - Plain mention:         "see Figure 6.16"
+                #   - Variant prefixes:      "Fig 6.16", "Fig. 6.16",
+                #                            "(Figure 6.16)", "FIGURE 6.16"
+                #   - Number-only key:       matcher is built from
+                #                            `_normalize_label(fig.figure_number)`
+                #                            so format inconsistency between
+                #                            workers ("Figure 6.16" vs
+                #                            "Fig. 6.16") never breaks the
+                #                            match.
+                # Word-boundary safe: pattern for "6.1" will NOT match
+                # inside "6.16" and vice versa.
+                #
+                # Routing semantics preserved:
+                #   raw_text match     → forced_target = "question"
+                #   solution_text match → forced_target = "solution"
+                # raw_text checked first so a label appearing in BOTH
+                # routes to the question stem (the more visible location).
+                if fig.figure_number and normalized_label and label_pattern is not None:
+                    for qq in questions:
+                        if qq.raw_text:
+                            m = label_pattern.search(qq.raw_text)
+                            if m:
+                                q = qq
+                                forced_target = "question"
+                                forced_offset = m.start()
+                                break
+                        if qq.solution_text:
+                            m = label_pattern.search(qq.solution_text)
+                            if m:
+                                q = qq
+                                forced_target = "solution"
+                                forced_offset = m.start()
+                                break
+                else:
+                    # UNLABELLED: structured top-down — no anchor-text
+                    # searching. The figure already carries:
+                    #   context_hint = "question"           (it IS a Q fig)
+                    #   section_uuid                        (which Q section)
+                    #   regen_meta.question_no              (which Q number)
+                    #   body_type = "question" | "solution" (stem vs sol)
+                    # These fields are deterministic. Just look up the Q
+                    # via section_uuid → question_no, then append to the
+                    # right body based on body_type. No string matching.
+                    question_no = (pos_meta.get("question_no") or "").strip()
+                    fig_sec_uuid = getattr(fig, "section_uuid", None)
+
+                    # PRIORITY 1: question_no is the user-facing ground
+                    # truth from Gemini ("this fig belongs to Q 6.4").
+                    # Use it FIRST, even if section_uuid points elsewhere
+                    # — section_uuid can be wrong when figure_section_
+                    # resolver mistakenly grouped figures by page (e.g.
+                    # page 5 has both Ex 6.3 and Ex 6.4; resolver puts
+                    # all p5 figs on Ex 6.3 even though Gemini said 6.4).
+                    if question_no:
+                        want = _norm_qno(question_no)
+                        matches = [
+                            qq for qq in questions
+                            if _norm_qno(qq.question_number) == want
+                        ]
+                        if matches:
+                            q = matches[0]
+
+                    # PRIORITY 2: fallback to section_uuid → single Q.
+                    # Only when no question_no was available.
+                    if q is None and fig_sec_uuid is not None:
+                        matches = [
+                            qq for qq in questions
+                            if qq.section_uuid is not None
+                            and str(qq.section_uuid) == str(fig_sec_uuid)
+                        ]
+                        if len(matches) == 1:
+                            q = matches[0]
+
+                    if q is not None:
+                        # body_type carries which body to append to.
+                        # Default to "question" when missing.
+                        forced_target = (
+                            "solution"
+                            if getattr(fig, "body_type", None) == "solution"
+                            else "question"
+                        )
+                        # forced_offset stays None → Step 3 appends at end
+                        # of the target text.
+
+                # PATH A: section_uuid direct match — single-question section
+                if q is None:
+                    fig_sec_uuid = getattr(fig, "section_uuid", None)
+                    if fig_sec_uuid is not None:
+                        matching_qs = [
+                            qq for qq in questions
+                            if qq.section_uuid is not None
+                            and str(qq.section_uuid) == str(fig_sec_uuid)
+                        ]
+                        if len(matching_qs) == 1:
+                            q = matching_qs[0]
+
+                # PATH B: identifier match
+                if q is None:
+                    identifier = (
+                        pos_meta.get("question_ref")
+                        or pos_meta.get("question_no")
+                        or ""
+                    ).strip()
+                    if identifier:
+                        q = _find_question(sec_slug or "", identifier)
+
+                # PATH C: single-question by section_ref slug
+                if q is None and sec_slug:
+                    same_section_qs = [
+                        qq for qq in questions
+                        if qq.section_ref == sec_slug
+                    ]
+                    if len(same_section_qs) == 1:
+                        q = same_section_qs[0]
+
+                if q is None:
+                    # No question matched after PATH 0 / A / B / C.
+                    # SECTION-END FALLBACK (per "fig should never be lost"
+                    # rule): if we DO know the section the figure belongs
+                    # to, dump it at section end as a theory-context
+                    # page_fallback. The figure stays visible in the UI
+                    # (rendered at the end of its Cat A section, marked
+                    # for human review). Without this fallback the
+                    # figure would land in placement_kind="unattached"
+                    # which the readers FILTER OUT → visible figure loss
+                    # in production (observed on Quadratic Equations:
+                    # 8 question figs invisible because q_no didn't
+                    # resolve).
+                    #
+                    # If section also can't be resolved → true orphan,
+                    # emit unattached (figure has no home at all).
+                    if sec_row is not None:
+                        new_refs.append(FigureReference(
+                            figure_id=fig.id, book_id=book_id,
+                            section_ref=sec_slug or fig.section_id or "",
+                            # context="theory" so the theory-tab reader
+                            # surfaces it; the Question tab reader filters
+                            # by question_id which is None here.
+                            context="theory", question_id=None,
+                            placeholder_text=None, link_method="auto",
+                            placement_kind="page_fallback",
+                            placement_block_idx=None,
+                            placement_char_offset=None,
+                            body_target=None,
+                        ))
+                        counters["theory_appended"] += 1
+                        failure_log.append({
+                            "figure_id": str(fig.id),
+                            "context_hint": "question",
+                            "reason": "question_not_found_section_end_fallback",
+                            "section": sec_slug or fig.section_id,
+                            "page": fig.page_number,
+                        })
+                        continue
+                    # No section either — true orphan
+                    new_refs.append(_emit_unattached(
+                        fig, sec_slug, "question_not_found", ctx="question",
+                    ))
+                    continue
+
+                # Step 2: pick target text. PATH 0 placeholder match wins
+                # (forced_target was set by where the placeholder lived).
+                # Otherwise fall back to body_type from Gemini extraction
+                # (which can be wrong — Figure 6.18 visually in solution
+                # was tagged body_type=solution correctly, but Figure 6.16
+                # in question stem was sometimes mis-tagged as solution).
+                # The placeholder location is ground truth from the PDF.
+                if forced_target is not None:
+                    body_target = forced_target
+                else:
+                    body_target = (
+                        "solution"
+                        if getattr(fig, "body_type", None) == "solution"
+                        else "question"
+                    )
+                target_text = (
+                    q.solution_text if body_target == "solution" else q.raw_text
+                ) or ""
+
+                # Step 3: find position inside target text.
+                # forced_offset from PATH 0 wins — it's the exact placeholder
+                # location, captured during the same search that picked the
+                # question. Skips the re-scan below.
+                offset: int | None = forced_offset
+                if offset is None and label_pattern:
+                    offset = _find_inline_char_offset(target_text, label_pattern)
+                # Anchor_text fallback ONLY when forced_target is None
+                # (i.e., legacy / unmatched cases). For the structured
+                # unlabelled path (forced_target set), we APPEND at the
+                # end of the right body — per user spec: section_type +
+                # question_no + body_type → append. No anchor search.
+                if offset is None and forced_target is None:
+                    anchor = (pos_meta.get("anchor_text") or "").strip()
+                    if anchor and target_text:
+                        # Try strict substring (60-char window, then 30).
+                        for window in (60, 30):
+                            needle = anchor[:window]
+                            if not needle:
+                                break
+                            idx = target_text.find(needle)
+                            if idx >= 0:
+                                offset = idx
+                                break
+
+                placement_kind = "inline" if offset is not None else "appended"
+                placement_char_offset = (
+                    offset if offset is not None else len(target_text)
+                )
+
+                new_refs.append(FigureReference(
+                    figure_id=fig.id, book_id=book_id,
+                    section_ref=(q.section_ref or sec_slug or ""),
+                    context="question", question_id=q.id,
+                    placeholder_text=None, link_method="auto",
+                    placement_kind=placement_kind,
+                    placement_block_idx=None,
+                    placement_char_offset=placement_char_offset,
+                    # Explicit body target — frontend reads this directly
+                    # instead of inferring from char_offset / placeholder
+                    # text. Set from forced_target (PATH 0 placeholder match)
+                    # or body_type (Gemini's classification fallback).
+                    body_target=body_target,
+                ))
+                counters[
+                    "question_inline" if offset is not None else "question_appended"
+                ] += 1
+                continue
+
+            # ═══════════════════════════════════════════════════════
+            # ctx = theory  →  find block in section, position relative
+            # ═══════════════════════════════════════════════════════
+            if sec_row is None:
+                new_refs.append(_emit_unattached(
+                    fig, sec_slug, "section_not_found", ctx="theory",
+                ))
+                continue
+
+            blocks = sec_row.blocks or []
+            block_idx: int | None = None
+            placement_kind = "page_fallback"
+            target_section_slug = sec_slug
+
+            # Step 1a: labelled — try same-section label match first
+            if normalized_label and isinstance(blocks, list) and blocks:
+                block_idx = _find_inline_block_index(
+                    blocks, normalized_label, label_pattern,
+                )
+                if block_idx is not None:
+                    placement_kind = "inline"
+                else:
+                    # Step 1b: cross-section label index rescue
+                    candidates = label_index.get(normalized_label, [])
+                    picked = _pick_label_match(
+                        candidates, fig.page_number, sections_by_id,
+                    )
+                    if picked:
+                        cross_sid, cross_idx = picked
+                        cross_sec = sections_by_id.get(cross_sid)
+                        if cross_sec is not None:
+                            target_section_slug = cross_sid
+                            sec_row = cross_sec
+                            block_idx = cross_idx
+                            placement_kind = (
+                                "inline" if cross_sid == sec_slug
+                                else "label_crosssection"
+                            )
+                            if cross_sid != sec_slug:
+                                counters["theory_relinked_by_label"] += 1
+
+            # Step 1c: unlabelled — anchor_text substring match using the
+            # LaTeX-aware normalizer (figure_normalizer.normalize_for_match).
+            # Anchors arrive as rendered prose ("∠AOB is acute" with
+            # Unicode glyphs); theory blocks store LaTeX source
+            # ("$\\angle AOB$ is acute"). Both sides through the same
+            # pylatexenc-based canonicalizer ("angle aob is acute") so
+            # math-heavy anchors match reliably. Without this, every
+            # anchor with Greek/math/comparison symbols falls through to
+            # page_fallback (this was the silent driver of the 685
+            # page_fallback refs across all books).
+            if block_idx is None:
+                anchor = (pos_meta.get("anchor_text") or "").strip()
+                if anchor and isinstance(blocks, list):
+                    from app.services.figure_normalizer import normalize_for_match
+                    norm_anchor = normalize_for_match(anchor)
+                    # 60-char window with 30-char fallback. The normalizer
+                    # often shortens text (strips punctuation, collapses
+                    # whitespace) so 60 normalized chars ≈ 80-90 raw.
+                    needles = [norm_anchor[:60], norm_anchor[:30]]
+                    if needles[0]:
+                        # Pre-normalize every block's full text pool ONCE
+                        # per section (per-figure was redundant work).
+                        # Covers EVERY block type: body, heading, equation
+                        # (single + multi-line), definition (term + content),
+                        # key_point, figure (label + caption), list_item,
+                        # table (caption + headers + rows), example_ref /
+                        # exercise_ref / question_ref (label + number).
+                        normalized_blocks: list[str] = [
+                            normalize_for_match(_block_text_pool(b))
+                            for b in blocks
+                        ]
+                        for needle in needles:
+                            if not needle:
+                                continue
+                            for i, npool in enumerate(normalized_blocks):
+                                if needle in npool:
+                                    block_idx = i
+                                    placement_kind = "inline"
+                                    break
+                            if block_idx is not None:
+                                break
+
+            # Step 2: positional adjustment for unlabelled
+            if block_idx is not None:
+                anchor_position = (pos_meta.get("anchor_position") or "below").lower()
+                if anchor_position == "above":
+                    final_block_idx = max(0, block_idx - 1)
+                else:  # below / beside / unknown → AFTER the anchor block
+                    final_block_idx = block_idx
+            else:
+                # Step 3: page_fallback — emit at section end so the
+                # figure surfaces SOMEWHERE in its section instead of
+                # being lost in the unattached tray.
+                final_block_idx = None
+                placement_kind = "page_fallback"
+                counters["theory_appended"] += 1
+
+            new_refs.append(FigureReference(
+                figure_id=fig.id, book_id=book_id,
+                section_ref=target_section_slug or fig.section_id or "",
+                context="theory", question_id=None,
+                placeholder_text=None, link_method="auto",
+                placement_kind=placement_kind,
+                placement_block_idx=final_block_idx,
+                placement_char_offset=None,
+            ))
+            if placement_kind != "page_fallback":
+                counters["theory_inline"] += 1
+
+        except Exception as e:
+            # Per-figure try/except — debt #43 observability + zero-drop
+            # invariant. One bad figure shouldn't crash the whole book's
+            # embedder run. Log + emit unattached so the figure isn't
+            # completely lost from the DB.
+            logger.exception(
+                "figure_embedder: per-figure exception on figure=%s: %s",
+                getattr(fig, "id", "?"), e,
+            )
+            counters["failed_exception"] += 1
+            failure_log.append({
+                "figure_id": str(getattr(fig, "id", "?")),
+                "reason": "exception",
+                "error": str(e)[:200],
+            })
+            try:
+                new_refs.append(FigureReference(
+                    figure_id=fig.id, book_id=book_id,
+                    section_ref=getattr(fig, "section_id", "") or "",
+                    context=(fig.context_hint or "theory").lower(),
+                    question_id=None,
+                    placeholder_text=None, link_method="auto",
+                    placement_kind="unattached",
+                    placement_block_idx=None,
+                    placement_char_offset=None,
+                ))
+                counters["unattached"] += 1
+            except Exception:
+                pass  # truly broken figure; counter records it
+
+    # Stash the failure log for caller-side logging / persistence.
+    counters["_failure_log_count"] = len(failure_log)
+    if failure_log:
+        # Log first 10 for visibility without log spam
+        logger.info(
+            "figure_embedder: %d figures could not be placed cleanly. "
+            "First failures: %s",
+            len(failure_log), failure_log[:10],
+        )
+    return new_refs, counters
+
+
+# ─── LEGACY PLACEMENT (kept for reference / fallback) ─────────────
+# Replaced by the top-down v2 above. Kept here in case a regression
+# needs to compare behavior; will be deleted after one session of
+# verifying the new function on real uploads.
+
+def _compute_figure_placements_legacy(
     figures,
     sections_by_id,
     questions,
@@ -1000,10 +1794,13 @@ async def embed_figures_for_book(
         )
     ).scalars().all()
 
-    # Rebuild references from scratch — cleaner than diffing; idempotent.
-    await session.execute(
-        delete(FigureReference).where(FigureReference.book_id == book_id)
-    )
+    # Load existing refs FIRST so we can diff against the target. Replaces
+    # the old wipe-and-rebuild — see debt #44 + _apply_placement_diff.
+    existing_refs = (
+        await session.execute(
+            select(FigureReference).where(FigureReference.book_id == book_id)
+        )
+    ).scalars().all()
 
     label_index = _build_global_label_index(sections)
 
@@ -1013,12 +1810,8 @@ async def embed_figures_for_book(
     )
 
     # Phase 2 of canonical identity migration (CONTRACT.md §1):
-    # stamp every FigureReference with the canonical section UUID. Uses
-    # the same section_ref slug each ref already carries — resolved
-    # once via the in-memory sections_by_id map (no extra DB I/O).
-    # Question-context refs get the question's section_uuid when set
-    # (Phase 2 question writer populates it), otherwise fall back to
-    # the slug-map lookup.
+    # stamp every TARGET FigureReference with the canonical section UUID.
+    # Resolved via the in-memory sections_by_id map (no extra DB I/O).
     section_uuid_by_slug = {slug: sec.id for slug, sec in sections_by_id.items()}
     question_uuid_by_id = {q.id: q.section_uuid for q in questions if q.section_uuid}
     for ref in refs:
@@ -1028,10 +1821,24 @@ async def embed_figures_for_book(
             ref.section_uuid = section_uuid_by_slug[ref.section_ref]
         # else: leave NULL; Phase 4 reader treats this as "unlinked"
 
-    for ref in refs:
+    # ── DIFF / UPSERT (debt #44) ─────────────────────────────────
+    # Apply only the deltas — preserves user manual placements
+    # (link_method='manual'), is_hidden flags, and identity (id).
+    to_insert, to_update, to_delete = _apply_placement_diff(existing_refs, refs)
+    for ref in to_insert:
         session.add(ref)
+    for existing, target in to_update:
+        _apply_update(existing, target)
+    for ref in to_delete:
+        await session.delete(ref)
     await session.flush()
 
+    counters["diff_inserted"] = len(to_insert)
+    counters["diff_updated"] = len(to_update)
+    counters["diff_deleted"] = len(to_delete)
+    counters["diff_preserved_manual"] = sum(
+        1 for r in existing_refs if r.link_method == "manual"
+    )
     logger.info("figure_embedder: book=%s %s", book_id, counters)
     return counters
 
@@ -1079,9 +1886,10 @@ def embed_figures_for_book_sync(session, book_id: UUID) -> dict[str, int]:
         _select(Figure).where(Figure.book_id == book_id)
     ).scalars().all()
 
-    session.execute(
-        _delete(FigureReference).where(FigureReference.book_id == book_id)
-    )
+    # Load existing refs FIRST for diff (replaces wipe-and-rebuild — debt #44)
+    existing_refs = session.execute(
+        _select(FigureReference).where(FigureReference.book_id == book_id)
+    ).scalars().all()
 
     label_index = _build_global_label_index(sections)
 
@@ -1091,7 +1899,7 @@ def embed_figures_for_book_sync(session, book_id: UUID) -> dict[str, int]:
     )
 
     # Phase 2 of canonical identity migration (CONTRACT.md §1):
-    # stamp every FigureReference with the canonical section UUID.
+    # stamp every TARGET FigureReference with the canonical section UUID.
     # Same logic as the async wrapper above — kept inline to avoid
     # async/sync drift.
     section_uuid_by_slug = {slug: sec.id for slug, sec in sections_by_id.items()}
@@ -1102,10 +1910,24 @@ def embed_figures_for_book_sync(session, book_id: UUID) -> dict[str, int]:
         elif ref.section_ref and ref.section_ref in section_uuid_by_slug:
             ref.section_uuid = section_uuid_by_slug[ref.section_ref]
 
-    for ref in refs:
+    # ── DIFF / UPSERT (debt #44) ─────────────────────────────────
+    # Apply only the deltas — preserves user manual placements
+    # (link_method='manual'), is_hidden flags, and identity (id).
+    to_insert, to_update, to_delete = _apply_placement_diff(existing_refs, refs)
+    for ref in to_insert:
         session.add(ref)
+    for existing, target in to_update:
+        _apply_update(existing, target)
+    for ref in to_delete:
+        session.delete(ref)
     session.flush()
 
+    counters["diff_inserted"] = len(to_insert)
+    counters["diff_updated"] = len(to_update)
+    counters["diff_deleted"] = len(to_delete)
+    counters["diff_preserved_manual"] = sum(
+        1 for r in existing_refs if r.link_method == "manual"
+    )
     logger.info("figure_embedder (sync): book=%s %s", book_id, counters)
     return counters
 

@@ -13,6 +13,7 @@ import React from 'react';
 import type { Section } from '../../api/sections';
 import type { Figure } from '../../api/figures';
 import { figureImageUrl } from '../../api/figures';
+import { API_BASE } from '../../api/client';
 import { Icon } from '../Icon';
 import { MathMarkdown } from '../MathMarkdown';
 
@@ -263,9 +264,20 @@ export function TheoryView({
       if (k) figureByLabel.set(k, f);
     }
   }
-  // Also embedded_figures on the Section (set by figure_embedder).
+  // Also embedded_figures on the Section (set by figure_embedder, surfaced
+  // by the canonical figure serializer). This is the SELF-SUFFICIENT path:
+  // every section the API returns carries its own embedded_figures, so a
+  // labelled `{t:'fig'}` block resolves to an image from the section ALONE —
+  // no dependency on the optional `figures` prop. That guarantees figures
+  // render automatically in EVERY caller (extract review, regen review,
+  // future pages) without each one remembering to pass `figures`.
+  //
+  // Key on `label` (the field the serializer emits) FIRST, plus the legacy
+  // figure-row field names so both shapes resolve. The stored object always
+  // exposes `image_url`, which the fig-block renderer uses directly.
   for (const ef of section.embedded_figures ?? []) {
     const candidates = [
+      (ef as unknown as { label?: string }).label,
       (ef as unknown as { normalized_label?: string }).normalized_label,
       (ef as unknown as { figure_number?: string }).figure_number,
       (ef as unknown as { figure_id_text?: string }).figure_id_text,
@@ -292,13 +304,47 @@ export function TheoryView({
     label?: string;
     figure_number?: string;
     caption?: string;
+    // Gemini-extracted 2-3 sentence description. Rendered as placeholder
+    // info for UNLABELLED figures (label + caption both empty). Ensures
+    // every figure has SOMETHING readable describing it, even when the
+    // source PDF didn't print a label or caption.
+    description?: string;
     figure_id?: string;
     ref_id?: string;
   };
   const figuresByBlockIdx = new Map<number, EmbeddedFigure[]>();
+  // Build a set of {t:'fig'} blocks already in the theory body, keyed by
+  // normalized label, so we can suppress an embedded_figure that would
+  // produce a visible duplicate card next to a theory `fig` block already
+  // showing the same caption. Symptom observed today: section
+  // "symmetry-point-symmetry" had a {t:'fig', label:'Figure 6.8'} block
+  // AND embedded ref at the same block_idx → UI rendered the figure
+  // twice (once via the fig block, once via the embedded card).
+  // Reuses module-level normLabel() helper (line 168).
+  const figBlockLabels = new Set<string>();
+  for (const b of (section.blocks ?? []) as Array<{ t?: string; label?: string; c?: string }>) {
+    if (b.t !== 'fig') continue;
+    const lbl = normLabel(b.label) || normLabel(b.c);
+    if (lbl) figBlockLabels.add(lbl);
+  }
+  // Figures the embedder could NOT anchor to a specific block
+  // (placement_block_idx = null — "page_fallback": it knows the figure is
+  // on the section's page but not which block). These have no inline
+  // position, so they render in a trailing group at the end of the section
+  // — nothing the embedder attached during extraction is ever dropped.
+  const trailingFigs: EmbeddedFigure[] = [];
   for (const ef of (section.embedded_figures ?? []) as EmbeddedFigure[]) {
     const idx = ef.placement_block_idx;
-    if (typeof idx !== 'number') continue;
+    // Dedup: if this embedded figure's label matches a {t:'fig'} block
+    // already in the theory body, suppress it — the fig block already
+    // renders the same caption + image via the EmbeddedFigureRender path.
+    const efLabel = normLabel(ef.label) || normLabel(ef.figure_number);
+    if (efLabel && figBlockLabels.has(efLabel)) continue;
+    if (typeof idx !== 'number') {
+      // No block anchor → trailing.
+      trailingFigs.push(ef);
+      continue;
+    }
     const list = figuresByBlockIdx.get(idx) ?? [];
     list.push(ef);
     figuresByBlockIdx.set(idx, list);
@@ -365,6 +411,14 @@ export function TheoryView({
                   <EmbeddedFigureRender key={`embed-${i}-${j}`} ef={ef} />
                 ))}
               </React.Fragment>
+            ))}
+            {/* Trailing figures: embedder attached them to this section but
+                couldn't anchor to a specific block (page_fallback). Render
+                at section end so no extracted figure is dropped. Same
+                EmbeddedFigureRender (image_url) → labelled or unlabelled both
+                show. Identical in extract + regen (one component). */}
+            {trailingFigs.map((ef, j) => (
+              <EmbeddedFigureRender key={`embed-trail-${j}`} ef={ef} />
             ))}
           </div>
         )}
@@ -563,9 +617,31 @@ function BlockRender({
   }
   if (t === 'fig') {
     const b = block as { c?: string; caption?: string; label?: string };
-    // Look up the actual Figure row for inline image rendering.
+    // Look up the resolved figure (full Figure row OR embedded_figure dict).
     const key = normLabel(b.label) || normLabel(b.c);
-    const fig = key ? figureByLabel.get(key) : undefined;
+    const fig = key
+      ? (figureByLabel.get(key) as unknown as {
+          id?: string;
+          image_url?: string;
+          has_original?: boolean;
+          figure_number?: string;
+          caption?: string;
+        } | undefined)
+      : undefined;
+    // Resolve the image URL from EITHER shape, so a labelled fig block
+    // renders its image whether the caller passed the `figures` prop
+    // (full rows → figureImageUrl(id)) OR only the section's
+    // embedded_figures (serializer dicts → image_url). This is what makes
+    // figure rendering self-sufficient + automatic in every caller.
+    const figSrc = fig
+      ? (fig.image_url
+          ? (fig.image_url.startsWith('http')
+              ? fig.image_url
+              : `${API_BASE}${fig.image_url}`)
+          : fig.id
+          ? figureImageUrl(fig.id)
+          : null)
+      : null;
     return (
       <figure
         style={{
@@ -577,7 +653,7 @@ function BlockRender({
           background: 'var(--surface)',
         }}
       >
-        {fig?.has_original ? (
+        {figSrc ? (
           <div
             style={{
               background: 'var(--surface-2)',
@@ -588,8 +664,8 @@ function BlockRender({
             }}
           >
             <img
-              src={figureImageUrl(fig.id)}
-              alt={b.label ?? fig.figure_number ?? b.c ?? 'Figure'}
+              src={figSrc}
+              alt={b.label ?? fig?.figure_number ?? b.c ?? 'Figure'}
               style={{
                 maxWidth: '100%',
                 maxHeight: 360,
@@ -616,18 +692,21 @@ function BlockRender({
           </div>
         )}
         <figcaption style={{ padding: '10px 14px' }}>
-          {(b.label || fig?.figure_number) && (
-            <div
-              style={{
-                fontWeight: 700,
-                color: 'var(--ink-900)',
-                marginBottom: 4,
-                fontSize: 13.5,
-              }}
-            >
-              {b.label ?? fig?.figure_number}
-            </div>
-          )}
+          {/* Heading — labeled fig shows its real label ("Figure 6.5"),
+              unlabeled fig falls back to generic "Figure" so the
+              placeholder is always visually identifiable as a figure
+              slot. Never blank, even for bare fig blocks without
+              caption. */}
+          <div
+            style={{
+              fontWeight: 700,
+              color: 'var(--ink-900)',
+              marginBottom: 4,
+              fontSize: 13.5,
+            }}
+          >
+            {b.label ?? fig?.figure_number ?? 'Figure'}
+          </div>
           {/* Description: read from block's c, then block's caption,
               then the matched Figure row's caption. block_normalizer
               outputs `caption`, so unlabeled figs (caption-only blocks)
@@ -974,6 +1053,9 @@ function EmbeddedFigureRender({
     label?: string;
     figure_number?: string;
     caption?: string;
+    // Gemini-extracted description — rendered as placeholder info for
+    // UNLABELLED figures, as secondary italic text when caption exists.
+    description?: string;
     placement_kind?: string;
     figure_id?: string;
   };
@@ -1029,9 +1111,14 @@ function EmbeddedFigureRender({
           <span>Figure not available inline</span>
         </div>
       )}
-      {(label || ef.caption) && (
+      {(label || ef.caption || ef.description) && (
         <figcaption style={{ padding: '10px 14px' }}>
-          {label && (
+          {/* Header: printed label like "Fig. 5.1" (labelled figs only).
+              UNLABELLED figs have no label/caption — show a soft
+              "Figure (unlabelled)" header so user knows what they're
+              looking at, with the Gemini description below as the
+              human-readable placeholder info. */}
+          {label ? (
             <div
               style={{
                 fontWeight: 700,
@@ -1042,10 +1129,42 @@ function EmbeddedFigureRender({
             >
               {label}
             </div>
+          ) : (
+            !ef.caption && ef.description && (
+              <div
+                style={{
+                  fontWeight: 600,
+                  color: 'var(--ink-500)',
+                  marginBottom: 4,
+                  fontSize: 11,
+                  letterSpacing: '0.06em',
+                  textTransform: 'uppercase',
+                }}
+              >
+                Figure (unlabelled)
+              </div>
+            )
           )}
           {ef.caption && (
             <div style={{ fontSize: 12.5, color: 'var(--ink-700)', lineHeight: 1.5 }}>
               {ef.caption}
+            </div>
+          )}
+          {/* Description: the Gemini-extracted 2-3 sentence summary. Always
+              shown when present BUT styled as secondary info when caption
+              already exists; styled as primary info text when there's no
+              caption (the unlabelled placeholder case). */}
+          {ef.description && (
+            <div
+              style={{
+                fontSize: ef.caption ? 11.5 : 12.5,
+                color: ef.caption ? 'var(--ink-500)' : 'var(--ink-700)',
+                lineHeight: 1.5,
+                marginTop: ef.caption ? 6 : 0,
+                fontStyle: ef.caption ? 'italic' : 'normal',
+              }}
+            >
+              {ef.description}
             </div>
           )}
         </figcaption>

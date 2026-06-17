@@ -143,11 +143,19 @@ def _derive_body_type(cands: list[dict[str, Any]]) -> str | None:
     question-context ref is the cross-reference back to its parent
     question. The embedder uses body_type to pick Question.raw_text vs
     Question.solution_text for placement.
+
+    READS `raw_context`, NOT `context`. The linker collapses Gemini's
+    "solution" into "question" when writing the `context` field (since
+    both route to context=question FigureReferences downstream). The
+    original Gemini classification is preserved in `raw_context`. Reading
+    `context` here would mean every solution figure becomes body_type=
+    "question" — that's the bug that left 98% of figures with NULL
+    body_type and broke the embedder's stem-vs-solution routing.
     """
-    contexts = {c.get("context") for c in cands if c.get("context")}
-    if "solution" in contexts:
+    raw = {c.get("raw_context") for c in cands if c.get("raw_context")}
+    if "solution" in raw:
         return "solution"
-    if "question" in contexts:
+    if "question" in raw:
         return "question"
     return None
 
@@ -403,7 +411,16 @@ def _extract_figures_v2_impl(book_id: str, job_id: str) -> dict[str, Any]:
                 section_uuid=primary_section_uuid,  # Phase 2: canonical FK
                 figure_number=head.get("placeholder_text"),
                 caption=head.get("caption"),
-                description=None,
+                # Persist description from Gemini extraction (was hardcoded
+                # to None — silently dropped on every book). The
+                # figure_extractor prompt asks Gemini for a 2-3 sentence
+                # description of every figure; we need it for:
+                #   (a) Frontend placeholder rendering on UNLABELLED figures
+                #       (no figure_number / caption → description is the only
+                #       human-readable info we can show)
+                #   (b) Figure regen prompt (figure_regenerator.txt:14 reads
+                #       {description} — always empty before this fix)
+                description=head.get("description"),
                 page_number=head.get("page"),
                 bounding_box=head.get("bounding_box"),
                 semantic_type=head.get("type") or "other",

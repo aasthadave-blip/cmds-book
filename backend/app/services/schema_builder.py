@@ -427,6 +427,54 @@ def build_schema(
                     cat_a_report.positional_skipped_no_text,
                 )
 
+            # ── DETERMINISTIC PAGE ANCHOR (Task 1 Pass 2) ─────────────
+            # Replace Gemini-emitted page ranges with PDF-grounded values
+            # computed deterministically (pypdf + title match, no LLM).
+            # Closes the bug class where Gemini sets every section to
+            # page_start=page_end=N (Integrals: every section page=6,
+            # missing ~50 questions because the worker scanned 1 page).
+            #
+            # Runs AFTER content-shape sanitizers (Cat A nesting, etc.)
+            # so the tree is final, and BEFORE the validator so it sees
+            # real pages. Idempotent + skipped for scanned PDFs.
+            try:
+                from app.schemas.analyser import BookSchema as _BSch
+                from app.services.schema_page_anchor import anchor_pages_from_pdf
+                _provisional_schema = _BSch(**data)
+                _anchored, anchor_report = anchor_pages_from_pdf(
+                    _provisional_schema, pdf_bytes,
+                )
+                if anchor_report.skipped_no_text:
+                    logger.info(
+                        "schema_page_anchor: skipped (scanned PDF, no pypdf text)"
+                    )
+                else:
+                    logger.info(
+                        "schema_page_anchor (attempt %s): walked=%d anchored=%d "
+                        "confirmed=%d repaired=%d phantoms=%d overlaps=%d",
+                        attempt,
+                        anchor_report.total_sections,
+                        anchor_report.anchored,
+                        anchor_report.confirmed,
+                        anchor_report.repaired,
+                        len(anchor_report.phantoms),
+                        len(anchor_report.sibling_overlap_warnings),
+                    )
+                    if anchor_report.phantoms:
+                        logger.warning(
+                            "schema_page_anchor: %d phantom section(s) (title not "
+                            "found in PDF text — kept Gemini's page values): %s",
+                            len(anchor_report.phantoms),
+                            anchor_report.phantoms[:10],
+                        )
+                    # Mutated in place. Persist back into `data` dict for
+                    # the remaining validator/postpass passes.
+                    data = _anchored.model_dump()
+            except Exception as e:
+                logger.warning(
+                    "schema_page_anchor failed (continuing with Gemini pages): %s", e
+                )
+
             # SCHEMA Day 3: hard validation BEFORE accepting the schema.
             # If errors found, save them for the next attempt's corrective
             # prompt and retry.

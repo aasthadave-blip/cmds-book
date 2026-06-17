@@ -217,17 +217,44 @@ async def _do_recover_orphaned_jobs() -> None:
         from datetime import datetime, timedelta, timezone
         # Recover:
         # 1. Jobs that were queued but never started (started_at IS NULL) — thread died before launch
-        # 2. Jobs stuck "running" for more than 35 minutes (past the task time limit) — hard crash
-        stale_cutoff = datetime.now(timezone.utc) - timedelta(minutes=35)
+        # 2. Jobs stuck "running" whose heartbeat went silent — worker hung/crashed.
+        #
+        # Heartbeat-driven recovery (was started_at-driven, 35 min cutoff).
+        # Background: the old logic only recovered jobs that started > 35
+        # min ago, which left a 0-35 min "stuck" window after every backend
+        # restart in dev mode (uvicorn --reload). Books showed "extracting"
+        # in UI while no worker was alive. The watchdog catches it
+        # eventually (now at 900s = 15 min), but a backend restart should
+        # recover immediately — every previously-running inline job IS
+        # dead the moment the process restarts.
+        #
+        # New rule: a job is orphaned when its last_heartbeat_at is stale
+        # by > 5 min (300s). Live workers beat every 10s, so 5 min of
+        # silence is unambiguous death — well within the watchdog's
+        # 15 min window. Jobs without a heartbeat field at all (legacy)
+        # fall back to the started_at check.
+        heartbeat_cutoff = datetime.now(timezone.utc) - timedelta(minutes=5)
+        legacy_started_cutoff = datetime.now(timezone.utc) - timedelta(minutes=5)
         orphans = session.execute(
             select(Job).where(
                 Job.status.in_(["queued", "running"]),
                 Job.finished_at.is_(None),
                 Job.book_id.isnot(None),
             ).filter(
-                # never started OR running too long (stale)
+                # Never started (queued, thread died pre-launch)
                 (Job.started_at.is_(None)) |
-                (Job.started_at < stale_cutoff)
+                # Heartbeat went silent > 5 min — worker dead
+                (
+                    Job.last_heartbeat_at.isnot(None) &
+                    (Job.last_heartbeat_at < heartbeat_cutoff)
+                ) |
+                # Legacy fallback: no heartbeat column populated AND
+                # started long ago — treat as dead.
+                (
+                    Job.last_heartbeat_at.is_(None) &
+                    Job.started_at.isnot(None) &
+                    (Job.started_at < legacy_started_cutoff)
+                )
             )
         ).scalars().all()
 
@@ -330,11 +357,14 @@ async def _do_recover_orphaned_jobs() -> None:
                         recovered_section_ids,
                     )
 
-                elif job.type == "extract_figures":
-                    dispatch("extract_figures", str(book.id), str(job.id))
-
-                elif job.type == "extract_figures_v2":
-                    # Figures pipeline v2 — new package at app/services/figures
+                elif job.type == "extract_figures" or job.type == "extract_figures_v2":
+                    # Both legacy 'extract_figures' (orchestrator creates this
+                    # type name for UI compatibility) AND 'extract_figures_v2'
+                    # always route to the v2 task. The v1 task path is dead —
+                    # v2 has the full PATH 0/A/B/C placement chain, the body_
+                    # target routing, the diff/upsert, the pylatexenc anchor
+                    # normalizer, and all today's improvements. Routing to v1
+                    # would silently bypass all of that.
                     dispatch("extract_figures_v2", str(book.id), str(job.id))
 
                 elif job.type == "regenerate_figures_v2_section":
@@ -352,11 +382,38 @@ async def _do_recover_orphaned_jobs() -> None:
                 elif job.type == "regen_figures":
                     dispatch("regenerate_figures", str(book.id), str(job.id))
 
-                elif job.type == "extract_questions":
-                    dispatch("extract_questions", str(book.id), str(job.id))
-
-                elif job.type == "extract_questions_v2":
-                    dispatch("extract_questions_v2", str(book.id), str(job.id))
+                elif job.type in ("extract_questions", "extract_questions_v2"):
+                    # Both legacy job-type names route to the v3 task. The
+                    # orchestrator creates jobs with type='extract_questions'
+                    # for UI compat but always dispatches the v3 task; for
+                    # orphan recovery we must do the same routing so today's
+                    # v3-only fixes (Cat B skip, Tier A threshold, wrapper
+                    # rule, verification loop, page-by-page Pass 3 fallback)
+                    # are NEVER bypassed by a recovered job. The v1 worker
+                    # is being decommissioned at the same time as this fix.
+                    #
+                    # v3 needs the bank_id which is NOT stored on the Job
+                    # row — look up the latest QuestionBank for this book.
+                    from app.models.question_bank import QuestionBank as _QB
+                    latest_bank = session.execute(
+                        select(_QB)
+                        .where(_QB.book_id == book.id)
+                        .order_by(_QB.created_at.desc())
+                    ).scalars().first()
+                    if latest_bank is None:
+                        job.status = "failed"
+                        job.error = (
+                            "Question worker recovery: no QuestionBank "
+                            "row found for book — cannot recover. Click "
+                            "Re-extract to start fresh."
+                        )
+                        session.commit()
+                        skipped += 1
+                        continue
+                    dispatch(
+                        "extract_questions_v3",
+                        str(book.id), str(latest_bank.id), str(job.id),
+                    )
 
                 elif job.type == "extract_questions_v3":
                     # v3 needs the bank_id which is not on the Job row — skip

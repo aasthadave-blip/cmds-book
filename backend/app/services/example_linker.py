@@ -93,6 +93,137 @@ def _split_question_id(section_id: str) -> tuple[str, str, str] | None:
     return None
 
 
+def _build_expected_qcount_map(schema: dict | None) -> dict[str, int]:
+    """Return {section_id: expected_question_count} from the schema.
+
+    Used by chip-label rendering to append "(N Q)" to chip labels so
+    reviewers see how many questions live under each Cat A section
+    without expanding it. Walks both sections[] and excluded_sections[]
+    recursively.
+    """
+    out: dict[str, int] = {}
+    if not schema or not isinstance(schema, dict):
+        return out
+
+    def walk(nodes) -> None:
+        if not isinstance(nodes, list):
+            return
+        for n in nodes:
+            if not isinstance(n, dict):
+                continue
+            sid = n.get("id")
+            if isinstance(sid, str):
+                try:
+                    eqc = int(n.get("expected_question_count") or 0)
+                except (TypeError, ValueError):
+                    eqc = 0
+                if eqc > 0:
+                    out[sid] = eqc
+            walk(n.get("subsections") or [])
+
+    walk(schema.get("sections") or [])
+    walk(schema.get("excluded_sections") or [])
+    return out
+
+
+def _build_cat_a_set_from_schema(schema: dict | None) -> set[str]:
+    """Return every Cat A section_id from the schema (any depth).
+
+    Cat A = content_types includes 'questions'. This is the SCHEMA's own
+    declaration — what the analyser identified as a question section,
+    regardless of how its slug got generated. We use this so chip
+    injection covers ANY Cat A node — including ones whose section_id
+    doesn't match the `_QUESTION_KINDS` slug convention
+    (e.g. "electricity-l-level-2-review-your-concepts", "practice-set",
+    "intext-questions", custom-named Cat A sections from any book).
+
+    Before this, the linker only injected chips when the slug matched
+    a hardcoded kind list — so any Cat A section with an off-pattern
+    slug silently got no chip in its parent theory. Schema-driven
+    detection closes that gap.
+    """
+    out: set[str] = set()
+    if not schema or not isinstance(schema, dict):
+        return out
+
+    def walk(nodes) -> None:
+        if not isinstance(nodes, list):
+            return
+        for n in nodes:
+            if not isinstance(n, dict):
+                continue
+            sid = n.get("id")
+            ct = n.get("content_types") or []
+            ct_norm = {str(c).lower() for c in ct} if isinstance(ct, list) else set()
+            if isinstance(sid, str) and "questions" in ct_norm:
+                out.add(sid)
+            walk(n.get("subsections") or [])
+
+    walk(schema.get("sections") or [])
+    return out
+
+
+def _kind_from_title(title: str) -> str:
+    """Best-effort kind classification when the section_id slug doesn't tell
+    us. Used for Cat A sections discovered via schema (not via slug regex).
+
+    Returns one of the _QUESTION_KINDS values. Used downstream by
+    `_label_for` and `_inject_ref` to pick the chip type + label format.
+    """
+    t = (title or "").lower()
+    if "worked example" in t or "solved example" in t:
+        return "example"
+    if "example" in t:
+        return "example"
+    if "exercise" in t or "problem" in t or "practice" in t:
+        return "exercise"
+    if "intext" in t or "in-text" in t or "in text" in t:
+        return "in-text-question"
+    # Generic Cat A — review, level, try-it, quick-check, etc.
+    return "in-text-question"
+
+
+def _resolve_chip_target(
+    section_id: str,
+    title: str,
+    cat_a_set: set[str],
+    schema_parent_map: dict[str, str],
+) -> tuple[str, str, str] | None:
+    """Return (parent_id, kind, num) for a section that should get a chip
+    injected into its parent theory section, OR None if it doesn't qualify.
+
+    Resolution order (matches user's rule "any Cat A section, slug can be
+    anything"):
+      1. Slug-based: section_id parses as a question-kind child via
+         `_split_question_id` → use that result (existing behavior).
+      2. Schema-based: section_id is in the schema's Cat A set →
+         derive parent from `schema_parent_map`, derive kind from title.
+
+    `num` is empty string for schema-based hits with no obvious numeric
+    suffix; `_label_for` falls back to the section title verbatim in that
+    case (which is what we want for "Level 2: Review Your Concepts" etc.).
+    """
+    # 1. Slug-based path (legacy + still correct when slug matches).
+    parsed = _split_question_id(section_id)
+    if parsed is not None:
+        return parsed
+
+    # 2. Schema-based path — catches "any Cat A section, any name".
+    if section_id not in cat_a_set:
+        return None
+    parent_id = schema_parent_map.get(section_id)
+    if not parent_id:
+        # Schema knows this is Cat A but has no parent for it. Likely a
+        # top-level Cat A — no theory section to attach a chip to. Skip
+        # without warning; this is normal for chapter-level question-only
+        # nodes.
+        return None
+    kind = _kind_from_title(title)
+    # No numeric suffix available — caller's _label_for falls back to the
+    # full title which is what we want for off-pattern Cat A sections.
+    return (parent_id, kind, "")
+
+
 def _build_parent_map_from_schema(schema: dict | None) -> dict[str, str]:
     """Walk the live book.schema_ tree and return {child_section_id:
     parent_section_id} for every child.
@@ -154,22 +285,34 @@ def _num_sort_key(num: str) -> tuple:
     return tuple(parts)
 
 
-def _label_for(section_title: str, num: str, kind: str = "example") -> str:
+def _label_for(
+    section_title: str,
+    num: str,
+    kind: str = "example",
+    expected_question_count: int | None = None,
+) -> str:
     """Build the label shown on the touchpoint chip.
 
-    Prefers the section's own title verbatim when it matches a canonical
-    question label (e.g. "EXAMPLE 9.1", "Exercise 1.1", "Problem 5"). Falls
-    back to "<Kind Title> <num>" if the title doesn't look canonical.
+    Returns the section title VERBATIM (per user's "exact section name"
+    rule). Previously this fell back to "<Kind> <num>" for any title that
+    didn't start with one of the canonical kind keywords — which produced
+    chips labelled "Example 1" for sections actually titled "Self Test 1"
+    or "Illustration 1". The schema is the source of truth; use the title
+    as the user (and the book) sees it.
+
+    If the section's schema has `expected_question_count > 0`, append
+    "(N Q)" so the reviewer knows how many questions live under the chip
+    without expanding it.
     """
     t = (section_title or "").strip()
-    if re.match(
-        r"(?i)^(example|worked\s+example|solved\s+example|exercise|problem|practice\s+problem|in[-\s]?text\s+question)\b",
-        t,
-    ):
-        return t
-    # Fall back to the kind keyword title-cased + num.
-    pretty = kind.replace("-", " ").title()
-    return f"{pretty} {num}".strip()
+    if not t:
+        # Defensive fallback when title is missing (legacy / malformed
+        # schemas). Use kind + num so the chip at least renders.
+        pretty = kind.replace("-", " ").title()
+        t = f"{pretty} {num}".strip() or "Section"
+    if expected_question_count and expected_question_count > 0:
+        return f"{t} ({expected_question_count} Q)"
+    return t
 
 
 def _label_pattern(label: str) -> re.Pattern[str]:
@@ -262,8 +405,12 @@ async def link_examples_to_theory(
     # Load the book so we can read its current schema tree
     book = await session.get(Book, book_id)
     schema_parent_map: dict[str, str] = {}
+    cat_a_set: set[str] = set()
+    eqc_map: dict[str, int] = {}
     if book is not None and book.schema is not None:
         schema_parent_map = _build_parent_map_from_schema(book.schema)
+        cat_a_set = _build_cat_a_set_from_schema(book.schema)
+        eqc_map = _build_expected_qcount_map(book.schema)
 
     sections = (
         await session.execute(
@@ -292,16 +439,23 @@ async def link_examples_to_theory(
     # Process children in (parent_id, numeric question number) order so
     # appended chips on a given parent end up in 1.1 → 1.2 → 1.10 order
     # instead of whatever order SQL returned the rows in.
+    #
+    # Resolution covers BOTH paths now: slug-based (existing _QUESTION_KINDS
+    # match) AND schema-based (any Cat A section in the schema, regardless of
+    # slug). The user's rule: "any Cat A section, slug can be anything, if
+    # it's between theory sections it should attach as a chip."
     children_with_parsed: list[tuple[Section, str, str, str]] = []
     for c in sections:
-        parsed = _split_question_id(c.section_id)
-        if parsed is None:
+        resolved = _resolve_chip_target(
+            c.section_id, c.title or "", cat_a_set, schema_parent_map,
+        )
+        if resolved is None:
             continue
-        # parsed = (id_parent_id, kind, num). Live-schema tree wins over
-        # the ID-derived parent so manual drag-drop in the schema editor
-        # moves the chip to the new parent.
-        effective_parent = schema_parent_map.get(c.section_id) or parsed[0]
-        children_with_parsed.append((c, effective_parent, parsed[1], parsed[2]))
+        id_parent, kind, num = resolved
+        # Live-schema tree wins over the ID-derived parent so manual
+        # drag-drop in the schema editor moves the chip to the new parent.
+        effective_parent = schema_parent_map.get(c.section_id) or id_parent
+        children_with_parsed.append((c, effective_parent, kind, num))
     children_with_parsed.sort(key=lambda t: (t[1], _num_sort_key(t[3])))
 
     # Strip any old chips for these children from EVERY parent before
@@ -327,15 +481,23 @@ async def link_examples_to_theory(
             n_skipped_no_parent += 1
             continue
 
-        # Skip injecting chips into a parent that is ITSELF a question-kind
-        # section (Exercise/Example/Problem etc). The user's rule: theory
-        # sections get a single chip pointing to the parent exercise, NOT
-        # 20 individual question-level chips inside that exercise. Those
-        # questions get rendered by the question extraction pipeline.
-        if _split_question_id(parent.section_id) is not None:
+        # Skip injecting chips into a parent that is ITSELF a Cat A section
+        # (whether the slug matches a question-kind regex OR the schema
+        # explicitly marks it Cat A). User's rule: theory sections get a
+        # single chip pointing to a child Cat A; Cat A sections themselves
+        # have their content rendered via the question pipeline, NOT as
+        # nested chips. Schema-aware check covers off-pattern slugs.
+        parent_is_cat_a = (
+            _split_question_id(parent.section_id) is not None
+            or parent.section_id in cat_a_set
+        )
+        if parent_is_cat_a:
             continue
 
-        label = _label_for(child.title or "", num, kind=kind)
+        label = _label_for(
+            child.title or "", num, kind=kind,
+            expected_question_count=eqc_map.get(child.section_id),
+        )
         question_id = questions_by_section.get(child.section_id)
 
         new_blocks, mode = _inject_ref(
@@ -380,8 +542,12 @@ def link_examples_to_theory_sync(session, book_id: UUID) -> dict:
 
     book = session.get(_Book, book_id)
     schema_parent_map: dict[str, str] = {}
+    cat_a_set: set[str] = set()
+    eqc_map: dict[str, int] = {}
     if book is not None and book.schema is not None:
         schema_parent_map = _build_parent_map_from_schema(book.schema)
+        cat_a_set = _build_cat_a_set_from_schema(book.schema)
+        eqc_map = _build_expected_qcount_map(book.schema)
 
     sections = session.execute(
         _select(Section).where(Section.book_id == book_id)
@@ -408,16 +574,18 @@ def link_examples_to_theory_sync(session, book_id: UUID) -> dict:
     # Process children in (parent_id, numeric question number) order so
     # appended chips on a given parent end up in 1.1 → 1.2 → 1.10 order
     # instead of whatever order SQL returned the rows in.
+    # Schema-driven chip eligibility — see _resolve_chip_target docstring.
+    # Covers both slug-matched + schema-only Cat A sections.
     children_with_parsed: list[tuple[Section, str, str, str]] = []
     for c in sections:
-        parsed = _split_question_id(c.section_id)
-        if parsed is None:
+        resolved = _resolve_chip_target(
+            c.section_id, c.title or "", cat_a_set, schema_parent_map,
+        )
+        if resolved is None:
             continue
-        # parsed = (id_parent_id, kind, num). Live-schema tree wins over
-        # the ID-derived parent so manual drag-drop in the schema editor
-        # moves the chip to the new parent.
-        effective_parent = schema_parent_map.get(c.section_id) or parsed[0]
-        children_with_parsed.append((c, effective_parent, parsed[1], parsed[2]))
+        id_parent, kind, num = resolved
+        effective_parent = schema_parent_map.get(c.section_id) or id_parent
+        children_with_parsed.append((c, effective_parent, kind, num))
     children_with_parsed.sort(key=lambda t: (t[1], _num_sort_key(t[3])))
 
     # Strip any old chips for these children from EVERY parent before
@@ -443,15 +611,21 @@ def link_examples_to_theory_sync(session, book_id: UUID) -> dict:
             n_skipped_no_parent += 1
             continue
 
-        # Skip injecting chips into a parent that is ITSELF a question-kind
-        # section (Exercise/Example/Problem etc). The user's rule: theory
-        # sections get a single chip pointing to the parent exercise, NOT
-        # 20 individual question-level chips inside that exercise. Those
-        # questions get rendered by the question extraction pipeline.
-        if _split_question_id(parent.section_id) is not None:
+        # Skip injecting chips into a parent that is ITSELF a Cat A section
+        # (slug-matched OR schema-marked). User's rule: theory sections get
+        # chips pointing to Cat A children; Cat A sections render via the
+        # question pipeline. Schema-aware check covers off-pattern slugs.
+        parent_is_cat_a = (
+            _split_question_id(parent.section_id) is not None
+            or parent.section_id in cat_a_set
+        )
+        if parent_is_cat_a:
             continue
 
-        label = _label_for(child.title or "", num, kind=kind)
+        label = _label_for(
+            child.title or "", num, kind=kind,
+            expected_question_count=eqc_map.get(child.section_id),
+        )
         question_id = questions_by_section.get(child.section_id)
 
         new_blocks, mode = _inject_ref(

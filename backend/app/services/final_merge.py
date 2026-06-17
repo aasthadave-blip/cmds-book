@@ -1241,7 +1241,58 @@ async def build_final_merge(
             and sid in consumed_qids_by_origin
             and not kept_questions
         ):
-            continue
+            # Original drop reason: a worked-example subsection whose
+            # only question got hoisted to its parent via chip-match
+            # would otherwise render twice — once as the inlined Q in
+            # the parent's flow, once as a standalone section here with
+            # its own blocks (which typically duplicate the solution
+            # prose). Dropping the section eliminates the visible
+            # duplicate body.
+            #
+            # BUT — when the subsection has NO blocks AND NO embedded
+            # figures (illustration-style chip-only Cat A children:
+            # title + 1 question, nothing else printed), keeping it as
+            # a heading-only stub costs nothing in the markdown/JSON
+            # exporters (they emit just the heading line) and lets
+            # final_draft.seed_draft_items_from_merge render a uniform
+            # sub-heading at the parent's chip position. Without the
+            # stub, single-Q children render as bare questions while
+            # multi-Q children get a clean sub-heading — visually
+            # inconsistent in Preview/Composer.
+            # Body = theory blocks only. Embedded figures are NOT body
+            # here — a page_fallback figure attached to an
+            # illustration-style chip-only Cat A child (no blocks of
+            # its own) belongs to the child's render flow; without it
+            # the figure is lost entirely (the question itself doesn't
+            # always carry the figure when placement_kind=page_fallback).
+            # We keep the figures on the stub so they render under the
+            # child's sub-heading; the original "drop duplicate body"
+            # rationale only applies when the child actually has
+            # theory blocks that would duplicate the parent's flow.
+            has_body = bool(s.get("blocks"))
+            if has_body:
+                continue
+            # Heading-only stub: preserve section_id / title / level /
+            # embedded_figures metadata; empty blocks so no duplicate
+            # render of any theory body. Restore THIS section's own
+            # questions (those whose origin == sid) onto the stub even
+            # though they were consumed via parent chip — the downstream
+            # renderer (final_draft._emit_inlined_at) REPLACES the
+            # parent's inlined Q with a recursive child render, so the
+            # Q's content must live inside the child or it's silently
+            # lost. The parent's anchor still carries the Q (used only
+            # as the trigger to inline this child); the Q itself only
+            # actually emits once — inside the child section.
+            s["blocks"] = []
+            restored_qs: list[dict[str, Any]] = []
+            for q in own_questions:
+                q_origin = q.get("_origin_section_id")
+                if q_origin and q_origin != sid:
+                    continue  # don't restore borrowed-from-descendant Qs
+                restored_qs.append(
+                    {k: v for k, v in q.items() if k != "_origin_section_id"}
+                )
+            s["questions"] = restored_qs
 
         # F8 extension — also drop a worked-example subsection that
         # consumed its OWN chip within itself. The chip-merge inlined the

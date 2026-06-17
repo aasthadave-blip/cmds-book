@@ -73,7 +73,16 @@ MAX_OUTPUT_TOKENS = 65536
 # its schema-declared expected_question_count. Incomplete units get a bounded
 # number of full re-scan retries (separate budget from the existing Q3 targeted
 # retry and Q1/Q2 post-passes) before we accept the gap and record it.
-COMPLETENESS_THRESHOLD = 0.9
+#
+# Threshold tightened 0.9 → 1.0 (Tier A): the 10% slack was letting marginal
+# misses through. Observed on Indefinite Integrals Sample / Critical Thinking:
+# extracted 24 of 26 expected = 92.3% → considered "complete" at 0.9 →
+# Pass-3 page-by-page recovery never fired → Q9 and Q23 silently dropped.
+# At 1.0, any gap (even 1 of 100) triggers Pass-3 → page-by-page recovery
+# → missing q-numbers are surfaced to Gemini with an explicit skip-list of
+# what's already extracted. Cost is bounded by existing gates
+# (MAX_UNITS_PER_BOOK=20, MAX_PAGES_PER_UNIT=12).
+COMPLETENESS_THRESHOLD = 1.0
 MAX_COMPLETENESS_RETRIES = 2
 
 # Sub-retry policy for transient OCR errors — Gemini server disconnects, read
@@ -2129,6 +2138,287 @@ async def _retry_missing_questions_from_figures(
     )
 
 
+# ───────────────────────────────────────────────────────────────────────
+# Q-3 — Page-by-page undercount fallback (Task 1 Pass 3)
+# ───────────────────────────────────────────────────────────────────────
+#
+# Runs AFTER Q-1 (figure-witness) + Q-2 (solution-completeness) have done
+# their best. For any Cat A unit that's STILL incomplete
+# (extracted < COMPLETENESS_THRESHOLD × expected), scans each page of the
+# unit's range in a SEPARATE Gemini call. The intuition: Gemini sometimes
+# undercounts on long sections because attention degrades when scanning
+# many questions in one call. Constraining the prompt to ONE page makes
+# each pass exhaustive.
+#
+# Cost gates (HARD):
+#   MAX_UNITS_PER_BOOK   = 20   — at most 20 incomplete units retried
+#   MAX_PAGES_PER_UNIT   = 12   — at most 12 page-calls per unit
+#   MIN_UNIT_PAGE_SPAN   = 2    — single-page units already minimal, skip
+#
+# Dedup: new questions are merged by question_number against existing
+# DB rows. Insertion uses the same _insert_only_merge path as Q-1.
+#
+# Idempotent: re-running adds zero rows when the gap is already closed.
+
+_PAGE_BY_PAGE_MAX_UNITS_PER_BOOK = 20
+_PAGE_BY_PAGE_MAX_PAGES_PER_UNIT = 12
+_PAGE_BY_PAGE_MIN_UNIT_PAGE_SPAN = 2
+
+
+async def _run_single_page_scan(
+    unit: "_Unit",
+    pdf_bytes: bytes,
+    system_prompt: str,
+    page_number: int,
+    already_extracted_qnos: set[str],
+) -> dict[str, Any]:
+    """Scan ONE page of a unit. Returns {"ok", "extracted", "identified_total"}.
+
+    The prompt explicitly names question_numbers already in DB so Gemini
+    skips re-extracting them — keeps the response tight + the dedup pass
+    cheap.
+    """
+    pdf_slice = _slice_pdf(pdf_bytes, page_number, page_number)
+
+    already_str = ", ".join(sorted(already_extracted_qnos)[:80]) if already_extracted_qnos else "(none)"
+    user_prompt = (
+        f"PAGE-BY-PAGE UNDERCOUNT RECOVERY for section: \"{unit.title}\" "
+        f"(ID: {unit.id}).\n\n"
+        f"You are looking at page {page_number} ONLY. Extract every numbered "
+        f"question / example / exercise / problem PRINTED on this exact page.\n\n"
+        f"Already extracted on prior passes (skip these — do NOT re-emit): "
+        f"{already_str}.\n\n"
+        f"Rules:\n"
+        f"- OCR-only — verbatim text, no fabrication, no invented options.\n"
+        f"- If a question's stem spans this page and continues onto the next, "
+        f"emit it as belonging to THIS page (its starting page).\n"
+        f"- If a numbered item appears here AND in 'already extracted', OMIT "
+        f"it — duplicates corrupt the bank.\n"
+        f"- If the page has NO new questions, return identified_total=0 with "
+        f"`extracted` as an empty array.\n\n"
+        f"Return JSON: section_id=\"{unit.id}\", section_title=\"{unit.title}\", "
+        f"identified_total (count you found newly on this page), "
+        f"extracted (array of only the new items)."
+    )
+    try:
+        raw = await _gemini_call_with_transient_retries(
+            pdf_slice, system_prompt, user_prompt,
+            ctx=f"q3-page {unit.kind}/{unit.id}/p{page_number}",
+        )
+        data = parse_json(raw)
+        if not isinstance(data, dict):
+            return {"ok": False, "extracted": [], "identified_total": 0}
+        extracted = list(data.get("extracted") or [])
+        fr = filter_items(extracted)
+        return {
+            "ok": True,
+            "identified_total": int(data.get("identified_total") or 0),
+            "extracted": fr.kept,
+        }
+    except Exception as e:
+        logger.warning(
+            "Q-3 single-page scan failed (unit=%s page=%d): %s",
+            unit.id, page_number, e,
+        )
+        return {"ok": False, "extracted": [], "identified_total": 0}
+
+
+async def _retry_undercount_page_by_page(
+    book_id: UUID,
+    bank_id: UUID,
+    units: list["_Unit"],
+    pdf_bytes: bytes,
+    system_prompt: str,
+) -> None:
+    """Last-resort recovery for units still under COMPLETENESS_THRESHOLD
+    after the figure-witness + solution-completeness retries.
+
+    For each qualifying incomplete unit, runs one Gemini call per page in
+    its range. Each call is scoped to a single page so Gemini's attention
+    can't dilute across many questions. New rows are dedup-by-q_no
+    against the bank's existing questions before insert.
+
+    HARD-gated by per-book + per-unit caps to bound Gemini cost.
+    Idempotent — a follow-up run with no remaining gap is a no-op.
+    """
+    from app.models.question import Question
+
+    # 1. Snapshot per-unit extracted counts + existing q_nos.
+    with SyncSession() as session:
+        rows = session.execute(
+            select(
+                Question.section_ref,
+                Question.question_number,
+            ).where(
+                Question.bank_id == bank_id,
+                Question.regen_id.is_(None),
+            )
+        ).all()
+
+    extracted_per_section: dict[str, int] = {}
+    qnos_per_section: dict[str, set[str]] = {}
+    for sref, qno in rows:
+        if not sref:
+            continue
+        extracted_per_section[sref] = extracted_per_section.get(sref, 0) + 1
+        if qno:
+            qnos_per_section.setdefault(sref, set()).add(_norm_qno(qno))
+
+    # 2. Identify incomplete units that qualify for page-by-page retry.
+    candidates: list["_Unit"] = []
+    for u in units:
+        if u.expected is None:
+            continue
+        expected = int(u.expected or 0)
+        if expected <= 0:
+            continue
+        extracted = extracted_per_section.get(u.id, 0)
+        if not _is_incomplete(expected, extracted):
+            continue
+        if u.page_start is None or u.page_end is None:
+            continue
+        page_span = (u.page_end - u.page_start) + 1
+        if page_span < _PAGE_BY_PAGE_MIN_UNIT_PAGE_SPAN:
+            # Single-page unit — Gemini's first pass already scanned it
+            # exhaustively; another single-page call adds no signal.
+            continue
+        candidates.append(u)
+
+    if not candidates:
+        logger.info(
+            "[q3-page] book=%s — no incomplete multi-page units, skipping",
+            book_id,
+        )
+        return
+
+    # Cap candidate count globally. Sort by largest gap first so we spend
+    # the budget on the worst undercounts.
+    def _gap(u: "_Unit") -> int:
+        return int(u.expected or 0) - extracted_per_section.get(u.id, 0)
+    candidates.sort(key=_gap, reverse=True)
+    if len(candidates) > _PAGE_BY_PAGE_MAX_UNITS_PER_BOOK:
+        logger.info(
+            "[q3-page] book=%s — %d incomplete units; capping to %d biggest "
+            "gaps (skipping the rest this pass)",
+            book_id, len(candidates), _PAGE_BY_PAGE_MAX_UNITS_PER_BOOK,
+        )
+        candidates = candidates[:_PAGE_BY_PAGE_MAX_UNITS_PER_BOOK]
+
+    logger.info(
+        "[q3-page] book=%s — page-by-page retry for %d incomplete unit(s)",
+        book_id, len(candidates),
+    )
+
+    total_inserted = 0
+    for u in candidates:
+        existing_qnos = set(qnos_per_section.get(u.id, set()))
+        pages = list(range(u.page_start, u.page_end + 1))
+        if len(pages) > _PAGE_BY_PAGE_MAX_PAGES_PER_UNIT:
+            logger.info(
+                "[q3-page] unit=%s spans %d pages — capping per-unit scan "
+                "to first %d pages (worker can re-run later for the tail)",
+                u.id, len(pages), _PAGE_BY_PAGE_MAX_PAGES_PER_UNIT,
+            )
+            pages = pages[:_PAGE_BY_PAGE_MAX_PAGES_PER_UNIT]
+
+        unit_inserted = 0
+        for p in pages:
+            res = await _run_single_page_scan(
+                unit=u, pdf_bytes=pdf_bytes,
+                system_prompt=system_prompt,
+                page_number=p,
+                already_extracted_qnos=existing_qnos,
+            )
+            if not res.get("ok"):
+                continue
+            page_items = res.get("extracted") or []
+            if not page_items:
+                continue
+            # Stash a synthetic "result" so _insert_only_merge can do its
+            # dedup-by-q_no + persist for us. identified_total reflects only
+            # this page's count.
+            inserted = _insert_only_merge(
+                book_id=book_id, bank_id=bank_id, unit=u,
+                result={
+                    "extracted": page_items,
+                    "identified_total": int(res.get("identified_total") or 0),
+                },
+            )
+            if inserted:
+                unit_inserted += inserted
+                # Update the local already-seen set so the next page's
+                # Gemini call won't be asked to re-emit these.
+                for it in page_items:
+                    qn = it.get("question_number")
+                    if qn:
+                        existing_qnos.add(_norm_qno(qn))
+
+        logger.info(
+            "[q3-page] unit=%s rescued=%d on %d page(s) "
+            "(expected=%s, was_extracted=%d, now=%d)",
+            u.id, unit_inserted, len(pages), u.expected,
+            extracted_per_section.get(u.id, 0),
+            extracted_per_section.get(u.id, 0) + unit_inserted,
+        )
+        total_inserted += unit_inserted
+
+    logger.info(
+        "[q3-page] book=%s — done. units=%d total_inserted=%d",
+        book_id, len(candidates), total_inserted,
+    )
+
+    # ─── Q-3 VERIFICATION LOOP (Tier A safety net) ───────────────────
+    # After Pass-3 finishes, re-count every candidate against its expected
+    # and surface what's STILL missing. Without this loop, a Pass-3 call
+    # that also misses (Gemini's per-page scan failed to find the
+    # specific stragglers) silently passes through — operator never
+    # knows the gap remains. With it: a structured warning is logged
+    # for every section that didn't fully recover, listing the gap and
+    # the page range so a manual re-extract has the info it needs.
+    #
+    # This is observability only — does NOT trigger another Gemini call.
+    # The page-by-page pass already exhausted its budget; a third pass
+    # with the same strategy wouldn't add signal.
+    try:
+        still_incomplete: list[tuple[str, int, int]] = []  # (section_id, got, expected)
+        with SyncSession() as _sess:
+            for u in candidates:
+                expected = int(u.expected or 0)
+                if expected <= 0:
+                    continue
+                final_got = _sess.execute(
+                    select(func.count(Question.id)).where(
+                        Question.book_id == book_id,
+                        Question.bank_id == bank_id,
+                        Question.regen_id.is_(None),
+                        Question.section_ref == u.id,
+                    )
+                ).scalar_one()
+                if final_got < expected:
+                    still_incomplete.append((u.id, final_got, expected))
+
+        if still_incomplete:
+            logger.warning(
+                "[q3-verify] book=%s — %d section(s) STILL incomplete after "
+                "Pass-3 page-by-page recovery: %s",
+                book_id, len(still_incomplete),
+                [
+                    f"{sid}={got}/{exp} (gap={exp - got})"
+                    for sid, got, exp in still_incomplete
+                ],
+            )
+        else:
+            logger.info(
+                "[q3-verify] book=%s — all %d retried section(s) recovered "
+                "to expected count ✓",
+                book_id, len(candidates),
+            )
+    except Exception as e:
+        # Never let verification telemetry break the main extraction flow.
+        logger.warning("[q3-verify] book=%s — verification pass failed: %s",
+                       book_id, e)
+
+
 def _insert_only_merge(
     book_id: UUID,
     bank_id: UUID,
@@ -2717,6 +3007,26 @@ async def _run_v3(book_id: UUID, bank_id: UUID, job_id: UUID) -> dict[str, Any]:
     except Exception as e:
         logger.warning(
             "Q-2 solution-completeness retry failed (book=%s): %s", book_id, e
+        )
+
+    # ─── Q-3: Page-by-page undercount fallback (Task 1 Pass 3) ────────
+    # Last-resort recovery for any unit that's STILL below
+    # COMPLETENESS_THRESHOLD after Q-1 + Q-2. Scans one page at a time
+    # with a focused prompt naming the q_nos already extracted so Gemini
+    # only returns the missing ones. Bounded by per-book + per-unit caps
+    # (see constants in _retry_undercount_page_by_page). Closes the
+    # "Gemini undercounts on long Cat A sections even after targeted
+    # retries" gap (observed in Integrals 4.x sections).
+    try:
+        await _retry_undercount_page_by_page(
+            book_id=book_id, bank_id=bank_id,
+            units=units, pdf_bytes=pdf_bytes,
+            system_prompt=system_prompt,
+        )
+    except Exception as e:
+        logger.warning(
+            "Q-3 page-by-page undercount retry failed (book=%s): %s",
+            book_id, e,
         )
 
     # Auto-embed figures now that questions exist. If figures were extracted

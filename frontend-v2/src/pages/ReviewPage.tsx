@@ -198,15 +198,28 @@ export default function ReviewPage() {
   const categoryAIds = schemaWalk.categoryAIds;
   const excludedQs = schemaWalk.excludedQs;
 
+  // Section ordering — BACKEND IS THE SINGLE SOURCE OF TRUTH.
+  // /api/books/:id/sections returns sections in correct reading order
+  // (backend's tree-walk, robust against slug/uuid divergence). We sort
+  // purely by each section's INDEX in that response — NOT by re-walking
+  // raw.schema_ in the frontend. Eliminates the jumble triggers from the
+  // previous re-derivation (schema_ not loaded yet, slug-drift, etc.).
+  const backendOrder = useMemo(() => {
+    const m: Record<string, number> = {};
+    allSections.forEach((s, i) => {
+      if (!(s.section_id in m)) m[s.section_id] = i;
+    });
+    return m;
+  }, [allSections]);
+
   const sortBySchema = useMemo(
     () => (a: Section, b: Section) => {
-      const ia = schemaOrder[a.section_id] ?? Number.MAX_SAFE_INTEGER;
-      const ib = schemaOrder[b.section_id] ?? Number.MAX_SAFE_INTEGER;
+      const ia = backendOrder[a.section_id] ?? Number.MAX_SAFE_INTEGER;
+      const ib = backendOrder[b.section_id] ?? Number.MAX_SAFE_INTEGER;
       if (ia !== ib) return ia - ib;
-      // Fallback alphabetical for sections not in schema (orphans).
       return a.section_id.localeCompare(b.section_id);
     },
-    [schemaOrder],
+    [backendOrder],
   );
 
   // ─── Per-tab section sets ─────────────────────────────────────────
@@ -255,6 +268,10 @@ export default function ReviewPage() {
       categoryAIds.has(s.section_id),
     );
     const existingIds = new Set(fromSchema.map((s) => s.section_id));
+    // Phase 3 — UUID-based dedup so the orphan filter doesn't depend on
+    // slug equality. A bank section whose section_uuid matches a row in
+    // fromSchema is already rendered; anything else is a real orphan.
+    const existingUuids = new Set(fromSchema.map((s) => s.id));
     const synthetic: Section[] = excludedQs
       .filter((x) => !existingIds.has(x.section_id))
       .map(
@@ -276,10 +293,20 @@ export default function ReviewPage() {
       );
 
     // ─── End-of-chapter orphans from the question bank ─────────────
-    // Build the set of section_refs that ARE in the schema tree (any
-    // depth) using the same `schemaOrder` map — its keys are exactly
-    // the schema node ids walked in tree order.
+    // Rule (locked): Questions tab shows ONLY Cat A + Excluded.
+    // A bank section_out qualifies for THIS tab when ANY of:
+    //   (a) it maps (via UUID or slug) to a pure Cat A section in schema —
+    //       and isn't already rendered in fromSchema (slug-divergence case)
+    //   (b) it's an Excluded section — handled separately via `synthetic[]`
+    //   (c) it's a true bank-discovered section with NO schema node at all
+    //       (PRACTICE QUESTIONS / REVIEW PROBLEMS / WING groupings)
+    // Anything else — i.e. a bank entry whose schema node is theory or
+    // mixed (theory+questions) — is suppressed here. Those questions
+    // surface inline as chips inside the Theory tab.
     const inSchemaSet = new Set<string>(Object.keys(schemaOrder));
+    const sectionByUuid = new Map<string, Section>(
+      allSections.map((s) => [s.id, s]),
+    );
 
     // Wing-grouping for "PRACTICE QUESTIONS - <X> WING - <subtype>"
     // entries: collapse all sub-types of the same wing into ONE sidebar
@@ -296,7 +323,25 @@ export default function ReviewPage() {
     if (banksDetail?.sections) {
       for (const bs of banksDetail.sections) {
         const ref = bs.section_ref;
-        if (!ref || inSchemaSet.has(ref) || existingIds.has(ref)) continue;
+        if (!ref) continue;
+
+        // UUID-first dedup (Phase 3 of identity migration). If the bank's
+        // section_uuid maps to a Section row already in fromSchema, it's
+        // rendered there — skip.
+        if (bs.section_uuid && existingUuids.has(bs.section_uuid)) continue;
+        if (!bs.section_uuid && existingIds.has(ref)) continue;
+
+        // Cat-A-only filter — enforce "Questions tab shows Cat A + Excluded
+        // only". If the bank entry corresponds to a schema section that
+        // ISN'T pure Cat A (theory or mixed), suppress it here.
+        if (bs.section_uuid) {
+          const matched = sectionByUuid.get(bs.section_uuid);
+          if (matched && !categoryAIds.has(matched.section_id)) continue;
+        } else if (inSchemaSet.has(ref) && !categoryAIds.has(ref)) {
+          // Slug-fallback: schema knows this ref but tagged it as non-CatA
+          // (theory / mixed). Skip — its questions belong in Theory chips.
+          continue;
+        }
 
         const wingMatch = ref.match(WING_RE);
         if (wingMatch) {
@@ -530,6 +575,20 @@ export default function ReviewPage() {
     if (selected.id.startsWith('wing:')) {
       return wingAggregator.get(selected.section_id) ?? null;
     }
+    // UUID-first match (Phase 3 of identity migration). The bank groups
+    // questions under each section's CANONICAL UUID (Section.id), surfaced
+    // as section_uuid in the response. The slug (section_ref) can drift
+    // between schema regenerations and the section creator, which used to
+    // hide entire sections from this tab (Class-9th-Maths blank-tab bug).
+    // UUID joins eliminate that whole class of bug.
+    //
+    // Fallback to slug match keeps legacy rows (section_uuid null) and
+    // pre-migration books rendering until they're re-extracted.
+    const selectedUuid = selected.id;
+    const byUuid = banksDetail.sections.find(
+      (s) => s.section_uuid && s.section_uuid === selectedUuid,
+    );
+    if (byUuid) return byUuid;
     return (
       banksDetail.sections.find(
         (s) => s.section_ref === selected.section_id,

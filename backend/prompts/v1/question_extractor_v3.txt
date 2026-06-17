@@ -160,6 +160,21 @@ boundary missed it), return `identified_total: 0` and an empty `extracted` list.
 Do not infer the section start — only transcribe what you can see is anchored
 to the named heading.
 
+PARENT / WRAPPER SECTION — your scope is the GAP:
+If this section has subsections beneath it (the STOP anchor is the first
+subsection's heading), your scope = the loose question-like items printed
+BETWEEN this section's heading and the STOP. Wrappers commonly hold 1-5
+loose questions above the first named subsection — those belong to THIS
+section, NOT to the next subsection. Even ONE loose item in that gap is
+yours.
+- Do NOT skip the gap because "the real questions look like they're inside
+  the next subsection."
+- Do NOT pull items from inside any subsection into your output — the STOP
+  anchor is the boundary.
+- If the gap genuinely has zero question-like items (the next subsection's
+  heading IMMEDIATELY follows this one with no items in between), return
+  `identified_total: 0` — that is correct and complete.
+
 ═══════════════════════════════════════════════════════════════════════════════
 WHAT COUNTS AS A QUESTION (INCLUDE)
 ═══════════════════════════════════════════════════════════════════════════════

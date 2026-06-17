@@ -41,6 +41,12 @@ type FigureItem = {
     figure_id: string;
     label: string;
     caption: string;
+    // Gemini-extracted 2-3 sentence description. Surfaces as the
+    // PLACEHOLDER info text when label and caption are both empty
+    // (unlabelled-figure case — e.g. geometry diagrams Gemini extracts
+    // without naming). Without this fallback the figcaption is empty,
+    // leaving figures visually orphaned.
+    description?: string;
     variant: 'original' | 'regen';
     image_url: string;
   };
@@ -326,7 +332,24 @@ function renderItem(item: FinalDraftItem): React.ReactElement | null {
           onError={(e) => { (e.target as HTMLImageElement).style.display = 'none'; }}
         />
         <figcaption style={{ fontSize: 12, color: 'var(--ink-500)', marginTop: 6, fontStyle: 'italic' }}>
-          <strong>{item.figure.label}</strong>{item.figure.caption && ` — ${item.figure.caption}`}
+          {/* Render label + caption when present (labelled figures /
+              well-extracted unlabelled ones). When BOTH are empty
+              (Gemini returned no metadata — e.g. small geometry diagrams),
+              fall back to the description (2-3 sentence summary Gemini
+              produces) so the reader sees what the figure depicts. When
+              everything is empty, show a generic "Figure" placeholder so
+              the image never renders without context. Prevents the
+              "blank caption + lost image" visual orphan. */}
+          {item.figure.label || item.figure.caption ? (
+            <>
+              <strong>{item.figure.label}</strong>
+              {item.figure.caption && ` — ${item.figure.caption}`}
+            </>
+          ) : item.figure.description ? (
+            <>📷 {item.figure.description}</>
+          ) : (
+            <>📷 Figure</>
+          )}
         </figcaption>
       </figure>
     );
@@ -341,6 +364,10 @@ function renderItem(item: FinalDraftItem): React.ReactElement | null {
       figure_id: string;
       label?: string;
       caption?: string;
+      // Same description fallback as the standalone figure item — surfaces
+      // as PLACEHOLDER text when Gemini extracted the figure without a
+      // label or caption (typical for inline question diagrams).
+      description?: string;
       variant?: string;
       image_url: string;
     }> }).embedded_figures ?? [];
@@ -390,20 +417,30 @@ function renderItem(item: FinalDraftItem): React.ReactElement | null {
                     }}
                     onError={(e) => { (e.target as HTMLImageElement).style.display = 'none'; }}
                   />
-                  {(ef.label || ef.caption) && (
-                    <figcaption
-                      style={{
-                        fontSize: 12,
-                        color: 'var(--ink-500)',
-                        marginTop: 4,
-                        fontStyle: 'italic',
-                      }}
-                    >
-                      {ef.label && <strong>{ef.label}</strong>}
-                      {ef.label && ef.caption && ' — '}
-                      {ef.caption}
-                    </figcaption>
-                  )}
+                  {/* Same fallback chain as the standalone figure item:
+                      label/caption → description → generic "Figure". The
+                      figcaption now ALWAYS renders so the reader gets
+                      context even when Gemini failed to extract metadata. */}
+                  <figcaption
+                    style={{
+                      fontSize: 12,
+                      color: 'var(--ink-500)',
+                      marginTop: 4,
+                      fontStyle: 'italic',
+                    }}
+                  >
+                    {ef.label || ef.caption ? (
+                      <>
+                        {ef.label && <strong>{ef.label}</strong>}
+                        {ef.label && ef.caption && ' — '}
+                        {ef.caption}
+                      </>
+                    ) : ef.description ? (
+                      <>📷 {ef.description}</>
+                    ) : (
+                      <>📷 Figure</>
+                    )}
+                  </figcaption>
                 </figure>
               );
             })}

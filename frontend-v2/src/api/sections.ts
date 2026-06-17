@@ -10,9 +10,21 @@ import type { components } from './generated';
 
 export type Section = components['schemas']['SectionOut'];
 
+// Which figure image each section's embedded_figures should resolve to.
+//   'auto'        → regen-if-exists, else original (default — extract review)
+//   'original'    → always the original image (Original tab / compare-left)
+//   'regenerated' → regen-if-exists, else original (Regenerated tab /
+//                   compare-right) — backend falls the URL back to auto so
+//                   the <img> never 404s when no regen exists.
+// The backend serializer (services/figure_serializer.py) owns the actual
+// URL composition; the frontend only forwards this hint.
+export type FigureVariant = 'auto' | 'original' | 'regenerated';
+
 // ─── HTTP ────────────────────────────────────────────────────────
-export const listSections = (bookId: string) =>
-  req<Section[]>(`/api/books/${bookId}/sections`);
+export const listSections = (bookId: string, variant: FigureVariant = 'auto') =>
+  req<Section[]>(
+    `/api/books/${bookId}/sections${variant !== 'auto' ? `?variant=${variant}` : ''}`,
+  );
 
 export const getSection = (sectionId: string) =>
   req<Section>(`/api/sections/${sectionId}`);
@@ -23,7 +35,10 @@ type State =
   | { kind: 'ready'; sections: Section[] }
   | { kind: 'error'; error: string };
 
-export function useSections(bookId: string | undefined) {
+export function useSections(
+  bookId: string | undefined,
+  variant: FigureVariant = 'auto',
+) {
   const [state, setState] = useState<State>({ kind: 'loading' });
 
   const load = useCallback(async () => {
@@ -33,7 +48,7 @@ export function useSections(bookId: string | undefined) {
     }
     setState({ kind: 'loading' });
     try {
-      const sections = await listSections(bookId);
+      const sections = await listSections(bookId, variant);
       setState({ kind: 'ready', sections });
     } catch (err) {
       const msg =
@@ -44,7 +59,7 @@ export function useSections(bookId: string | undefined) {
           : 'Unknown error';
       setState({ kind: 'error', error: msg });
     }
-  }, [bookId]);
+  }, [bookId, variant]);
 
   useEffect(() => {
     void load();

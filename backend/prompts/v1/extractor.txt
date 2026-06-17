@@ -49,53 +49,87 @@ MATH EXPRESSION INTEGRITY across column wraps:
 
 PARENT vs LEAF SECTION — CRITICAL — read this BEFORE you start transcribing:
 
-You receive ONE section at a time. The user prompt will tell you which role
-this section has (look for the lines starting "This is a PARENT/CONTAINER
-section" or "This is a LEAF section").
-
-PARENT / CONTAINER section (has subsections beneath it in the schema):
-- Output ONLY content that appears BETWEEN this section's heading AND the
-  FIRST subsection heading.
-- If the first subsection heading immediately follows the parent heading
-  (no prose, equations, lists, or other body content in between), return
-  an EMPTY `paragraphs` array (`"paragraphs": []`).
-- NEVER pull content from inside any subsection into this parent's output.
-  If you do, the user sees the same paragraph under two sidebar entries —
-  the visible duplication you are trying to prevent.
-- Typical patterns where the parent should be EMPTY:
-  - A Chapter heading immediately followed by a "Chapter Outline" sub-heading
-    on the next line → chapter root's paragraphs = [].
-  - A section root immediately followed by a "(A) ..." lettered sub-heading
-    with no prose between → section root's paragraphs = [].
-- Typical patterns where the parent has its OWN content:
-  - Chapter intro paragraph (1-2 lines) BEFORE the first subsection heading
-    → parent's paragraphs = [that intro paragraph].
-  - Theory paragraph that introduces the topic, followed by lettered sub-points
-    → parent's paragraphs = [that intro paragraph], lettered sub-points belong
-    to the lettered subsections.
+You receive ONE section at a time. The user prompt tells you the role
+("This is a PARENT/CONTAINER section" or "This is a LEAF section").
 
 LEAF section (no subsections beneath it):
-- Standard behaviour. Transcribe everything from the section's heading
-  until the next sibling heading or end of provided pages.
+- Transcribe everything from the section's heading until the STOP anchor.
 
-In BOTH cases, the user prompt's stop-instruction is authoritative — never
-extract past the named stop heading.
+PARENT / WRAPPER section (has subsections beneath it):
+- Your scope = the text printed BETWEEN this section's heading AND its
+  first subsection's heading (which is your STOP anchor).
+- EMIT every block (paragraph, list, equation, figure caption, key_point,
+  chip, table, definition) printed in that gap. Even one or two lines of
+  intro prose IS the wrapper's content — emit it.
+- Wrappers are NOT empty by definition — they hold genuine intro
+  content whenever the book prints it.
+- The ONLY case for returning an empty paragraphs array is when the
+  first subsection's heading literally follows the wrapper's heading
+  with NO visible content between them.
+- NEVER pull content from inside any subsection into this wrapper's
+  output. The STOP anchor is the boundary.
+
+(Rule (0) HARD STOP below restates this with examples — both halves
+are equally important.)
 
 COMPLETENESS CONTRACT — NON-NEGOTIABLE
 
 Your job: capture EVERY content block between the section's START (its own heading, where extraction begins) and STOP (the next section's title from the schema, supplied in the user prompt).
 
-CRITICAL RULES (read all four before extracting):
+CRITICAL RULES (read all before extracting):
 
-(1) SUB-HEADINGS ARE NOT STOP POINTS — THEY ARE YOUR CONTENT
-    The schema names ONE section for you to extract. That section may contain INTERNAL sub-headings (e.g. "Isotopes", "Isobars", "Properties", "Method 1", "Definition"). These sub-headings are PART of your current section's content — emit each as a `heading` block (h2/h3) and CONTINUE extracting the prose, lists, equations, etc. underneath them.
-    DO NOT stop extraction at a sub-heading. DO NOT skip a sub-heading just because it looks like a new section header. Only the NEXT SCHEMA SECTION's title is your stop point.
+(0) HARD STOP — TWO SIDES OF ONE RULE
 
-(2) STOP ONLY AT THE SCHEMA'S NEXT SECTION TITLE
-    The next schema section's title is the ONLY place where extraction ends. It is supplied to you as the STOP anchor in the user prompt.
-    Sub-headings within your section ≠ stop points. A "Definition" header mid-section ≠ stop. A bolded sub-topic ≠ stop. Only the exact STOP anchor text (with its page) is the stop.
+    Your section starts at YOUR heading and ends at the STOP anchor.
+    Both halves of the rule are equally important:
 
-(3) NO SKIPPING — EMIT EVERY CONTENT BLOCK
+    ── (A) EMIT EVERYTHING PRINTED BETWEEN THE TWO HEADINGS ──
+       Capture every paragraph, list, equation, figure caption,
+       key_point, chip, table, and definition printed AFTER your
+       section's heading and BEFORE the STOP anchor's heading.
+
+       Returning an EMPTY paragraphs array when visible content exists
+       between the two headings is WRONG and is itself an extraction
+       failure.
+
+       Even if your section spans only a few lines (e.g. a short
+       sub-topic squeezed onto a single page between two other
+       sub-topics), those few lines ARE your content — extract them.
+
+    ── (B) DO NOT INCLUDE ANY OF THE NEXT SECTION ──
+       The MOMENT you reach the STOP anchor text on its page, stop —
+       even mid-paragraph, mid-list, mid-figure caption.
+       Do NOT emit the STOP anchor's heading itself.
+       Do NOT emit ANY block (prose, list, list_item, figure, equation,
+       key_point, chip, table, definition, heading) that appears AT or
+       AFTER the STOP anchor on its page.
+
+    SAME-PAGE CASE — both halves apply equally:
+       If your section's heading AND the STOP anchor are on the SAME
+       page, the printed text BETWEEN them on that page is YOURS —
+       extract it. Do not return empty just because the STOP anchor is
+       nearby. Stop AT the STOP anchor heading, not before reaching it.
+
+    RECURRING HEADING TEXT:
+       If the same heading text appears multiple times in the provided
+       pages, only the instance on the STOP anchor's exact page is the
+       stop point. Ignore earlier same-named occurrences.
+
+    Bleeding (A) into the next section AND emitting empty when (B)
+    content exists are BOTH critical failures. Both halves must be
+    honored together — neither overrides the other.
+
+(1) STOP ONLY AT THE SCHEMA'S NEXT SECTION TITLE — sub-headings are NOT stops
+    The next schema section's/subsection's title is the ONLY place where
+    extraction ends — supplied as the STOP anchor in the user prompt.
+    Your section may contain INTERNAL sub-headings (e.g. "Isotopes",
+    "Isobars", "Properties", "Method 1", "Definition"). These are PART of
+    your content — emit each as a `heading` block (h2/h3) and CONTINUE
+    extracting the prose, lists, equations underneath them.
+    A "Definition" header mid-section ≠ stop. A bolded sub-topic ≠ stop.
+    Only the EXACT STOP anchor text (with its page) is the stop.
+
+(2) NO SKIPPING — EMIT EVERY CONTENT BLOCK
     For your page range, emit a block for EACH of:
       a. Every heading (h1/h2/h3) — including unnumbered sub-headings
       b. Every paragraph, even short ones (1-line intros, transitions)
@@ -103,11 +137,11 @@ CRITICAL RULES (read all four before extracting):
       d. Every equation, formula, derivation step — emit as `equation` block with valid LaTeX
       e. Every list (bulleted or numbered) — emit each item as a `list_item` block, IN ORDER
       f. Every example callout, key point, info box, remember box
-      g. Every table — emit as `table` block with headers + rows
+      g. Every table — emit as `table` block with headers + rows (NEVER as prose, NEVER as key_point — see TABLE RULE below)
       h. Every figure caption — emit as `figure` block with label + caption
     If you SEE content but OMIT emitting it → you have FAILED the contract.
 
-(4) EQUATIONS — RENDER ALL, SKIP NONE, NO SUMMARIES
+(3) EQUATIONS — RENDER ALL, SKIP NONE, NO SUMMARIES
     Every printed equation, formula, expression, derivation step MUST be captured as an `equation` block with valid LaTeX. Do NOT skip complex equations. Do NOT write "equation involving X" or "see formula above" — emit the actual LaTeX. Multi-line derivations = one `equation` block PER printed line, preserving order. Chemistry formulas use `\ce{...}` (see CHEMISTRY FORMULAS section).
 
 SELF-CHECK before emitting:
@@ -221,13 +255,51 @@ INTERLEAVED THEORY — KEEP TRANSCRIBING BETWEEN PLACEHOLDERS — CRITICAL:
 PLACEHOLDER RULE — TRUE QUESTIONS ONLY — CRITICAL:
 - The full body of any TRUE question is captured by a separate question-extraction pipeline.
 - For TRUE questions, theory's job is ONLY to mark their POSITION with a placeholder block (similar to how a figure is just a placeholder, not the diagram itself).
-- Emit ONE placeholder block at the exact position the item starts on the page.
 
-WHICH LABELS BECOME PLACEHOLDERS (TRUE QUESTIONS — body suppressed):
-  - "Example N", "Worked Example N", "Solved Example N"   → "example_ref"
-  - "Exercise N.M", "Problem N", "Practice Problem N", "Practice N" → "exercise_ref"
-  - "In-text Question N", "Intext Questions" → "question_ref"
-  - Numbered exercise / problem list with no other heading       → "exercise_ref"
+CHIPS ARE FOR INLINE CAT A CONTENT ONLY — NEVER FOR EXCLUDED SECTIONS:
+- A chip (placeholder) is emitted ONLY when a TRUE question label header
+  (Example N, Exercise N.M, Intext Question N, etc.) appears INLINE within
+  the prose of a theory section you are extracting — i.e. printed between
+  theory paragraphs, not as its own dedicated chapter section.
+- If the schema has separately listed an "Exercises" / "End of Chapter
+  Questions" / "Practice Problems" section as its own schema entry
+  (a standalone question bank), DO NOT emit a chip when you encounter
+  it — that section is owned by the question-extraction pipeline and is
+  outside your STOP anchor. Your current section ends BEFORE it.
+- Rule of thumb: if it's printed mid-prose of your section → chip.
+  If it's a separate header section the schema has named on its own
+  → not your concern, stop before it.
+
+ONE CHIP PER PRINTED LABEL HEADER — NOT PER QUESTION:
+- A "chip" (placeholder) represents the WHOLE GROUP of inline questions
+  printed under a single label header — NOT each individual question.
+
+  Examples:
+   • "Exercise 1.2" containing 10 numbered sub-questions (Q1…Q10)
+        → ONE `exercise_ref` chip with label "Exercise 1.2"
+        → NOT ten chips.
+   • "Example 5.3"   (a single worked example, may have parts a/b/c)
+        → ONE `example_ref` chip with label "Example 5.3"
+   • "Example 5.4"   (a separate worked example printed below 5.3)
+        → ONE more `example_ref` chip with label "Example 5.4"
+   • "Intext Questions" followed by 5 numbered questions
+        → ONE `question_ref` chip with label "Intext Questions"
+
+- Rule: ONE chip per printed LABEL HEADER. Multiple sub-questions /
+  parts under the same label are CONSUMED by that single chip — do not
+  emit a separate chip per Q1, Q2, Q3, (a), (b), etc.
+- Emit the chip at the position the LABEL HEADER first appears in the
+  printed reading order.
+- Two different printed label headers (e.g. Example 5.3 and Example 5.4)
+  = two separate chips, one for each.
+
+WHICH LABEL HEADERS BECOME CHIPS:
+  - "Example N", "Worked Example N", "Solved Example N"            → "example_ref"
+  - "Exercise N.M", "Problem Set N", "Problem N", "Practice N"     → "exercise_ref"
+  - "In-text Question N", "Intext Questions"                       → "question_ref"
+  - Numbered exercise / problem list with no other heading         → "exercise_ref" (ONE chip for the whole list)
+
+
 
 WHICH LABELS ARE TRANSCRIBED AS FULL THEORY BODY (NO chip — these are theory aids, not assessed questions):
 
@@ -276,26 +348,79 @@ QUESTION STEMS — NEVER AS THEORY BODY:
 
 DECISION RULE if you're unsure: if the printed label asks the reader to formally solve a problem AND its solution is shown elsewhere or expected from the student → TRUE QUESTION (placeholder). If the printed label introduces a worked walk-through, hands-on activity, self-reflection, or is a teaching aid embedded in the explanation → THEORY BODY (no placeholder; transcribe in full).
 
-TABLE RULE — CRITICAL:
-- ANY grid/table structure on the page → use type="table", NOT key_point or body
-- headers: array of column header strings
-- rows: array of rows, each row is an array of cell strings
-- caption: table caption or title if present, else ""
+TABLE RULE — NON-NEGOTIABLE:
 
-TABLE CELLS — MATH AND CHEMISTRY MUST RENDER:
-The backend converts your `headers`/`rows` arrays into an HTML table where each cell is rendered through KaTeX. So math/chemistry symbols inside ANY cell MUST be wrapped properly, otherwise they render as plain text.
-- Math inside a cell: wrap with `$...$`. Example:
-    rows: [["Speed of light", "$c$", "$3 \\times 10^8$ m/s"], ["Planck constant", "$h$", "$6.626 \\times 10^{-34}$ J·s"]]
-- Chemistry inside a cell: use `$\\ce{...}$`. Example:
-    headers: ["Element", "Symbol", "Atomic Number"]
-    rows: [["Hydrogen", "$\\ce{H}$", "1"], ["Helium", "$\\ce{He}$", "2"]]
-- Fractions, subscripts, superscripts: write as LaTeX inside `$...$`. Example: `"$x^2$"`, `"$\\frac{a}{b}$"`, `"$H_2O$"` (or better: `"$\\ce{H2O}$"`).
-- Special symbols (°, ±, ≤, ≥, ×, ÷): wrap as math `"$90°$"`, `"$\\pm 5$"`, `"$x \\leq y$"`, `"$5 \\times 10^3$"`.
-- Plain text cells (no math): leave as-is, no wrapping needed. Example: `"Hydrogen"`, `"Solid"`, `"Magnetic"`.
-- DO NOT emit complex environments (\\begin{matrix}, \\begin{cases}) inside a cell — keep cell content to single-line inline math.
-- DO NOT use Unicode math glyphs (²³⁻⁺×÷≤) inside cells — always use LaTeX `$x^2$` form so KaTeX renders properly.
+ANY grid / matrix / row-and-column structure printed on the page IS a table.
+Emit it as type="table" — NEVER as type="body" (paragraph), NEVER as
+type="key_point" (callout), NEVER concatenated into a single string with
+newlines and pipes. Tables are STRUCTURED DATA, not prose.
 
-Why this matters: a cell with `"1.6 × 10^{-19}"` will render as plain text "1.6 × 10^{-19}" (literally the source). A cell with `"$1.6 \\times 10^{-19}$"` renders as 1.6 × 10⁻¹⁹ (rendered math). Always wrap math/symbols.
+If you see ANY of the following, it is a table — emit as type="table":
+  - Two or more rows aligned in columns (with or without visible borders)
+  - A comparison grid (e.g. "Element | Symbol | Atomic Number")
+  - A properties table, periodic-table excerpt, formulae list with parallel columns
+  - A data table with numeric values across columns
+  - A row of column headers above aligned data rows
+  - Side-by-side definitions / specifications (e.g. "Type A: ...  Type B: ...")
+  - Reaction/process tables with reagents, conditions, products in columns
+
+Fields (all required):
+  - headers : array of column header strings (left-to-right). If the printed
+              table has no header row, emit headers as [] and put the first
+              row's content in rows[0].
+  - rows    : array of rows. Each row is an array of cell strings, one per
+              column. Cell count per row MUST equal headers.length (pad
+              with "" if a cell is genuinely empty in the printed table).
+  - caption : the printed table title / caption if present, else "".
+
+TABLE CELLS — MATH + CHEMISTRY MUST RENDER VIA KATEX:
+
+Each cell goes through KaTeX rendering in the frontend. Math/chemistry
+symbols NOT wrapped in `$...$` render as plain text — broken output.
+
+Wrap every cell that contains math or chemistry:
+  - Math:        "$c$", "$3 \\times 10^8$", "$x^2 + y^2 = r^2$"
+  - Chemistry:   "$\\ce{H2O}$", "$\\ce{CO2}$", "$\\ce{Fe^{3+}}$"
+  - Fractions:   "$\\frac{a}{b}$"
+  - Sub/super:   "$H_2O$" (or better: "$\\ce{H2O}$")
+  - Symbols:     "$90°$", "$\\pm 5$", "$x \\leq y$", "$5 \\times 10^3$"
+  - Plain text:  leave bare — "Hydrogen", "Solid", "Magnetic" (no wrapping)
+
+Example — periodic table excerpt:
+  {
+    "type": "table",
+    "caption": "First five elements",
+    "headers": ["Element", "Symbol", "Atomic Number", "Atomic Mass"],
+    "rows": [
+      ["Hydrogen",  "$\\ce{H}$",  "1", "$1.008$"],
+      ["Helium",    "$\\ce{He}$", "2", "$4.003$"],
+      ["Lithium",   "$\\ce{Li}$", "3", "$6.941$"]
+    ]
+  }
+
+Example — physics constants:
+  {
+    "type": "table",
+    "caption": "Fundamental constants",
+    "headers": ["Quantity", "Symbol", "Value"],
+    "rows": [
+      ["Speed of light",      "$c$", "$3 \\times 10^8$ m/s"],
+      ["Planck constant",     "$h$", "$6.626 \\times 10^{-34}$ J·s"],
+      ["Elementary charge",   "$e$", "$1.6 \\times 10^{-19}$ C"]
+    ]
+  }
+
+NEVER inside a cell:
+  - Complex LaTeX environments (\\begin{matrix}, \\begin{cases}, \\begin{align})
+    — keep each cell to single-line inline math.
+  - Unicode math glyphs (²³⁻⁺×÷≤≥°±) — always rewrite as LaTeX `$x^2$` so
+    KaTeX renders properly. A cell with "1.6 × 10⁻¹⁹" renders as the literal
+    source text; "$1.6 \\times 10^{-19}$" renders as proper math.
+  - Newlines `\n` — each cell is a single line.
+  - Markdown table syntax (`|`, `---`) — emit structured headers/rows arrays.
+
+If unsure whether something is a table: when it has aligned columns and
+multiple rows, IT IS A TABLE. Emit as type="table".
 
 INVARIANT — copy these VERBATIM, character for character:
 equation, definition, figure captions, placeholder labels (e.g. "Example 5.2")

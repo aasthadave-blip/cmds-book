@@ -223,6 +223,28 @@ def compute_extraction_slice(
     # ── is_container ──────────────────────────────────────────────────
     is_container = bool(section.subsections)
 
+    # ── Schema-resilience for wrappers (don't trust bad page ranges) ──
+    # Some schemas emit a wrapper with page_start > its first child's
+    # page_start (e.g. "Chapter 4" pages 6-6 but children start on page 1).
+    # Following the schema blindly would either (a) try to slice
+    # backwards → SliceComputationError → wrapper marked failed → no
+    # chapter intro content shown, or (b) bleed the wrong page into the
+    # wrapper. Use the children's MIN page_start as the wrapper's start,
+    # so the wrapper extracts only the genuine intro/heading before its
+    # first child. Follows document sequence, not schema page math.
+    if is_container:
+        child_min: Optional[int] = None
+        for child in section.subsections or []:
+            if child.page_start is not None:
+                if child_min is None or child.page_start < child_min:
+                    child_min = child.page_start
+        if child_min is not None and child_min < page_start:
+            diagnostics.append(
+                f"wrapper page_start corrected {page_start} → {child_min} "
+                f"(schema had wrapper after its first child)"
+            )
+            page_start = child_min
+
     # ── next stop boundary ────────────────────────────────────────────
     # Container: its first child is the natural next stop.
     # Leaf:      the next entry in document order (which may be a Cat A

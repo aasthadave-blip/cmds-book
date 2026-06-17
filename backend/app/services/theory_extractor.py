@@ -70,7 +70,38 @@ example, and table. Do not summarize. Do not skip anything.
 
 Target: at least 400 chars of substantive content per page.
 If a page is mostly figures, emit fig captions + surrounding prose.
+
+STOP ANCHOR STILL APPLIES — non-negotiable:
+While being more thorough, you MUST still STOP at the STOP-anchor
+heading specified earlier in the user prompt. "More content" means
+extracting everything BEFORE the STOP heading that you missed last
+time — it does NOT mean extracting content from past the STOP
+heading. If the STOP heading sits on the SAME PAGE as content you
+have already extracted (a same-page boundary), STOP THERE — the
+content under the STOP heading belongs to the next section, not
+this one. Re-read the STOP-anchor instruction above before
+responding.
 """
+
+
+# A chapter-level wrapper has a "bare" section_id — no dot, no hyphen,
+# usually a single number ("5"), Roman numeral ("I"), or word
+# ("chapter"). Subsection IDs always carry a dotted or hyphenated path
+# ("5-introduction", "1.5", "1.2-illustration-1"). Used by the density
+# QC carve-out so chapter wrappers — which legitimately hold minimal
+# content (title + maybe 1-2 line intro) — aren't forced into the
+# completeness retry, which makes Gemini overrun the STOP anchor and
+# pull subsection content into the wrapper's blocks (Ch5 Geometry
+# regression: §5 retry → kp blocks for Key Ideas + Remember leaked
+# into the chapter wrapper, then duplicated as standalone subsections).
+def _is_chapter_wrapper_id(section_id: str | None) -> bool:
+    if not section_id:
+        return False
+    sid = section_id.strip()
+    if not sid:
+        return False
+    # No dotted/hyphenated path = bare wrapper id
+    return "-" not in sid and "." not in sid
 
 
 def _is_transient(err: Exception) -> bool:
@@ -280,8 +311,14 @@ def _is_legitimately_short_section(blocks: list[dict]) -> bool:
     )
     fig_count = sum(1 for b in blocks if b.get("t") == "fig")
     list_count = sum(1 for b in blocks if b.get("t") == "list")
-    # Mostly chips (Cat A parent) — short by design
-    if chip_count / n > 0.5:
+    # Mostly chips (Cat A parent) — short by design. Threshold tightened
+    # to >=0.7 so parents that carry real body content alongside chips
+    # (e.g. a Cat A parent with the SI/Dimensional-Formulae table plus
+    # 2 chip refs → ratio 0.5) are NOT excused from the density check.
+    # 0.5 was excusing chapters whose multi-page body tables silently
+    # dropped on the floor (book Theory and Question Unit and measurement,
+    # §1.5: 2 paragraphs + 2 chips over 5 pages, 76 chars/pp).
+    if n >= 1 and chip_count / n >= 0.7:
         return True
     # Mostly figures
     if fig_count / n > 0.5:
@@ -359,11 +396,28 @@ def _simple_qc(
 
     # Completeness contract — density floor. Operates on normalized blocks
     # (the canonical {t,c,...} shape) so the char counting is unambiguous.
+    #
+    # Density check applies to:
+    #   • LEAF sections (is_container=False)
+    #   • Subsection-level CONTAINERS that legitimately carry body content
+    #     alongside their children (e.g. §1.5 Dimensional Formulae table
+    #     in Unit & Measurement — 5 pages of table body alongside 2 chip
+    #     refs; without the density check the table silently truncated).
+    #
+    # Density check is SKIPPED for chapter-level wrappers (is_container=
+    # True AND _is_chapter_wrapper_id(section_id)). Chapter wrappers
+    # genuinely have minimal content — just chapter title + optional 1-2
+    # line intro before the first subsection. Forcing them to retry
+    # under the completeness addendum makes Gemini extract subsection
+    # content INTO the wrapper's blocks, past the STOP anchor (book Ch5
+    # Geometry, §5: retry produced kp blocks for Key Ideas + Remember
+    # subsections inside the chapter wrapper, then those subsections
+    # also rendered standalone → duplicated content).
     if (
         blocks is not None
         and section_page_start is not None
         and section_page_end is not None
-        and not is_container
+        and not (is_container and _is_chapter_wrapper_id(section_id))
     ):
         pages = max(1, section_page_end - section_page_start + 1)
         text_blocks = ("p", "kp", "def", "h1", "h2", "h3", "list")

@@ -23,15 +23,29 @@ export type QuestionEmbeddedFigure = {
   figure_id: string;
   label: string;
   caption: string;
+  // Gemini-extracted 2-3 sentence description of what the figure shows.
+  // Used as the PLACEHOLDER info text for UNLABELLED figures (where label
+  // and caption are both empty strings). The user always sees SOMETHING
+  // describing the image, even when the source PDF didn't print a label.
+  description?: string;
   variant: 'original' | 'regen';
   image_url: string;
   placement_kind?: string;
   placement_char_offset?: number | null;
+  // Explicit body target — embedder-computed. Tells the UI whether to
+  // render this figure under the question stem or inside the solution
+  // block. NULL on legacy refs (rendered as question body by default).
+  body_target?: 'question' | 'solution' | null;
 };
 
 export type ExtractedQuestion = {
   id: string;
   section_ref: string;
+  // Canonical UUID FK to the Section row this question belongs to.
+  // Frontend joins on this (not section_ref slug) so schema/db slug
+  // divergence — see the Class-9th-Maths blank-tab bug — can never
+  // hide questions again. Null on legacy rows; slug is the fallback.
+  section_uuid?: string | null;
   section_title: string | null;
   page_start: number | null;
   page_end: number | null;
@@ -60,6 +74,12 @@ export type RejectedItem = {
 
 export type SectionQuestions = {
   section_ref: string;
+  // Canonical UUID FK to the Section row. See ExtractedQuestion.section_uuid
+  // — this is the same identity, surfaced at the group level so the UI
+  // can join `bs.section_uuid === selectedSection.id` instead of slug-
+  // matching. Null when the schema slug doesn't map to any DB Section row
+  // (legacy / pre-race-fix books); selector falls back to section_ref.
+  section_uuid?: string | null;
   section_title: string | null;
   questions: ExtractedQuestion[];
   extracted: number;
