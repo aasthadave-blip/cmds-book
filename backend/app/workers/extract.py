@@ -172,18 +172,6 @@ def analyse_book_task(self, book_id: str, job_id: str) -> dict:
         try:
             pdf_bytes = download_pdf(book.pdf_url)
 
-            # SCANNED page-number reliability (additive, fail-safe): produce an
-            # OCR'd copy with an invisible text layer so the deterministic
-            # page-anchor can locate section headings. build_schema below still
-            # runs on the ORIGINAL bytes (preserves its scanned-timeout
-            # preflight + behaviour); the OCR'd copy is used ONLY to re-anchor
-            # page ranges after the schema is built. ensure_text_layer never
-            # raises and returns the original bytes for digital PDFs / on any
-            # OCR error, so this can only help, never break ingest.
-            from app.services.pdf_text_layer import ensure_text_layer
-
-            _ocr_pdf_bytes, _ocr_applied = ensure_text_layer(pdf_bytes)
-
             # Fast path: try to derive P1 metadata locally (pymupdf, no Claude call).
             # This works for digital PDFs and saves one full agent subprocess round-trip.
             _update_job(session, job_uuid, message="Analysing PDF", progress=15)
@@ -243,24 +231,6 @@ def analyse_book_task(self, book_id: str, job_id: str) -> dict:
                 raise ValueError(
                     "Schema generation produced no parseable output across all attempts"
                 )
-
-            # SCANNED page-anchor: Gemini's page numbers are unreliable on
-            # scanned PDFs (it can map every section of a multi-page chapter
-            # onto a single summary page). If we built an OCR text layer above,
-            # relocate each section's page range by finding its heading in the
-            # real per-page text — the same deterministic anchor digital PDFs
-            # already use. Fail-safe: on any error keep the schema's pages.
-            if _ocr_applied:
-                try:
-                    from app.services.schema_page_anchor import anchor_pages_from_pdf
-
-                    schema, _anchor_rep = anchor_pages_from_pdf(schema, _ocr_pdf_bytes)
-                    logger.info("scanned page-anchor applied: %s", _anchor_rep)
-                except Exception as _anchor_err:
-                    logger.warning(
-                        "scanned page-anchor failed (keeping schema pages): %s",
-                        _anchor_err,
-                    )
 
             # Derive AnalyserResult: use pymupdf fast-path if available, otherwise
             # build it entirely from the Gemini schema output (no Claude P1 needed).
