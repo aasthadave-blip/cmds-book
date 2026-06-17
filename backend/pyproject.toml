@@ -22,6 +22,10 @@ dependencies = [
     "pymupdf>=1.27.0",
     "pypdf>=5.0.0",
     "pdfplumber>=0.11.0",
+    # OCR text layer for scanned PDFs (deterministic page-anchoring).
+    # Shells out to system tesseract + ghostscript (installed via the
+    # Dockerfile in prod / Homebrew locally).
+    "ocrmypdf>=16.0.0",
     # Claude Agent SDK — "agent" mode (Claude Code OAuth, no API key needed)
     "claude-agent-sdk>=0.1.0",
     # HTTP

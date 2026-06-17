@@ -8,12 +8,18 @@ ENV PYTHONDONTWRITEBYTECODE=1 \
 
 WORKDIR /app
 
-# pandoc is required at runtime for docx export (pypandoc shells out to it).
+# pandoc        → docx export (pypandoc shells out to it)
+# tesseract-ocr → OCR text layer for scanned PDFs (pdf_text_layer.ensure_text_layer)
+# ghostscript   → required by ocrmypdf
+# poppler-utils → PDF page rendering
 RUN apt-get update && apt-get install -y --no-install-recommends \
     build-essential \
     curl \
     libpq-dev \
     pandoc \
+    tesseract-ocr \
+    ghostscript \
+    poppler-utils \
     && rm -rf /var/lib/apt/lists/*
 
 COPY pyproject.toml ./
