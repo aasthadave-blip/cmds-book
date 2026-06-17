@@ -153,6 +153,19 @@ def _block_text_pool(b: Any) -> str:
     if not isinstance(b, dict):
         return ""
     parts: list[str] = []
+    # Definition blocks: the printed (and figure-anchor) form is
+    # "term: content" — e.g. "Line: A line is a set of infinite points…".
+    # Emit that term-first reconstruction FIRST so a figure anchor of the
+    # same shape matches as a contiguous substring. The generic field loop
+    # below appends `term` AFTER `c`, which yields "A line is… Line"
+    # (term last) and breaks the substring match — this is the regression
+    # that dropped definition figures to page_fallback. Restores the prior
+    # embedder behavior (f"{term}: {c}").
+    if b.get("t") == "def":
+        _term = b.get("term")
+        _dc = b.get("c") or b.get("content")
+        if isinstance(_term, str) and _term and isinstance(_dc, str) and _dc:
+            parts.append(f"{_term}: {_dc}")
     # Scalar string fields (every block type's primary text)
     for k in ("c", "content", "label", "term", "caption", "number", "ref"):
         v = b.get(k)
