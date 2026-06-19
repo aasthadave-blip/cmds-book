@@ -60,3 +60,10 @@ backend/sample_export_theory.py
 # resvg standalone binary — Windows-dev SVG->PNG fallback (prod uses cairosvg).
 # Download per backend/tools/resvg/README.md; not committed (platform-specific binary).
 backend/tools/resvg/
+
+# Local dev launch scripts (Windows-specific convenience, not part of the app)
+start-backend.bat
+start-frontend.bat
+
+# Debug render artifacts
+backend/diag_*.png
