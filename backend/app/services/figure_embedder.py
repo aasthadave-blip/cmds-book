@@ -517,6 +517,42 @@ def _apply_update(existing: FigureReference, target: FigureReference) -> None:
 #   - Stem-vs-solution routing actually uses body_type (now populated
 #     after the raw_context fix in figures_tasks.py:_derive_body_type).
 
+def _anchor_match_needles(norm_anchor: str) -> list[str]:
+    """Exact-substring needles for matching a figure anchor against a block.
+
+    GENERAL fix for the whole class of "the anchor text is right there but it
+    didn't match" failures. An anchor often starts with math/symbols
+    ("tan⁻¹(b/a)") that canonicalize DIFFERENTLY between the anchor (Unicode)
+    and the block (LaTeX source). Matching only the anchor's PREFIX then fails
+    even though the prose later in the anchor is a verbatim substring of the
+    block.
+
+    So we return the prefix windows AND exact sliding windows across the WHOLE
+    anchor. The caller takes the first block containing ANY of these runs.
+    Every needle is an exact substring of the normalized anchor (no fuzzy, no
+    token-overlap) → it cannot false-positive onto an unrelated block; it just
+    stops betting everything on the first 60 characters. General for any
+    anchor whose distinctive text is not at the very start.
+    """
+    n = len(norm_anchor)
+    if not n:
+        return []
+    if n <= 40:
+        return [norm_anchor] if n <= 30 else [norm_anchor, norm_anchor[:30]]
+    out = [norm_anchor[:60], norm_anchor[:30]]
+    win, step = 40, 20
+    for start in range(0, n - win + 1, step):
+        out.append(norm_anchor[start:start + win])
+    out.append(norm_anchor[-win:])  # always cover the tail
+    seen: set[str] = set()
+    uniq: list[str] = []
+    for x in out:
+        if x and x not in seen:
+            seen.add(x)
+            uniq.append(x)
+    return uniq
+
+
 def _compute_figure_placements(
     figures,
     sections_by_id,
@@ -1031,10 +1067,12 @@ def _compute_figure_placements(
                 if anchor and isinstance(blocks, list):
                     from app.services.figure_normalizer import normalize_for_match
                     norm_anchor = normalize_for_match(anchor)
-                    # 60-char window with 30-char fallback. The normalizer
-                    # often shortens text (strips punctuation, collapses
-                    # whitespace) so 60 normalized chars ≈ 80-90 raw.
-                    needles = [norm_anchor[:60], norm_anchor[:30]]
+                    # Prefix windows PLUS exact sliding windows across the
+                    # whole anchor — so a clean run of the anchor text still
+                    # matches even when the START contains math/symbols that
+                    # canonicalize differently (e.g. "tan⁻¹(b/a)" vs LaTeX).
+                    # All needles are exact substrings → no false positives.
+                    needles = _anchor_match_needles(norm_anchor)
                     if needles[0]:
                         # Pre-normalize every block's full text pool ONCE
                         # per section (per-figure was redundant work).
@@ -1058,13 +1096,107 @@ def _compute_figure_placements(
                             if block_idx is not None:
                                 break
 
-            # Step 2: positional adjustment for unlabelled
+            # Step 1c-cross: anchor not found in the scheduled section →
+            # search EVERY OTHER section for the SAME exact anchor text and
+            # relocate the figure there. The figure pass sometimes files a
+            # figure under the wrong sibling/sub-section; the anchor text is
+            # the source of truth for where it belongs. Only STRONG (>=40-char)
+            # exact-substring needles run cross-section, so a short generic
+            # run can't pull a figure into an unrelated section.
+            if block_idx is None:
+                _xa = (pos_meta.get("anchor_text") or "").strip()
+                if _xa:
+                    from app.services.figure_normalizer import normalize_for_match
+                    _xstrong = [
+                        n for n in _anchor_match_needles(normalize_for_match(_xa))
+                        if len(n) >= 40
+                    ]
+                    if _xstrong:
+                        for _xsid, _xsec in sections_by_id.items():
+                            if _xsid == target_section_slug:
+                                continue
+                            _xbl = getattr(_xsec, "blocks", None) or []
+                            if not isinstance(_xbl, list) or not _xbl:
+                                continue
+                            _xpool = [
+                                normalize_for_match(_block_text_pool(b)) for b in _xbl
+                            ]
+                            _xhit = None
+                            for _nd in _xstrong:
+                                for _bi, _p in enumerate(_xpool):
+                                    if _nd in _p:
+                                        _xhit = _bi
+                                        break
+                                if _xhit is not None:
+                                    break
+                            if _xhit is not None:
+                                target_section_slug = _xsid
+                                sec_row = _xsec
+                                blocks = _xbl
+                                block_idx = _xhit
+                                placement_kind = "inline"
+                                counters["theory_relinked_by_anchor"] = (
+                                    counters.get("theory_relinked_by_anchor", 0) + 1
+                                )
+                                break
+
+            # Step 1d: SUB-UNIT (list item) resolution. If the matched block
+            # is a multi-item list, find WHICH item the anchor matched so the
+            # figure lands INSIDE the list at that item — not stacked after
+            # the whole merged list. We record a char offset into the
+            # "\n"-joined items; the theory reader splits the list there.
+            # Only theory list blocks set this; the question + export readers
+            # consume char_offset BY CONTEXT, so theory values are isolated.
+            sub_char_offset = None
+            if block_idx is not None and isinstance(blocks, list):
+                _blk = blocks[block_idx]
+                _items = _blk.get("items") if isinstance(_blk, dict) else None
+                if isinstance(_items, list) and len(_items) > 1:
+                    from app.services.figure_normalizer import normalize_for_match
+                    _anchor = (pos_meta.get("anchor_text") or "").strip()
+                    _needles = _anchor_match_needles(normalize_for_match(_anchor))
+                    _inorm = [normalize_for_match(str(it)) for it in _items]
+                    _hit = None
+                    for _nd in _needles:
+                        if not _nd:
+                            continue
+                        for _k, _ip in enumerate(_inorm):
+                            if _nd in _ip:
+                                _hit = _k
+                                break
+                        if _hit is not None:
+                            break
+                    if _hit is not None:
+                        _apos = (pos_meta.get("anchor_position") or "below").lower()
+                        # "above" (text above figure) → figure AFTER that item;
+                        # "below"/other → figure BEFORE that item.
+                        _upto = _hit + 1 if _apos == "above" else _hit
+                        sub_char_offset = len(
+                            "\n".join(str(x) for x in _items[:_upto])
+                        )
+
+            # Step 2: positional adjustment for unlabelled.
+            # anchor_position = where the ANCHOR TEXT sits relative to the
+            # FIGURE (set by the figure-extraction pass), so INVERT it to
+            # place the figure. The reader renders a figure right AFTER
+            # block `placement_block_idx`, so:
+            #   "above" (text above image) → figure BELOW the text →
+            #            render AFTER the anchor block         (block_idx)
+            #   "below" (text below image) → figure ABOVE the text →
+            #            render BEFORE the anchor block         (block_idx - 1)
+            #   "beside"/unknown → before the anchor (figure first, then text)
+            # Matches the labelled/migrate path (Spot 2) convention below.
             if block_idx is not None:
-                anchor_position = (pos_meta.get("anchor_position") or "below").lower()
-                if anchor_position == "above":
-                    final_block_idx = max(0, block_idx - 1)
-                else:  # below / beside / unknown → AFTER the anchor block
+                if sub_char_offset is not None:
+                    # Sub-unit placement: keep the figure ON the list block;
+                    # the char offset positions it at the right item inside.
                     final_block_idx = block_idx
+                else:
+                    anchor_position = (pos_meta.get("anchor_position") or "below").lower()
+                    if anchor_position == "above":
+                        final_block_idx = block_idx
+                    else:  # below / beside / unknown → BEFORE the anchor block
+                        final_block_idx = max(0, block_idx - 1)
             else:
                 # Step 3: page_fallback — emit at section end so the
                 # figure surfaces SOMEWHERE in its section instead of
@@ -1080,7 +1212,7 @@ def _compute_figure_placements(
                 placeholder_text=None, link_method="auto",
                 placement_kind=placement_kind,
                 placement_block_idx=final_block_idx,
-                placement_char_offset=None,
+                placement_char_offset=sub_char_offset,
             ))
             if placement_kind != "page_fallback":
                 counters["theory_inline"] += 1

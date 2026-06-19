@@ -12,11 +12,84 @@ hallucinations (page_end=999 on a 50-page PDF, page_start=0 on a
 
 from __future__ import annotations
 
+import logging
 from typing import Any
+
+logger = logging.getLogger(__name__)
 
 
 def _is_int(v: Any) -> bool:
     return isinstance(v, int) and not isinstance(v, bool)
+
+
+def _collect_pages(schema_dict: dict) -> list[int]:
+    """Gather every page_start/page_end int across sections + excluded (nested)."""
+    out: list[int] = []
+
+    def walk(nodes):
+        for n in nodes or []:
+            if not isinstance(n, dict):
+                continue
+            for k in ("page_start", "page_end"):
+                v = n.get(k)
+                if _is_int(v):
+                    out.append(v)
+            walk(n.get("subsections") or [])
+
+    walk(schema_dict.get("sections") or [])
+    walk(schema_dict.get("excluded_sections") or [])
+    return out
+
+
+def _detect_print_offset(schema_dict: dict, total_pages: int) -> int:
+    """Detect a systematic PRINTED-page-number offset; return amount to subtract.
+
+    When a mid-book chapter is saved as a standalone PDF, Gemini sometimes
+    reports the book's PRINTED page numbers (e.g. 96–117) instead of the PDF's
+    physical indices (1–22). The plain clamp would then crush every value > N
+    down to N (all sections collapse onto the last page). Instead, if the whole
+    set of page numbers is a contiguous band sitting ABOVE the page count but
+    that would FIT inside [1, total_pages] once shifted down, we shift it — the
+    printed→physical conversion (96–117 → 1–22).
+
+    Returns 0 (no shift) for:
+      • normal in-range books (max ≤ total_pages) — never triggers,
+      • a lone hallucinated outlier (page 999 among 1–8) — its span far exceeds
+        total_pages, so it's left to the clamp.
+    """
+    pages = _collect_pages(schema_dict)
+    if not pages:
+        return 0
+    pmin, pmax = min(pages), max(pages)
+    # Only when the top of the band actually exceeds the PDF length.
+    if pmax <= total_pages:
+        return 0
+    # ...and the band is shifted above page 1 and would fit once shifted down.
+    span = pmax - pmin + 1
+    if pmin > 1 and span <= total_pages:
+        return pmin - 1
+    return 0
+
+
+def _shift_pages(schema_dict: dict, offset: int) -> int:
+    """Subtract `offset` from every page_start/page_end. Returns count changed."""
+    n = 0
+
+    def walk(nodes):
+        nonlocal n
+        for node in nodes or []:
+            if not isinstance(node, dict):
+                continue
+            for k in ("page_start", "page_end"):
+                v = node.get(k)
+                if _is_int(v):
+                    node[k] = v - offset
+                    n += 1
+            walk(node.get("subsections") or [])
+
+    walk(schema_dict.get("sections") or [])
+    walk(schema_dict.get("excluded_sections") or [])
+    return n
 
 
 def _clamp_pair(
@@ -67,6 +140,20 @@ def clamp_pages_to_bounds(
         return schema_dict, 0
     if total_pages is None or not isinstance(total_pages, int) or total_pages <= 0:
         return schema_dict, 0
+
+    # PRINTED-page-offset pre-pass (runs BEFORE the clamp): if Gemini emitted
+    # the book's printed page numbers for a mid-book chapter (e.g. 96–117 in a
+    # 22-page PDF), shift the whole band down to physical [1, N] instead of
+    # letting the clamp crush every out-of-range value onto the last page.
+    # No-op for in-range books and lone outliers (see _detect_print_offset).
+    offset = _detect_print_offset(schema_dict, total_pages)
+    if offset > 0:
+        n_shifted = _shift_pages(schema_dict, offset)
+        logger.info(
+            "page-offset detected: shifted %d page value(s) by -%d "
+            "(printed page numbers → physical 1-%d)",
+            n_shifted, offset, total_pages,
+        )
 
     n_total = 0
 

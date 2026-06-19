@@ -222,35 +222,43 @@ export function TheoryView({
       if (label) linkedLabels.add(label);
     }
   }
-  let blocks = rawBlocks.filter((b) => {
-    if (b.t !== 'example_ref') return true;
+  // Compute the set of RAW block indices to HIDE from rendering — WITHOUT
+  // re-indexing the array. Embedded (unlabelled) figures are keyed by their
+  // original `placement_block_idx`, so the render MUST look them up by the
+  // ORIGINAL index. Filtering into a new array (and .slice(1)) silently
+  // shifted every figure down by the number of removed blocks before it —
+  // the root cause of unlabelled-figure misplacement. We render over
+  // rawBlocks with the original index intact and just skip the dropped ones.
+  const droppedIdx = new Set<number>();
+  rawBlocks.forEach((b, i) => {
+    if (b.t !== 'example_ref') return;
     const label = (b as { label?: string }).label?.trim();
-    // If a sibling question_ref/exercise_ref exists with the same label
-    // → drop this example_ref (duplicate chip).
-    return !(label && linkedLabels.has(label));
+    // Drop an example_ref whose label also appears as a linked
+    // question_ref/exercise_ref (duplicate chip).
+    if (label && linkedLabels.has(label)) droppedIdx.add(i);
   });
 
-  // Dedupe duplicate heading: when the FIRST block is a heading whose text
-  // matches the section title (case/punctuation-insensitive), drop it. The
-  // section title is already shown above (by SectionHeader or by the parent
-  // page header). The same applies to a leading `h3` block — common when the
-  // extractor emits an h3 with the section name at the top of the section.
+  // Dedupe duplicate heading: when the FIRST VISIBLE block is a heading whose
+  // text matches the section title (case/punctuation-insensitive), hide it —
+  // the section title is already shown above (SectionHeader / page header).
   const normHeading = (s: string) =>
     s
       .toLowerCase()
       .replace(/[^a-z0-9]+/g, ' ')
       .trim();
-  if (blocks.length > 0) {
-    const first = blocks[0] as { t: string; c?: string };
+  const firstVisibleIdx = rawBlocks.findIndex((_, i) => !droppedIdx.has(i));
+  if (firstVisibleIdx >= 0) {
+    const first = rawBlocks[firstVisibleIdx] as { t: string; c?: string };
     if (
       (first.t === 'heading' || first.t === 'h3' || first.t === 'h2') &&
       typeof first.c === 'string' &&
       section.title &&
       normHeading(first.c) === normHeading(section.title)
     ) {
-      blocks = blocks.slice(1);
+      droppedIdx.add(firstVisibleIdx);
     }
   }
+  const visibleBlockCount = rawBlocks.length - droppedIdx.size;
 
   // Build a {normalized label → Figure} map for inline image rendering.
   const figureByLabel = new Map<string, Figure>();
@@ -300,6 +308,11 @@ export function TheoryView({
   // figure has a label.
   type EmbeddedFigure = {
     placement_block_idx?: number | null;
+    // Sub-unit position INSIDE the block (char offset into the block's
+    // "\n"-joined sub-units). Set by the embedder for figures that belong
+    // to a specific list item, so they render between items, not after the
+    // whole list. null → block-level (render after the block, as before).
+    placement_char_offset?: number | null;
     image_url?: string;
     label?: string;
     figure_number?: string;
@@ -383,7 +396,7 @@ export function TheoryView({
         )}
         {!hideHeader && <SectionHeader section={section} />}
 
-        {blocks.length === 0 ? (
+        {visibleBlockCount === 0 ? (
           <div
             style={{
               padding: '40px 24px',
@@ -404,14 +417,39 @@ export function TheoryView({
           </div>
         ) : (
           <div style={{ marginTop: 20 }}>
-            {blocks.map((b, i) => (
-              <React.Fragment key={i}>
-                <BlockRender block={b} figureByLabel={figureByLabel} />
-                {figuresByBlockIdx.get(i)?.map((ef, j) => (
-                  <EmbeddedFigureRender key={`embed-${i}-${j}`} ef={ef} />
-                ))}
-              </React.Fragment>
-            ))}
+            {rawBlocks.map((b, i) => {
+              // Iterate over rawBlocks so the index `i` matches each figure's
+              // placement_block_idx. Hidden blocks (dropped chips / duplicate
+              // title heading) are skipped from display but their index slot
+              // is preserved, so figures never shift.
+              const figs = figuresByBlockIdx.get(i) ?? [];
+              const isList = (b as { t?: string }).t === 'list';
+              // Figures carrying a sub-unit offset belong INSIDE a list at a
+              // specific item; render those interleaved. The rest render
+              // after the block (unchanged behavior).
+              const subFigs = isList
+                ? figs.filter((f) => typeof f.placement_char_offset === 'number')
+                : [];
+              const afterFigs = subFigs.length
+                ? figs.filter((f) => typeof f.placement_char_offset !== 'number')
+                : figs;
+              return (
+                <React.Fragment key={i}>
+                  {!droppedIdx.has(i) &&
+                    (subFigs.length > 0 ? (
+                      <ListWithInlineFigures
+                        block={b as { items?: string[]; ordered?: boolean }}
+                        figs={subFigs}
+                      />
+                    ) : (
+                      <BlockRender block={b} figureByLabel={figureByLabel} />
+                    ))}
+                  {afterFigs.map((ef, j) => (
+                    <EmbeddedFigureRender key={`embed-${i}-${j}`} ef={ef} />
+                  ))}
+                </React.Fragment>
+              );
+            })}
             {/* Trailing figures: embedder attached them to this section but
                 couldn't anchor to a specific block (page_fallback). Render
                 at section end so no extracted figure is dropped. Same
@@ -1045,6 +1083,72 @@ function BlockRender({
  * fallback) that the label-keyed `figureByLabel` map cannot resolve.
  * The image_url comes from the API response (`/api/figures/<id>/image`).
  */
+// Render a list block with figures placed INSIDE it, after the specific
+// item each figure belongs to. The embedder records a char offset into the
+// block's "\n"-joined items; we recompute the same item boundaries and slot
+// each figure after the matching item. Falls back to nothing special when
+// there are no sub-unit figures (the caller only uses this then).
+function ListWithInlineFigures({
+  block,
+  figs,
+}: {
+  block: { items?: string[]; ordered?: boolean };
+  figs: Array<{
+    placement_char_offset?: number | null;
+    image_url?: string;
+    label?: string;
+    figure_number?: string;
+    caption?: string;
+    description?: string;
+    placement_kind?: string;
+    figure_id?: string;
+  }>;
+}) {
+  const items = block.items ?? [];
+  if (items.length === 0) return null;
+  const strip = (s: string) =>
+    s.replace(/^\s*(?:\(\s*\d+\s*\)|\d+[.)])\s+/, '').trim();
+  // boundary[k] = char length of items[0..k] joined by "\n" — identical to
+  // the backend's offset math, so a figure's offset maps to the item it
+  // should follow (smallest k with boundary[k] >= offset).
+  const boundary: number[] = [];
+  let acc = 0;
+  items.forEach((it, k) => {
+    acc += (k > 0 ? 1 : 0) + it.length;
+    boundary.push(acc);
+  });
+  const figsByItem = new Map<number, typeof figs>();
+  for (const ef of figs) {
+    const off = ef.placement_char_offset ?? 0;
+    let k = boundary.findIndex((bnd) => bnd >= off);
+    if (k < 0) k = items.length - 1;
+    const arr = figsByItem.get(k) ?? [];
+    arr.push(ef);
+    figsByItem.set(k, arr);
+  }
+  const Tag = block.ordered === false ? 'ul' : 'ol';
+  return (
+    <Tag
+      style={{
+        margin: '4px 0 14px',
+        paddingLeft: 24,
+        fontSize: 15,
+        lineHeight: 1.7,
+        color: 'var(--ink-800)',
+      }}
+    >
+      {items.map((it, i) => (
+        <li key={i} style={{ marginBottom: 6 }}>
+          <MathMarkdown inline>{strip(it)}</MathMarkdown>
+          {figsByItem.get(i)?.map((ef, j) => (
+            <EmbeddedFigureRender key={`li-embed-${i}-${j}`} ef={ef} />
+          ))}
+        </li>
+      ))}
+    </Tag>
+  );
+}
+
 function EmbeddedFigureRender({
   ef,
 }: {

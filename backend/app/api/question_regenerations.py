@@ -21,7 +21,7 @@ import re
 import shutil
 import tempfile
 from pathlib import Path
-from typing import Any
+from typing import Any, Literal
 from uuid import UUID
 
 from fastapi import APIRouter, Body, Depends, HTTPException, Query, Response, status
@@ -50,19 +50,15 @@ class RegenerateRequest(BaseModel):
     label: str | None = None
 
     # R4 — v3 regen params. All optional with worker-side defaults.
-    similarity_level: str | None = Field(
-        default=None,
-        pattern=(
-            "^(numbers_only|numbers_and_rephrase|new_question_same_topic"
-            "|same_topic_add_one_concept|same_chapter_any_topic)$"
-        ),
-    )
-    count: int | None = Field(default=None, ge=1, le=20)
+    similarity_level: Literal[
+        "numbers_and_rephrase",
+        "numbers_rephrase_add_concept",
+        "new_question_same_topic",
+        "same_topic_add_one_concept",
+        "same_chapter_any_topic",
+    ] | None = Field(default=None)
     question_type: str | None = Field(default=None, max_length=64)
-    priority_mode: str | None = Field(
-        default=None,
-        pattern="^(override|layer_on_top|specific_aspects)$",
-    )
+    priority_mode: Literal["override"] = "override"
 
 
 def _regen_dict(r: QuestionRegeneration, question_count: int = 0) -> dict:
@@ -142,6 +138,10 @@ def _question_dict(
         "has_solution": q.has_solution,
         "kind": q.kind or "exercise",
         "embedded_figures": embedded,
+        # qc_local carries the no-skip fallback flag (regen_failed) so the
+        # frontend can badge a retained-original variant ("couldn't
+        # regenerate — original retained") and offer a retry.
+        "qc_local": q.qc_local,
     }
 
 
@@ -179,7 +179,6 @@ async def start_regeneration(
         custom_instructions=(payload.custom_instructions or None),
         # R4 — v3 regen params (all optional; worker uses defaults if None)
         similarity_level=payload.similarity_level,
-        count=payload.count,
         question_type=payload.question_type,
         priority_mode=payload.priority_mode,
         status="pending",
@@ -380,6 +379,12 @@ async def save_regeneration(
         raise HTTPException(400, detail=f"Cannot save regen with status={r.status}")
     r.status = "saved"
     await session.commit()
+    # The UPDATE fires `updated_at`'s server-side onupdate, which SQLAlchemy
+    # expires on commit. `_regen_dict` is synchronous and reads `r.updated_at`
+    # — a lazy refresh from a sync attribute access inside an async request
+    # raises MissingGreenlet (→ 500 on the "Save Questions Regen" CTA).
+    # Refresh explicitly in the async context so every column is loaded.
+    await session.refresh(r)
     return _regen_dict(r)
 
 

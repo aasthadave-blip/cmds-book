@@ -727,7 +727,12 @@ function BlockRender({ block }: { block: Block }) {
   }
   if (t === 'list') {
     const items = ((block as { items?: string[] }).items ?? []);
-    return <ol style={{ paddingLeft: 18, fontSize: 13, lineHeight: 1.55, margin: 0 }}>
+    // Split-list parts (backend resolver, content_stream) carry `_split_start`
+    // so the <ol> numbering continues across the figure cards interleaved
+    // between parts — each part is its own draggable card but reads as one
+    // list. Non-split lists have no `_split_start` → unchanged.
+    const splitStart = (block as { _split_start?: number })._split_start;
+    return <ol start={typeof splitStart === 'number' ? splitStart : undefined} style={{ paddingLeft: 18, fontSize: 13, lineHeight: 1.55, margin: 0 }}>
       {items.map((it, i) => <li key={i} style={{ whiteSpace: 'pre-wrap' }}>{it}</li>)}
     </ol>;
   }

@@ -62,6 +62,7 @@ def _draft_to_dict(draft: FinalDraft) -> dict[str, Any]:
         "book_id": str(draft.book_id),
         "status": draft.status,
         "prefer_regen": bool(draft.prefer_regen),
+        "is_dirty": bool(draft.is_dirty),
         "items": draft.items or [],
         "item_count": len(draft.items or []),
         "last_seeded_at": (
@@ -76,8 +77,16 @@ async def _load_or_seed(
     book_id: UUID,
     *,
     prefer_regen: bool = True,
+    auto_reseed: bool = True,
 ) -> FinalDraft:
-    """Fetch the draft; seed one if it doesn't exist yet."""
+    """Fetch the draft; seed one if it doesn't exist yet.
+
+    ``auto_reseed=False`` returns the persisted draft AS-IS (no fresh seed).
+    The PATCH path uses this: a reseed regenerates every item id, so
+    reseeding before applying an op would invalidate the id the client just
+    sent (→ "unknown id"). Edits must apply against the exact items the
+    client is looking at.
+    """
     # Verify book exists (clear 404 instead of FK error later)
     book = await session.get(Book, book_id)
     if book is None:
@@ -105,22 +114,29 @@ async def _load_or_seed(
     # any failure we serve whatever items were last persisted. Mirrors
     # the auto-heal failure handling in build_final_merge.
     if existing is not None:
-        try:
-            fresh_items = await seed_draft_items_from_merge(
-                session, book_id, prefer_regen=prefer_regen
-            )
-            existing.items = fresh_items
-            existing.last_seeded_at = datetime.utcnow()
-            existing.prefer_regen = prefer_regen
-            await session.commit()
-            await session.refresh(existing)
-        except Exception as e:
-            import logging as _logging
-            _logging.getLogger(__name__).warning(
-                "auto-reseed failed (book=%s, non-fatal): %s",
-                book_id, e,
-            )
-            await session.rollback()
+        # Preserve manual edits: once the user has edited the draft
+        # (is_dirty), DO NOT auto-reseed — otherwise their delete/reorder/
+        # edit would be overwritten by fresh final-merge and never reflect in
+        # Preview. A clean (un-edited) draft still auto-reseeds so new regen /
+        # figures / schema edits surface automatically. Explicit reseed /
+        # merge-regen clears is_dirty.
+        if auto_reseed and not existing.is_dirty:
+            try:
+                fresh_items = await seed_draft_items_from_merge(
+                    session, book_id, prefer_regen=prefer_regen
+                )
+                existing.items = fresh_items
+                existing.last_seeded_at = datetime.utcnow()
+                existing.prefer_regen = prefer_regen
+                await session.commit()
+                await session.refresh(existing)
+            except Exception as e:
+                import logging as _logging
+                _logging.getLogger(__name__).warning(
+                    "auto-reseed failed (book=%s, non-fatal): %s",
+                    book_id, e,
+                )
+                await session.rollback()
         return existing
 
     items = await seed_draft_items_from_merge(
@@ -183,6 +199,9 @@ async def reseed_final_draft(
         existing.status = "draft"
         existing.prefer_regen = prefer_regen
         existing.last_seeded_at = datetime.utcnow()
+        # Explicit reseed/merge-regen: discard edits → draft is clean again,
+        # so future GETs resume auto-reseeding for freshness.
+        existing.is_dirty = False
         draft = existing
     await session.commit()
     await session.refresh(draft)
@@ -203,7 +222,10 @@ async def patch_final_draft(
             status.HTTP_400_BAD_REQUEST, detail="`operations` must be a list"
         )
 
-    draft = await _load_or_seed(session, book_id)
+    # auto_reseed=False: apply ops on the EXACT persisted items the client is
+    # editing. Reseeding here would regenerate item ids and break the id the
+    # client just sent ("unknown id").
+    draft = await _load_or_seed(session, book_id, auto_reseed=False)
     items = list(draft.items or [])
     for i, op in enumerate(operations):
         if not isinstance(op, dict):
@@ -225,6 +247,9 @@ async def patch_final_draft(
     # flag_modified guarantees the update is persisted.
     from sqlalchemy.orm.attributes import flag_modified
     flag_modified(draft, "items")
+    # Manual edit → mark dirty so GET stops auto-reseeding over it. The edit
+    # now persists and reflects in Preview until an explicit reseed/merge.
+    draft.is_dirty = True
     # Reset status if user edits after a previous export
     if draft.status == "exported":
         draft.status = "draft"

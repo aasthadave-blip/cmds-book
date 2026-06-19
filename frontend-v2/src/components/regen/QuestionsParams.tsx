@@ -8,7 +8,6 @@ import {
   SegmentChoice,
 } from './PipelineCard';
 import type {
-  QuestionsPriorityMode,
   QuestionsRegenParams,
   QuestionsSimilarity,
 } from '../../api/regen';
@@ -19,31 +18,19 @@ type Props = {
 };
 
 const SIMILARITY_OPTS: readonly QuestionsSimilarity[] = [
-  'numbers_only',
   'numbers_and_rephrase',
+  'numbers_rephrase_add_concept',
   'new_question_same_topic',
   'same_topic_add_one_concept',
   'same_chapter_any_topic',
 ] as const;
 
 const SIMILARITY_LABEL: Record<QuestionsSimilarity, string> = {
-  numbers_only: 'Numbers only',
   numbers_and_rephrase: 'Numbers + rephrase',
+  numbers_rephrase_add_concept: 'Numbers + rephrase + concept',
   new_question_same_topic: 'New Q, same topic',
   same_topic_add_one_concept: 'Add one concept',
   same_chapter_any_topic: 'Any topic in chapter',
-};
-
-const PRIORITY_OPTS: readonly QuestionsPriorityMode[] = [
-  'override',
-  'layer_on_top',
-  'specific_aspects',
-] as const;
-
-const PRIORITY_LABEL: Record<QuestionsPriorityMode, string> = {
-  override: 'Override',
-  layer_on_top: 'Layer on top',
-  specific_aspects: 'Specific aspects',
 };
 
 export function QuestionsParams({ value, onChange }: Props) {
@@ -92,17 +79,6 @@ export function QuestionsParams({ value, onChange }: Props) {
       </ParamRow>
 
       <ParamRow>
-        <ParamLabel hint="How many regenerated questions per source question (1–20).">
-          Variants per question
-        </ParamLabel>
-        <SegmentChoice
-          options={[1, 2, 3, 4, 5] as const}
-          value={(value.count ?? 2) as 1 | 2 | 3 | 4 | 5}
-          onChange={(v) => upd('count', v)}
-        />
-      </ParamRow>
-
-      <ParamRow>
         <ParamLabel hint="Optional — restrict to one question type (MCQ, Short answer, etc.).">
           Question type
         </ParamLabel>
@@ -120,18 +96,6 @@ export function QuestionsParams({ value, onChange }: Props) {
             font: 'inherit',
             fontSize: 13,
           }}
-        />
-      </ParamRow>
-
-      <ParamRow>
-        <ParamLabel hint="How custom instructions interact with the default prompt.">
-          Priority mode
-        </ParamLabel>
-        <SegmentChoice
-          options={PRIORITY_OPTS}
-          value={(value.priority_mode ?? 'layer_on_top') as QuestionsPriorityMode}
-          onChange={(v) => upd('priority_mode', v)}
-          format={(v) => PRIORITY_LABEL[v as QuestionsPriorityMode]}
         />
       </ParamRow>
 

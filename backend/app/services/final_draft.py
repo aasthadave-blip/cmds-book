@@ -20,6 +20,7 @@ from uuid import UUID
 
 from sqlalchemy.ext.asyncio import AsyncSession
 
+from app.services.content_stream import resolve_block_figures
 from app.services.final_merge import build_final_merge
 
 
@@ -300,19 +301,28 @@ async def seed_draft_items_from_merge(
                     continue
                 # No adjacent figure → keep the fig block as a visible
                 # placeholder. Fall through to the normal emit-block path.
-            items.append({
-                "id": _new_id(),
-                "type": "block",
-                "parent_section_id": section_id,
-                "block": b,
-            })
-            for f in figures_by_idx.get(i, []):
-                items.append({
-                    "id": _new_id(),
-                    "type": "figure",
-                    "parent_section_id": section_id,
-                    "figure": f,
-                })
+            # Resolve block + its anchored figures into ordered nodes via the
+            # single positional-truth resolver. For non-list blocks (and lists
+            # without interior char-offset figures) this returns exactly
+            # [block, fig, fig...] — identical to the previous stack-after-
+            # block behaviour. For a LIST with interior figures, the list is
+            # split at item boundaries so figures interleave between items
+            # (matching TheoryView). See content_stream.resolve_block_figures.
+            for node in resolve_block_figures(b, figures_by_idx.get(i, [])):
+                if node["kind"] == "figure":
+                    items.append({
+                        "id": _new_id(),
+                        "type": "figure",
+                        "parent_section_id": section_id,
+                        "figure": node["figure"],
+                    })
+                else:
+                    items.append({
+                        "id": _new_id(),
+                        "type": "block",
+                        "parent_section_id": section_id,
+                        "block": node["block"],
+                    })
             _emit_inlined_at(str(i))
 
         for f in trailing_figs:

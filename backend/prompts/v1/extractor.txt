@@ -119,6 +119,20 @@ CRITICAL RULES (read all before extracting):
     content exists are BOTH critical failures. Both halves must be
     honored together — neither overrides the other.
 
+    MULTIPLE SECTIONS ON ONE PAGE — the most common bleed source:
+       A single page often stacks several short sibling sections (e.g.
+       five sub-topics printed one after another down one page). Your
+       heading AND the STOP anchor may both sit partway down that page,
+       with OTHER sections above and below yours. Extract ONLY the text
+       physically between YOUR heading and the STOP anchor. Blocks ABOVE
+       your heading belong to the previous sibling; blocks AT or AFTER the
+       STOP anchor belong to the next. Emitting the whole page copies the
+       same paragraphs and figures into 2-3 sibling sections — that is
+       bleed.
+       When "capture everything" (A) and "stop at the STOP anchor" (B)
+       seem to conflict, BOUNDARY WINS: capturing a co-page sibling's
+       block is a failure exactly as bad as dropping one of your own.
+
 (1) STOP ONLY AT THE SCHEMA'S NEXT SECTION TITLE — sub-headings are NOT stops
     The next schema section's/subsection's title is the ONLY place where
     extraction ends — supplied as the STOP anchor in the user prompt.
@@ -129,8 +143,9 @@ CRITICAL RULES (read all before extracting):
     A "Definition" header mid-section ≠ stop. A bolded sub-topic ≠ stop.
     Only the EXACT STOP anchor text (with its page) is the stop.
 
-(2) NO SKIPPING — EMIT EVERY CONTENT BLOCK
-    For your page range, emit a block for EACH of:
+(2) NO SKIPPING — EMIT EVERY CONTENT BLOCK WITHIN YOUR SPAN
+    For the span between YOUR heading and the STOP anchor (NOT the whole
+    page — a page may hold several sibling sections), emit a block for EACH of:
       a. Every heading (h1/h2/h3) — including unnumbered sub-headings
       b. Every paragraph, even short ones (1-line intros, transitions)
       c. Every definition — emit as `definition` block with `term` + `content` fields filled
@@ -145,7 +160,7 @@ CRITICAL RULES (read all before extracting):
     Every printed equation, formula, expression, derivation step MUST be captured as an `equation` block with valid LaTeX. Do NOT skip complex equations. Do NOT write "equation involving X" or "see formula above" — emit the actual LaTeX. Multi-line derivations = one `equation` block PER printed line, preserving order. Chemistry formulas use `\ce{...}` (see CHEMISTRY FORMULAS section).
 
 SELF-CHECK before emitting:
-For each page in your range, mentally re-scan top to bottom. For every visible content block (heading, paragraph, list item, equation, definition, table, figure, callout) — confirm you emitted a corresponding block. If any are missing → add them before responding. If unsure whether something is content vs decoration → emit it (better than dropping).
+Re-scan ONLY the span from YOUR heading down to the STOP anchor (not the whole page). For every content block IN THAT SPAN (heading, paragraph, list item, equation, definition, table, figure, callout) — confirm you emitted a corresponding block. Blocks ABOVE your heading belong to the previous section, and blocks AT or AFTER the STOP anchor belong to the next — do NOT emit those, even when they sit on the same page. If a block inside your span is missing → add it before responding. If unsure whether something inside your span is content vs decoration → emit it (better than dropping).
 
 TRANSCRIPTION RULES:
 1. Transcribe EVERY sentence of theory content — zero summarisation, zero skipping

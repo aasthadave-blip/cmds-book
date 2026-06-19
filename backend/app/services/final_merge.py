@@ -967,7 +967,18 @@ async def build_final_merge(
             "has_solution": bool(q.has_solution),
             "solution_text": q.solution_text or "",
             "kind": q.kind,
-            "embedded_figures": question_figures_by_qid.get(str(q.id), []),
+            # Regen variants have no figure_references of their own (the
+            # embedder runs on the original extraction), so fall back to the
+            # SOURCE question's figures — the variant shows the same figure as
+            # the original. Keeps Composer/Preview consistent with the
+            # RegenReview page (own-then-source). Originals (no
+            # source_question_id) just use their own.
+            "embedded_figures": (
+                question_figures_by_qid.get(str(q.id))
+                or question_figures_by_qid.get(
+                    str(getattr(q, "source_question_id", None)), []
+                )
+            ),
             "image_regen_hint": _extract_image_regen_hint(q),
         }
         if origin_section_id is not None:
@@ -1089,50 +1100,97 @@ async def build_final_merge(
     for k, v in questions_by_section.items():
         normalized_index.setdefault(_norm_key(k), []).extend(v)
 
+    def _excluded_q_dict(q) -> dict[str, Any]:
+        # Same shape as the regular-section question dict so excluded-bank
+        # questions carry figures + regen hints identically. Regen variants
+        # fall back to the SOURCE question's figures (own-then-source).
+        return {
+            "id": str(q.id),
+            "question_number": q.question_number,
+            "exercise_ref": q.exercise_ref,
+            "section_ref": q.section_ref,
+            "page_start": q.page_start,
+            "question_type": q.question_type,
+            "raw_text": q.raw_text or "",
+            "has_options": bool(getattr(q, "has_options", False)),
+            "has_solution": bool(q.has_solution),
+            "solution_text": q.solution_text or "",
+            "kind": q.kind,
+            "embedded_figures": (
+                question_figures_by_qid.get(str(q.id))
+                or question_figures_by_qid.get(
+                    str(getattr(q, "source_question_id", None)), []
+                )
+            ),
+            "image_regen_hint": _extract_image_regen_hint(q),
+        }
+
+    def _min_page(qs) -> int:
+        ps = [getattr(q, "page_start", None) for q in qs]
+        ps = [p for p in ps if isinstance(p, int)]
+        return min(ps) if ps else 10**9
+
     for ex in getattr(schema_obj, "excluded_sections", []) or []:
         title = (ex.title or "").strip()
         if not title:
             continue
-        # Lookup order: exact title → explicit id (if model has one) → normalized.
-        qs = questions_by_section.get(title, [])
-        if not qs:
+        # Excluded end-of-chapter banks are subdivided by SUB-WING in the
+        # question section_ref: "<BANK TITLE>::<sub-wing>" — e.g.
+        # "CLASSROOM WING::Short Answer Type Questions" or
+        # "Critical Thinking::1.3 Argand diagram". The previous lookup matched
+        # ONLY the bare bank title, silently dropping every sub-wing question
+        # (~half of all questions across affected books — e.g. Complex Numbers
+        # surfaced 46/271). Gather EVERY question whose section_ref is the bank
+        # title OR "title::*", bucketed by sub-wing, so each renders under the
+        # bank as its own ordered sub-heading. Regen variants are already
+        # overlaid into questions_by_section per ref above, so a saved regen on
+        # a sub-wing surfaces here at the same position automatically.
+        title_norm = _norm_key(title)
+        buckets: dict[str, list] = {}
+        for ref, qs in questions_by_section.items():
+            head, sep, tail = (ref or "").partition("::")
+            if _norm_key(head) == title_norm:
+                key = tail.strip() if sep else ""
+                buckets.setdefault(key, []).extend(qs)
+        # Legacy fallback: explicit id / normalized exact (banks with no
+        # "::" sub-wing structure).
+        if not buckets:
             ex_id = getattr(ex, "id", None) or ""
-            if ex_id:
-                qs = questions_by_section.get(ex_id, [])
-        if not qs:
-            qs = normalized_index.get(_norm_key(title), [])
-        if not qs:
+            qs = (
+                questions_by_section.get(title, [])
+                or (questions_by_section.get(ex_id, []) if ex_id else [])
+                or normalized_index.get(title_norm, [])
+            )
+            if qs:
+                buckets[""] = qs
+        if not buckets:
             continue  # excluded section with no extracted questions → skip
         used_excluded_titles.add(title)
-        # Build question dicts (same shape as regular sections)
-        question_dicts: list[dict[str, Any]] = []
-        for q in qs:
-            question_dicts.append({
-                "id": str(q.id),
-                "question_number": q.question_number,
-                "exercise_ref": q.exercise_ref,
-                "section_ref": q.section_ref,
-                "page_start": q.page_start,
-                "question_type": q.question_type,
-                "raw_text": q.raw_text or "",
-                # E2 fix — see _question_to_dict above
-                "has_options": bool(getattr(q, "has_options", False)),
-                "has_solution": bool(q.has_solution),
-                "solution_text": q.solution_text or "",
-                "kind": q.kind,
-                "embedded_figures": question_figures_by_qid.get(str(q.id), []),
-                "image_regen_hint": _extract_image_regen_hint(q),
-            })
+
+        # Bare-title questions render directly on the bank heading; sub-wings
+        # become ordered sub-sections beneath it (document/page order).
+        direct = buckets.pop("", [])
         out_sections.append({
             "section_id": title,
             "section_title": title,
-            "level": 0,
+            "level": 2,
             "blocks": [],
             "block_source": "original",
             "regen_meta": None,
             "embedded_figures": [],
-            "questions": question_dicts,
+            "questions": [_excluded_q_dict(q) for q in direct],
         })
+        for subwing in sorted(buckets, key=lambda k: _min_page(buckets[k])):
+            out_sections.append({
+                "section_id": f"{title}::{subwing}",
+                "section_title": subwing,
+                "level": 3,
+                "blocks": [],
+                "block_source": "original",
+                "regen_meta": None,
+                "embedded_figures": [],
+                "questions": [_excluded_q_dict(q) for q in buckets[subwing]],
+            })
 
     # SYNTHETIC RECAP SECTIONS: when the recap worker writes orphan-
     # fallback section(s) into blocks_by_section (e.g.
@@ -1350,6 +1408,111 @@ async def build_final_merge(
     # Ball Electroscope section" case where the example is a sub-region
     # of a larger section. Deterministic — no AI.
     merged_sections = [_drop_in_section_worked_examples(s) for s in merged_sections]
+
+    # ZERO-LOSS SAFETY NET — guarantee every extracted question is visible.
+    # Despite the section / chip-inline / excluded-bank machinery above, a
+    # small tail can still fall through: a Cat A subsection pruned on the
+    # assumption its question was inlined into a parent (when the chip text
+    # didn't actually match → the inline never landed), or a section_ref that
+    # maps to no schema node at all (self-test-N, bare "1", orphaned sub-wing
+    # slugs). Rather than chase every fragile chip/prune edge case (which would
+    # risk the ~14k questions that DO place correctly), we enforce the
+    # invariant additively: any non-hidden question not yet emitted anywhere is
+    # re-attached at the end — titled by its schema node when known — so it is
+    # visible in Composer / Preview / export instead of silently dropped.
+    emitted_qids: set[str] = set()
+    for s in merged_sections:
+        for q in (s.get("questions") or []):
+            emitted_qids.add(str(q.get("id")))
+        for qs in (s.get("inlined_questions_by_block_idx") or {}).values():
+            for q in qs:
+                emitted_qids.add(str(q.get("id")))
+    node_title_by_id = {ss.id: (ss.title or ss.id) for ss in ordered_schema_sections}
+    node_level_by_id = {ss.id: ss.level for ss in ordered_schema_sections}
+    # Schema-order index — used to slot a recovered section back into its
+    # natural document position rather than dumping it at the very end.
+    order_index = {ss.id: i for i, ss in enumerate(ordered_schema_sections)}
+
+    missing_by_ref: dict[str, list] = {}
+    seen_missing: set[str] = set()
+    for ref, qs in questions_by_section.items():
+        for q in qs:
+            qid = str(q.id)
+            if qid in emitted_qids or qid in seen_missing:
+                continue
+            seen_missing.add(qid)
+            missing_by_ref.setdefault(ref or "(uncategorized)", []).append(q)
+
+    # Resolve a question's section_ref to its schema node id. The question
+    # extractor and the schema sometimes disagree on prefixing — the node may
+    # be parent-prefixed ("1.6-self-test-5") while the question ref is short
+    # ("self-test-5"), or vice-versa. Match exactly, else by UNAMBIGUOUS
+    # suffix in either direction (exactly one candidate). Ambiguous / no match
+    # → None (those go to the uncategorized tail).
+    def _resolve_node(ref: str) -> str | None:
+        if ref in order_index:
+            return ref
+        cands = [
+            nid for nid in order_index
+            if nid.endswith("-" + ref) or ref.endswith("-" + nid)
+        ]
+        return cands[0] if len(cands) == 1 else None
+
+    # Index existing emitted sections by id so we can ATTACH recovered
+    # questions onto the section the main loop already emitted (typically an
+    # empty heading, because the ref mismatch left it question-less) — this
+    # places them at the node's exact schema position with no duplicate.
+    section_by_id: dict[str, dict[str, Any]] = {}
+    for s in merged_sections:
+        section_by_id.setdefault(s.get("section_id"), s)
+
+    def _new_section(node_id: str, qs: list) -> dict[str, Any]:
+        return {
+            "section_id": node_id,
+            "section_title": node_title_by_id.get(node_id, node_id),
+            "level": node_level_by_id.get(node_id) or 3,
+            "blocks": [],
+            "block_source": "original",
+            "regen_meta": None,
+            "embedded_figures": [],
+            "questions": [_excluded_q_dict(q) for q in qs],
+        }
+
+    uncategorized: list = []
+    # Process in schema order so multiple new inserts land correctly.
+    for ref, qs in sorted(
+        missing_by_ref.items(),
+        key=lambda kv: order_index.get(_resolve_node(kv[0]) or "", 1 << 30),
+    ):
+        node_id = _resolve_node(ref)
+        if node_id is None:
+            uncategorized.extend(qs)
+            continue
+        existing = section_by_id.get(node_id)
+        if existing is not None:
+            # Attach onto the already-emitted section (dedup by qid).
+            have = {str(q.get("id")) for q in (existing.get("questions") or [])}
+            existing.setdefault("questions", []).extend(
+                _excluded_q_dict(q) for q in qs if str(q.id) not in have
+            )
+            continue
+        # Node not emitted by the main loop → insert at its schema-order spot,
+        # before the first later-ordered section / non-schema section.
+        oidx = order_index[node_id]
+        sec = _new_section(node_id, qs)
+        insert_at = len(merged_sections)
+        for i, ms in enumerate(merged_sections):
+            ms_oidx = order_index.get(ms.get("section_id"))
+            if ms_oidx is None or ms_oidx > oidx:
+                insert_at = i
+                break
+        merged_sections.insert(insert_at, sec)
+        section_by_id[node_id] = sec
+
+    # Truly uncategorized (ref maps to no schema node) → visible at the end.
+    if uncategorized:
+        merged_sections.append(_new_section("(uncategorized)", uncategorized))
+        merged_sections[-1]["section_title"] = "Additional Questions"
 
     return {
         "book": {

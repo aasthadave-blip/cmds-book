@@ -60,61 +60,41 @@ SyncSession = sessionmaker(bind=_sync_engine, class_=Session, autoflush=False)
 
 # Defaults for R2 — R4/R5 make these configurable per regen run via API/UI.
 DEFAULT_SIMILARITY = "numbers_and_rephrase"
-DEFAULT_COUNT = 3
+DEFAULT_COUNT = 1
 DEFAULT_QUESTION_TYPE = "same_as_source"
 DEFAULT_PRIORITY_MODE = "override"
 
-# Valid priority modes (R3).
-_VALID_PRIORITY_MODES = {"override", "layer_on_top", "specific_aspects"}
+# Priority mode is locked to override only.
+_VALID_PRIORITY_MODES = {"override"}
+
+# Valid similarity levels.
+_VALID_SIMILARITY_LEVELS = {
+    "numbers_and_rephrase",
+    "numbers_rephrase_add_concept",
+    "new_question_same_topic",
+    "same_topic_add_one_concept",
+    "same_chapter_any_topic",
+}
 
 
 def _priority_mode_block(mode: str, custom_instructions: str) -> str:
     """Build the framing block that tells Gemini HOW to apply custom
-    instructions, per the user-selected priority mode.
+    instructions. Mode is always override; parameter kept for compatibility.
 
-    Returns "" if custom_instructions is empty/None — mode is irrelevant
-    without instructions to apply.
+    Returns "" if custom_instructions is empty/None.
     """
     txt = (custom_instructions or "").strip()
     if not txt:
         return ""
-    mode = (mode or "").strip().lower()
-    if mode not in _VALID_PRIORITY_MODES:
-        mode = DEFAULT_PRIORITY_MODE
-
-    if mode == "override":
-        header = (
-            "PRIORITY MODE: OVERRIDE\n"
-            "The custom_instructions below COMPLETELY REPLACE the default "
-            "similarity-level behavior. Follow them above all other rules "
-            "EXCEPT factual correctness (which always wins). The similarity "
-            "level still selects which aspects are conceptually LOCKED, but "
-            "every other generation choice (tone, structure, language, "
-            "style, pattern) is dictated by these instructions."
-        )
-    elif mode == "layer_on_top":
-        header = (
-            "PRIORITY MODE: LAYER_ON_TOP\n"
-            "Apply the default similarity-level behavior FIRST (following "
-            "the LOCKED / CHANGES rules for the selected similarity level). "
-            "THEN, on top of the resulting question, apply the "
-            "custom_instructions below as ADDITIONAL constraints. Both must "
-            "be honoured. If the custom_instructions conflict with the "
-            "similarity-level locks, the similarity locks win (e.g. "
-            "similarity 'numbers_only' still requires sentence structure "
-            "to remain unchanged)."
-        )
-    else:  # specific_aspects
-        header = (
-            "PRIORITY MODE: SPECIFIC_ASPECTS\n"
-            "The custom_instructions below modify ONLY the aspects the user "
-            "has listed in the instructions text. Preserve all other aspects "
-            "of the source question. If the user did NOT enumerate which "
-            "aspects to modify, default to changing ONLY wording and "
-            "scenario; preserve numbers, concept, sentence-level structure, "
-            "and question_type. Do NOT introduce changes beyond the listed "
-            "aspects."
-        )
+    header = (
+        "PRIORITY MODE: OVERRIDE\n"
+        "The custom_instructions below COMPLETELY REPLACE the default "
+        "similarity-level behavior. Follow them above all other rules "
+        "EXCEPT factual correctness (which always wins). The similarity "
+        "level still selects which aspects are conceptually LOCKED, but "
+        "every other generation choice (tone, structure, language, "
+        "style, pattern) is dictated by these instructions."
+    )
     return header + "\n\nCustom instructions:\n" + txt
 
 GEMINI_MODEL = "gemini-2.5-flash"
@@ -241,7 +221,6 @@ def _build_user_prompt(
 
     parts.extend([
         f"similarity_level    : {similarity_level}",
-        f"count               : {count}",
         f"question_type       : {question_type}",
         f"subject             : {_maybe(subject)}",
         f"chapter             : {_maybe(chapter)}",
@@ -487,9 +466,11 @@ def _persist_regen_items(
         text, _ = normalize_question_latex(text)
         if solution_text:
             solution_text, _ = normalize_question_latex(solution_text)
-        # A variant only carries a solution if the SOURCE question did.
-        if not source.has_solution:
-            solution_text = None
+        # SOLUTION is the deliberate exception to source-mirroring: the
+        # prompt ALWAYS generates a full worked solution for regenerated
+        # questions (Category A), even when the source had no printed
+        # solution (e.g. exercise questions). So we keep whatever solution
+        # the model produced and do NOT gate on source.has_solution.
         # Q1 invariant: solution_text + has_solution finalized in lockstep.
         solution_text, has_solution = _finalize_solution_flag(solution_text)
         model_says_options = bool(it.get("options"))
@@ -562,6 +543,106 @@ def _persist_regen_items(
     return inserted
 
 
+def _persist_regen_fallback(
+    session: Session,
+    *,
+    regen: QuestionRegeneration,
+    source: Question,
+    reason: str,
+) -> int:
+    """No-skip guarantee — retain the original, flagged.
+
+    When a source question yields 0 usable variants after all retries, the
+    old behaviour dropped it: the source vanished from the regen output and
+    was only counted as ``failed`` in stats. That silently lost ~5% of
+    questions on some books.
+
+    Instead, persist ONE row carrying the ORIGINAL question text + solution,
+    flagged ``qc_local.regen_failed`` so the frontend can badge it
+    ("⚠ couldn't regenerate — original retained") and the user can retry it
+    via the existing section-level retry. This guarantees every source
+    question is present in the regen output (count parity) — completing the
+    "retry empties, never silently drop" philosophy already stated at the
+    top of this module.
+
+    Section anchoring + figure inheritance mirror ``_persist_regen_items``.
+    Returns 1 (the retained row).
+    """
+    source_refs = (
+        session.execute(
+            select(FigureReference)
+            .where(FigureReference.question_id == source.id)
+            .where(FigureReference.context == "question")
+        )
+        .scalars()
+        .all()
+    )
+
+    qc_local: dict[str, Any] = {
+        "pass": False,
+        "score": 0.0,
+        "failures": ["regen_failed"],
+        # Frontend hint: this row is the source verbatim, not a regenerated
+        # variant. Surfaces a badge + retry affordance.
+        "regen_failed": {
+            "retained_original": True,
+            "reason": (reason or "no variants produced")[:300],
+        },
+    }
+
+    row = Question(
+        bank_id=regen.bank_id,
+        book_id=regen.book_id,
+        regen_id=regen.id,
+        source_question_id=source.id,
+        section_ref=source.section_ref,
+        section_uuid=source.section_uuid,
+        section_title=source.section_title,
+        page_start=source.page_start,
+        page_end=source.page_end,
+        # Carry the ORIGINAL text + solution verbatim (already normalized at
+        # extraction time, so no re-normalization needed).
+        raw_text=source.raw_text,
+        qc_local=qc_local,
+        attempts=_REGEN_SOURCE_MAX_ATTEMPTS,
+        # 'passed' so it renders alongside generated variants in the regen
+        # output (the failure is signalled via qc_local, not by hiding it).
+        status="passed",
+        question_number=None,
+        exercise_ref=source.exercise_ref,
+        chapter_ref=source.chapter_ref,
+        kind=source.kind,
+        question_type=source.question_type,
+        has_options=source.has_options,
+        solution_text=source.solution_text,
+        has_solution=source.has_solution,
+        identified_total=None,
+        qc_status="pending",
+    )
+    session.add(row)
+    session.flush()  # need row.id for figure_references copy
+
+    for sref in source_refs:
+        session.add(
+            FigureReference(
+                book_id=sref.book_id,
+                figure_id=sref.figure_id,
+                section_ref=sref.section_ref,
+                section_uuid=sref.section_uuid,
+                context="question",
+                question_id=row.id,
+                placeholder_text=sref.placeholder_text,
+                link_method="auto",
+                placement_kind=sref.placement_kind,
+                placement_block_idx=sref.placement_block_idx,
+                placement_char_offset=sref.placement_char_offset,
+            )
+        )
+
+    session.commit()
+    return 1
+
+
 # ---------------------------------------------------------------------------
 # Main run
 # ---------------------------------------------------------------------------
@@ -582,21 +663,14 @@ async def _run_regen_v3(regen_id: UUID, job_id: UUID) -> dict[str, Any]:
             (getattr(regen, "similarity_level", None) or "").strip()
             or DEFAULT_SIMILARITY
         )
-        count_raw = getattr(regen, "count", None)
-        try:
-            count = int(count_raw) if count_raw else DEFAULT_COUNT
-        except (TypeError, ValueError):
-            count = DEFAULT_COUNT
+        if similarity_level == "numbers_only" or similarity_level not in _VALID_SIMILARITY_LEVELS:
+            similarity_level = DEFAULT_SIMILARITY
+        count = DEFAULT_COUNT  # always 1, locked
         question_type = (
             (getattr(regen, "question_type", None) or "").strip()
             or DEFAULT_QUESTION_TYPE
         )
-        priority_mode = (
-            (getattr(regen, "priority_mode", None) or "").strip().lower()
-            or DEFAULT_PRIORITY_MODE
-        )
-        if priority_mode not in _VALID_PRIORITY_MODES:
-            priority_mode = DEFAULT_PRIORITY_MODE
+        priority_mode = DEFAULT_PRIORITY_MODE  # always override
         custom_instructions = (regen.custom_instructions or "").strip() or None
 
         # Snapshot for downstream use.
@@ -754,6 +828,20 @@ async def _run_regen_v3(regen_id: UUID, job_id: UUID) -> dict[str, Any]:
                         items=result["items"],
                     )
                     result["persisted"] = inserted
+        else:
+            # No-skip guarantee: regen produced 0 usable variants after all
+            # retries → retain the ORIGINAL question (flagged) so the source
+            # is never silently dropped from the output. persisted stays 0
+            # (no GENERATED variant) but the row exists, flagged for retry.
+            with SyncSession() as own:
+                src = own.get(Question, qid)
+                regen_obj = own.get(QuestionRegeneration, regen_id)
+                if src is not None and regen_obj is not None:
+                    _persist_regen_fallback(
+                        own, regen=regen_obj, source=src,
+                        reason=str(result.get("error") or "no variants"),
+                    )
+                    result["fallback"] = True
         return qid, result
 
     # Heartbeat-wrap the parallel run.
@@ -777,16 +865,24 @@ async def _run_regen_v3(regen_id: UUID, job_id: UUID) -> dict[str, Any]:
                 section_ref = src.section_ref if src else "?"
             persisted = int(result.get("persisted") or 0)
             ok = bool(result.get("ok"))
+            fallback = bool(result.get("fallback"))
             bucket = section_counts.setdefault(section_ref, {
-                "source_count": 0, "generated": 0, "failed": 0,
+                "source_count": 0, "generated": 0, "failed": 0, "retained": 0,
             })
             bucket["source_count"] += 1
             bucket["generated"] += persisted
             if ok and persisted > 0:
                 total_generated += persisted
             else:
+                # Regen failed for this source. The question is NOT dropped —
+                # the original was retained (fallback row). Count it as failed
+                # (regen didn't produce a variant) AND as retained (present in
+                # output) so stats are transparent: failed == regen misses,
+                # retained == originals kept so nothing is skipped.
                 bucket["failed"] += 1
                 total_failed += 1
+                if fallback:
+                    bucket["retained"] += 1
 
             with SyncSession() as own:
                 _update_job(own, job_id, progress=progress,
@@ -828,9 +924,13 @@ async def _run_regen_v3(regen_id: UUID, job_id: UUID) -> dict[str, Any]:
             "source_count": c["source_count"],
             "generated": c["generated"],
             "failed": c["failed"],
+            # How many of the failures had their ORIGINAL retained (no-skip
+            # fallback). retained == failed means nothing was dropped.
+            "retained": c.get("retained", 0),
             "status": sec_status,
         })
 
+    total_retained = sum(c.get("retained", 0) for c in section_counts.values())
     stats = {
         "sections": sections_report,
         "totals": {
@@ -840,6 +940,10 @@ async def _run_regen_v3(regen_id: UUID, job_id: UUID) -> dict[str, Any]:
             "partial": partial,
             "empty": empty,
             "failed": failed,
+            # Originals retained via the no-skip fallback. Invariant:
+            # every source appears in output → generated + retained covers
+            # all source questions (no silent drops).
+            "retained_originals": total_retained,
         },
     }
 
@@ -898,21 +1002,14 @@ async def _run_regen_one_section_v3(
             (getattr(regen, "similarity_level", None) or "").strip()
             or DEFAULT_SIMILARITY
         )
-        count_raw = getattr(regen, "count", None)
-        try:
-            count = int(count_raw) if count_raw else DEFAULT_COUNT
-        except (TypeError, ValueError):
-            count = DEFAULT_COUNT
+        if similarity_level == "numbers_only" or similarity_level not in _VALID_SIMILARITY_LEVELS:
+            similarity_level = DEFAULT_SIMILARITY
+        count = DEFAULT_COUNT  # always 1, locked
         question_type = (
             (getattr(regen, "question_type", None) or "").strip()
             or DEFAULT_QUESTION_TYPE
         )
-        priority_mode = (
-            (getattr(regen, "priority_mode", None) or "").strip().lower()
-            or DEFAULT_PRIORITY_MODE
-        )
-        if priority_mode not in _VALID_PRIORITY_MODES:
-            priority_mode = DEFAULT_PRIORITY_MODE
+        priority_mode = DEFAULT_PRIORITY_MODE  # always override
         # Section-level instructions OVERRIDE the regen's persisted custom
         # instructions for this single retry. The regen record stays clean.
         if section_custom_instructions and section_custom_instructions.strip():
@@ -970,6 +1067,7 @@ async def _run_regen_one_section_v3(
     # Per-source processing (same pattern as main worker).
     total_generated = 0
     total_failed = 0
+    total_retained = 0
 
     async def _process_one(qid: UUID) -> tuple[UUID, dict[str, Any]]:
         with SyncSession() as own:
@@ -1028,6 +1126,19 @@ async def _run_regen_one_section_v3(
                         items=result["items"],
                     )
                     result["persisted"] = inserted
+        else:
+            # No-skip guarantee (mirrors the full-regen path): retain the
+            # original question, flagged, so a section retry never drops a
+            # source that failed to regenerate.
+            with SyncSession() as own:
+                src = own.get(Question, qid)
+                regen_obj = own.get(QuestionRegeneration, regen_id)
+                if src is not None and regen_obj is not None:
+                    _persist_regen_fallback(
+                        own, regen=regen_obj, source=src,
+                        reason=str(result.get("error") or "no variants"),
+                    )
+                    result["fallback"] = True
         return qid, result
 
     with Heartbeat(
@@ -1047,6 +1158,8 @@ async def _run_regen_one_section_v3(
                 total_generated += persisted
             else:
                 total_failed += 1
+                if result.get("fallback"):
+                    total_retained += 1
             with SyncSession() as own:
                 _update_job(own, job_id, progress=progress,
                             message=f"Section retry {done}/{total_sources} — "
@@ -1078,6 +1191,7 @@ async def _run_regen_one_section_v3(
         "source_count": total_sources,
         "generated": total_generated,
         "failed": total_failed,
+        "retained": total_retained,
         "status": sec_status,
     }
 

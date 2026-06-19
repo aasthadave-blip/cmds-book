@@ -60,6 +60,17 @@ class FinalDraft(Base):
         default=True,
         server_default=sa.text("1"),
     )
+    # True once the user makes a manual edit (PATCH op) since the last seed.
+    # While dirty, GET does NOT auto-reseed, so manual edits (delete/reorder/
+    # edit) survive and reflect in Preview. An explicit reseed / merge-regen
+    # clears it. Without this, the unconditional auto-reseed on every GET
+    # wiped Composer edits before Preview could show them.
+    is_dirty: Mapped[bool] = mapped_column(
+        sa.Boolean(),
+        nullable=False,
+        default=False,
+        server_default=sa.text("0"),
+    )
     last_seeded_at: Mapped[datetime | None] = mapped_column(
         DateTime(), nullable=True
     )

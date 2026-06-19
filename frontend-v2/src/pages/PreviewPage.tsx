@@ -551,7 +551,14 @@ function BlockRow({ block }: { block: Block }) {
   }
   if (t === 'list') {
     const items = ((block as { items?: string[] }).items ?? []);
-    return <ol style={{ marginBottom: 12, paddingLeft: 22 }}>
+    // A list with interior figures is split into parts by the backend
+    // resolver (content_stream) so figure items interleave between <li>s.
+    // `_split_start` continues the <ol> numbering across parts and the
+    // margins collapse so the parts read as one continuous list, matching
+    // RegenReview. Non-split lists have no `_split_start` → unchanged.
+    const splitStart = (block as { _split_start?: number })._split_start;
+    const isSplit = typeof splitStart === 'number';
+    return <ol start={isSplit ? splitStart : undefined} style={{ marginTop: isSplit && splitStart > 1 ? 0 : undefined, marginBottom: isSplit ? 0 : 12, paddingLeft: 22 }}>
       {items.map((it, k) => (
         <li key={k} style={{ marginBottom: 4, lineHeight: 1.55, fontSize: 14 }}>
           <MathMarkdown inline>{it}</MathMarkdown>

@@ -462,6 +462,44 @@ async def _do_recover_orphaned_jobs() -> None:
                         continue
                     dispatch("extract_questions_regen", str(regen.id), str(job.id))
 
+                elif job.type == "extract_questions_regen_v3":
+                    # v3 question-regen — the CURRENT regen worker. The
+                    # QuestionRegeneration row is linked by job_id (set at
+                    # creation), and the worker is idempotent: on entry it
+                    # wipes all Question rows for this regen.id and re-runs
+                    # the full section scope (see question_regen_v3.py
+                    # `delete(Question).where(regen_id == regen.id)`). So
+                    # re-dispatching after a restart completes the regen
+                    # cleanly — no duplicates, no skipped sections — instead
+                    # of leaving it stuck at "Unknown job type".
+                    from app.models.question_regeneration import QuestionRegeneration
+
+                    regen = session.execute(
+                        select(QuestionRegeneration).where(
+                            QuestionRegeneration.job_id == job.id
+                        )
+                    ).scalars().first()
+                    if regen is None:
+                        job.status = "failed"
+                        job.error = "Interrupted before regen row was linked — click Regenerate to retry"
+                        session.commit()
+                        skipped += 1
+                        continue
+                    dispatch("extract_questions_regen_v3", str(regen.id), str(job.id))
+
+                elif job.type in ("re_extract_section_v3", "retry_regen_section_v3"):
+                    # Section-scoped re-extract / regen retries store the
+                    # target (bank_id + section_ref) ONLY in dispatch args,
+                    # not on the Job row — so they cannot be auto-resumed.
+                    # Mark failed with a clear, actionable message (same
+                    # pattern as re_extract / re_extract_block) rather than
+                    # the confusing generic "Unknown job type".
+                    job.status = "failed"
+                    job.error = "Interrupted by server restart — re-run this section from the UI"
+                    session.commit()
+                    skipped += 1
+                    continue
+
                 elif job.type == "run_qa_fidelity":
                     # Bank id is not on the Job row — cannot recover. Mark
                     # failed so the UI surfaces it and the user can retrigger.

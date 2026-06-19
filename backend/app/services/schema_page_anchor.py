@@ -38,6 +38,7 @@ The single non-LLM source of truth for "what page does section X start on."
 from __future__ import annotations
 
 import logging
+import re
 from dataclasses import dataclass, field
 from typing import Any
 
@@ -177,6 +178,138 @@ def _find_title_anywhere(
     return None
 
 
+_FIG_CAPTION_RE = re.compile(
+    r"^\s*(figure|fig|table|diagram|illustration|photo|graph|chart|plate)\.?\s*\d",
+    re.IGNORECASE,
+)
+
+_NUM_TOKEN_RE = re.compile(r"^\d+(\.\d+)*$")
+
+
+def _furniture_key(norm_line: str) -> str:
+    """Normalized line with leading/trailing pure-number tokens stripped.
+
+    Running headers are frequently glued by pypdf to a per-page figure or
+    page number — "6.8 Chapter 6" on page 2, "6.10 Chapter 6" on page 4.
+    Each raw line is then UNIQUE (different number), so exact-line repetition
+    misses the header. Stripping the bounding number tokens collapses them
+    all to one stable key ("chapter") so the repeated header is detected.
+    """
+    toks = norm_line.split()
+    while toks and _NUM_TOKEN_RE.match(toks[0]):
+        toks.pop(0)
+    while toks and _NUM_TOKEN_RE.match(toks[-1]):
+        toks.pop()
+    return " ".join(toks)
+
+
+def _positional_furniture_keys(pdf_bytes: bytes) -> set[str]:
+    """Identify running-header/footer text by GEOMETRIC repetition.
+
+    A running header/footer is the same short text printed at the SAME
+    position on many pages. We detect it from pymupdf line bounding boxes:
+    a number-stripped key (see `_furniture_key`) that appears on >= 3 pages
+    AND whose vertical position is tightly clustered (it prints in the same
+    horizontal band every time) is furniture — REGARDLESS of where that
+    band sits (top, bottom, or mid-page) and REGARDLESS of multi-column
+    text-stream order, because position comes from the box, not the stream.
+
+    A genuine recurring heading ("Definition", "Illustration", "Exercise")
+    appears at DIFFERENT vertical positions page to page, so its spread is
+    wide and it is never flagged. This is what keeps real headings intact.
+
+    Returns the set of furniture keys; `_strip_page_furniture` removes
+    matching lines from the (pypdf) match text. On any pymupdf failure
+    returns an empty set — the anchor then simply skips header stripping
+    (degrades safely, never corrupts).
+    """
+    try:
+        import fitz  # pymupdf
+    except Exception as e:  # pragma: no cover - dependency present in prod
+        logger.warning("pymupdf unavailable; skipping positional furniture: %s", e)
+        return set()
+
+    try:
+        doc = fitz.open(stream=pdf_bytes, filetype="pdf")
+    except Exception as e:
+        logger.warning("pymupdf could not open PDF for furniture detection: %s", e)
+        return set()
+
+    key_pages: dict[str, set[int]] = {}
+    key_ys: dict[str, list[float]] = {}
+    try:
+        for pno in range(doc.page_count):
+            page = doc[pno]
+            height = page.rect.height or 1.0
+            try:
+                data = page.get_text("dict")
+            except Exception:
+                continue
+            for block in data.get("blocks", []):
+                for line in block.get("lines", []):
+                    text = "".join(s.get("text", "") for s in line.get("spans", []))
+                    norm = _normalize_for_match(text)
+                    # Cap length: headers/footers are short; never treat a
+                    # full sentence/paragraph as furniture even if repeated.
+                    if not norm or len(norm.split()) > 12:
+                        continue
+                    key = _furniture_key(norm)
+                    if not key:
+                        continue
+                    y0 = (line.get("bbox") or [0, 0, 0, 0])[1]
+                    key_pages.setdefault(key, set()).add(pno + 1)
+                    key_ys.setdefault(key, []).append(y0 / height)
+    finally:
+        doc.close()
+
+    furniture: set[str] = set()
+    for key, pages in key_pages.items():
+        if len(pages) < 3:
+            continue
+        ys = key_ys.get(key, [])
+        # Tightly clustered vertical position across pages → running
+        # header/footer. Wide spread → recurring mid-page heading → keep.
+        if ys and (max(ys) - min(ys)) < 0.08:
+            furniture.add(key)
+    return furniture
+
+
+def _strip_page_furniture(
+    per_page: dict[int, str],
+    furniture_keys: set[str],
+) -> dict[int, str]:
+    """Drop running-header/footer and figure-caption lines from each page's
+    (pypdf) text BEFORE title matching, so a section title can only anchor
+    to genuine heading/body text — never to page furniture or a caption.
+
+    `furniture_keys` come from `_positional_furniture_keys` (geometry-based,
+    so they are confirmed running headers/footers). Because that gate is
+    positional, stripping a furniture key wherever it appears is safe — a
+    real heading like "Definition" is never in the set. When nothing genuine
+    remains for a title, the caller's phantom path keeps Gemini's page value.
+
+      • Running headers / footers — collide with a chapter-root title, anchor
+        it to the first page the header prints on, and drag the forward
+        cursor so every later section is mis-placed too (the Trachea→p2 /
+        Lungs→p2 regression).
+      • Figure captions / diagram labels — "Figure 6.8 Human Respiratory
+        System", "Fig. 6.7 ..." — would anchor a matching title to the
+        figure's page instead of its heading.
+    """
+    cleaned: dict[int, str] = {}
+    for p, text in per_page.items():
+        kept: list[str] = []
+        for ln in (text or "").splitlines():
+            norm = _normalize_for_match(ln)
+            if norm and furniture_keys and _furniture_key(norm) in furniture_keys:
+                continue
+            if _FIG_CAPTION_RE.match(ln or ""):
+                continue
+            kept.append(ln)
+        cleaned[p] = "\n".join(kept)
+    return cleaned
+
+
 def anchor_pages_from_pdf(
     schema: BookSchema,
     pdf_bytes: bytes,
@@ -210,7 +343,16 @@ def anchor_pages_from_pdf(
         report.skipped_no_text = True
         return schema, report
 
-    per_page_norm = {p: _normalize_for_match(t) for p, t in per_page.items()}
+    # Strip running headers/footers and figure captions BEFORE normalizing —
+    # otherwise a section title can anchor to page furniture (e.g. a "Chapter
+    # 6" running header) or a figure caption, overwrite its correct page, and
+    # drag the forward cursor so every later section is mis-placed too.
+    # Furniture is detected by GEOMETRY (pymupdf boxes) so a header is caught
+    # at any position and through multi-column reordering; matching stays on
+    # the pypdf text to preserve verified anchor behavior.
+    furniture_keys = _positional_furniture_keys(pdf_bytes)
+    per_page_clean = _strip_page_furniture(per_page, furniture_keys)
+    per_page_norm = {p: _normalize_for_match(t) for p, t in per_page_clean.items()}
     total_pages = max(per_page_norm.keys()) if per_page_norm else 0
     if total_pages <= 0:
         report.skipped_no_text = True

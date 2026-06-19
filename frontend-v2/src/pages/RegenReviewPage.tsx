@@ -113,6 +113,17 @@ export default function RegenReviewPage() {
 
   const [topTab, setTopTab] = useState<TopTab>('theory');
 
+  // When the book has only QUESTION regen (no theory regen), land on the
+  // Questions tab so the user sees their regenerated content instead of an
+  // empty Theory tab. One-shot — never fights a later manual tab switch.
+  const autoTabPicked = useRef(false);
+  useEffect(() => {
+    if (autoTabPicked.current) return;
+    if (regenState.kind === 'loading' || questionRegenLoading) return;
+    if (regenState.kind === 'empty' && questionRegen) setTopTab('questions');
+    autoTabPicked.current = true;
+  }, [regenState.kind, questionRegen, questionRegenLoading]);
+
   // Refetch fresh data when the user lands on a tab. The hooks only fetch
   // once on mount otherwise — if a background regen completes after mount
   // (and before the user opens the relevant tab), the cached state would
@@ -500,7 +511,11 @@ export default function RegenReviewPage() {
       </div>
     );
   }
-  if (regenState.kind === 'empty') {
+  // Show the full empty state ONLY when there is NO regenerated content of
+  // EITHER kind. A question-only regen (theory regen empty) must still render
+  // the page so its Questions tab is visible — gating the whole page on the
+  // theory regen was why a completed question regen showed "No content".
+  if (regenState.kind === 'empty' && !questionRegen && !questionRegenLoading) {
     return (
       <div className="content fade-up">
         <div className="content-narrow" style={{ maxWidth: 720 }}>
@@ -1653,8 +1668,17 @@ function QuestionContent({
     has_solution?: boolean;
     solution_text?: string | null;
     embedded_figures?: RegenQEmbeddedFigure[];
+    qc_local?: {
+      regen_failed?: { retained_original?: boolean; reason?: string };
+    } | null;
   };
 }) {
+  // No-skip fallback badge: when regeneration produced 0 variants for a
+  // source, the backend retains the ORIGINAL question flagged here so it is
+  // never silently dropped. Surface that clearly so the user knows this
+  // "variant" is the original verbatim and can retry the section.
+  const regenFailed = question.qc_local?.regen_failed;
+  const retainedOriginal = Boolean(regenFailed?.retained_original);
   // Same STRUCTURAL split as the extracted-content question view
   // (QuestionsView): body_target routes each figure under the question
   // stem vs inside the solution block. No inference — the data carries its
@@ -1669,6 +1693,26 @@ function QuestionContent({
 
   return (
     <>
+      {retainedOriginal && (
+        <div
+          title={regenFailed?.reason || 'Regeneration produced no variants'}
+          style={{
+            display: 'inline-flex',
+            alignItems: 'center',
+            gap: 6,
+            marginBottom: 6,
+            padding: '3px 8px',
+            borderRadius: 6,
+            background: '#FFF4E5',
+            border: '1px solid #E0A458',
+            color: '#8A5300',
+            fontSize: 11,
+            fontWeight: 700,
+          }}
+        >
+          ⚠ Couldn't regenerate — original retained
+        </div>
+      )}
       <div
         style={{
           fontSize: 13.5,
