@@ -31,6 +31,7 @@ Routes:
 
 from __future__ import annotations
 
+import asyncio
 import json
 import logging
 from typing import Any
@@ -41,6 +42,7 @@ from pydantic import BaseModel, Field
 from sqlalchemy import select
 from sqlalchemy.ext.asyncio import AsyncSession
 
+from app.core.config import settings
 from app.core.db import get_session
 from app.models.book import Book
 from app.models.figure import Figure
@@ -432,6 +434,95 @@ async def discard_figure_regen(
         "figure_id": str(figure_id),
         "status": "discarded",
     }
+
+
+class FigureDiagramRegenRequest(BaseModel):
+    """Body for the manual theory-figure LaTeX/SVG regeneration."""
+    custom_instructions: str | None = Field(default=None, max_length=2000)
+
+
+@figures_router.post("/{figure_id}/regenerate-diagram")
+async def regenerate_figure_diagram(
+    figure_id: UUID,
+    payload: FigureDiagramRegenRequest = Body(default_factory=FigureDiagramRegenRequest),
+    session: AsyncSession = Depends(get_session),
+) -> dict:
+    """Manually regenerate a THEORY figure as clean LaTeX/SVG aligned to the
+    regenerated theory (same engine as question diagrams). On-demand only — the
+    figure is never auto-updated. On success the rasterized PNG is stored as the
+    figure's approved regen variant, so Preview/Composer/Export reflect it.
+    """
+    fig = await session.get(Figure, figure_id)
+    if fig is None:
+        raise HTTPException(404, detail="Figure not found")
+    if not settings.MULTIMODAL_REGEN_ENABLED:
+        raise HTTPException(400, detail="Multimodal diagram regen is disabled")
+    if not fig.image_bytes:
+        raise HTTPException(400, detail="Figure has no source image to regenerate")
+
+    from app.workers.question_regen_v3 import regenerate_theory_figure
+
+    result = await asyncio.to_thread(
+        regenerate_theory_figure, figure_id, payload.custom_instructions
+    )
+    err = result.get("_error") if isinstance(result, dict) else "failed"
+    if err == "fallback":
+        # The model judged the figure too complex to vectorize — original kept.
+        return {
+            "ok": False,
+            "fallback": True,
+            "figure_id": str(figure_id),
+            "message": result.get("description")
+            or "Diagram too complex to vectorize — original figure kept.",
+        }
+    if err == "no_image":
+        raise HTTPException(400, detail="Figure has no source image to regenerate")
+    if not result.get("ok"):
+        raise HTTPException(500, detail="Figure diagram regeneration failed")
+    return result
+
+
+class FigureRedrawRequest(BaseModel):
+    """Body for the on-demand single-figure 'Redraw cleanly' (image model)."""
+    style: str = Field(default="enhanced", pattern="^(enhanced|original)$")
+    custom_instructions: str | None = Field(default=None, max_length=2000)
+    watermark_clean: bool = False
+    overlay: bool = False
+
+
+@figures_router.post("/{figure_id}/redraw")
+async def redraw_figure(
+    figure_id: UUID,
+    payload: FigureRedrawRequest = Body(default_factory=FigureRedrawRequest),
+    session: AsyncSession = Depends(get_session),
+) -> dict:
+    """On-demand 'Redraw cleanly' for ONE figure — the image-model redraw
+    (same engine as the section batch), scoped to a single figure and
+    auto-approved so it shows immediately. Distinct from the LaTeX/SVG
+    /regenerate-diagram path; this one is a clean raster redraw.
+    """
+    fig = await session.get(Figure, figure_id)
+    if fig is None:
+        raise HTTPException(404, detail="Figure not found")
+    if not fig.image_bytes:
+        raise HTTPException(400, detail="Figure has no source image to redraw")
+
+    from app.workers.figures_tasks import redraw_single_figure
+
+    result = await asyncio.to_thread(
+        redraw_single_figure,
+        figure_id,
+        style=payload.style,
+        custom_instructions=payload.custom_instructions,
+        watermark_clean=payload.watermark_clean,
+        overlay=payload.overlay,
+    )
+    err = result.get("_error") if isinstance(result, dict) else "failed"
+    if err == "no_image":
+        raise HTTPException(400, detail="Figure has no source image to redraw")
+    if not result.get("ok"):
+        raise HTTPException(500, detail="Figure redraw failed")
+    return result
 
 
 # ---------------------------------------------------------------------------

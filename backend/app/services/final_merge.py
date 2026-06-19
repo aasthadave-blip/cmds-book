@@ -64,6 +64,30 @@ def _extract_image_regen_hint(q: Question) -> dict[str, Any] | None:
     return {"needed": True, "reason": ir.get("reason") or ""}
 
 
+def _extract_regenerated_diagram(q: Question) -> dict[str, Any] | None:
+    """Step 2 — surface the regenerated LaTeX/SVG diagram payload from qc_local.
+
+    The Composer seeds its draft from these question dicts, so without this the
+    Final/Export DOCX path can never embed the new diagram. With it present, the
+    docx builder rasterizes ``svg_preview`` to PNG and embeds it IN PLACE OF the
+    original figure (honoring fallback_to_original). None when there is no regen
+    diagram on the question.
+    """
+    qc = getattr(q, "qc_local", None)
+    if not isinstance(qc, dict):
+        return None
+    rd = qc.get("regenerated_diagram")
+    if not isinstance(rd, dict):
+        return None
+    return {
+        "fallback_to_original": bool(rd.get("fallback_to_original", False)),
+        "subject": rd.get("subject") or "",
+        "latex_code": rd.get("latex_code") or "",
+        "svg_preview": rd.get("svg_preview") or "",
+        "description": rd.get("description") or "",
+    }
+
+
 # ---------------------------------------------------------------------------
 # Chip ↔ Question merge
 # ---------------------------------------------------------------------------
@@ -930,6 +954,9 @@ async def build_final_merge(
             "kind": q.kind,
             "embedded_figures": question_figures_by_qid.get(str(q.id), []),
             "image_regen_hint": _extract_image_regen_hint(q),
+            # Step 2 — carry the regen diagram so the Composer/Final DOCX export
+            # can embed it in place of the original figure.
+            "regenerated_diagram": _extract_regenerated_diagram(q),
         }
         if origin_section_id is not None:
             qd["_origin_section_id"] = origin_section_id
@@ -1083,6 +1110,8 @@ async def build_final_merge(
                 "kind": q.kind,
                 "embedded_figures": question_figures_by_qid.get(str(q.id), []),
                 "image_regen_hint": _extract_image_regen_hint(q),
+                # Step 2 — see _question_to_dict above
+                "regenerated_diagram": _extract_regenerated_diagram(q),
             })
         out_sections.append({
             "section_id": title,

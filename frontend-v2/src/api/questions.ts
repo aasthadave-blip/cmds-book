@@ -48,6 +48,19 @@ export type ExtractedQuestion = {
   // Figures referenced inline within this question's text. Empty if the
   // figure_embedder didn't find any "Fig. X.Y" reference in raw_text.
   embedded_figures?: QuestionEmbeddedFigure[];
+  // Step 2 — chained LaTeX/SVG diagram regen. Present only on regenerated
+  // variants whose source question carried a diagram. svg_preview renders
+  // live in the browser; latex_code is the compilable standalone source.
+  image_regen_hint?: { needed: boolean; reason: string } | null;
+  regenerated_diagram?: RegeneratedDiagram | null;
+};
+
+export type RegeneratedDiagram = {
+  fallback_to_original: boolean;
+  subject: string;
+  latex_code: string;
+  svg_preview: string;
+  description: string;
 };
 
 export type RejectedItem = {
@@ -122,6 +135,22 @@ export const retryRegenSection = (
 
 export const saveQuestionRegeneration = (regenId: string) =>
   req(`/api/question-regenerations/${regenId}/save`, { method: 'POST' });
+
+// Reseed ONE regenerated question's LaTeX/SVG diagram with an optional
+// customization instruction (mirrors "Reseed this section" but for the figure).
+// Refines the current diagram via the LLM, persists it, and returns the new one.
+export const regenerateQuestionDiagram = (
+  questionId: string,
+  customInstructions?: string | null,
+) =>
+  req<{
+    ok: boolean;
+    question_id: string;
+    regenerated_diagram: RegeneratedDiagram;
+  }>(`/api/question-banks/questions/${questionId}/regenerate-diagram`, {
+    method: 'POST',
+    body: JSON.stringify({ custom_instructions: customInstructions ?? null }),
+  });
 
 // Hide / unhide a single question (used in the reviewer UI to drop a
 // generated question the user doesn't want without re-running regen).

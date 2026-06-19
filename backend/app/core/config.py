@@ -139,6 +139,17 @@ class Settings(BaseSettings):
     # regen is identical regardless of this flag.
     MULTIMODAL_REGEN_ENABLED: bool = True
 
+    # Step 2 — chained LaTeX/SVG diagram regen. When a regenerated question's
+    # `regenerated_diagram.svg_preview` is present (and not fallback_to_original),
+    # the Word export rasterizes that SVG to PNG and embeds it IN PLACE OF the
+    # original figure. Primary rasterizer is cairosvg (Linux/prod: needs system
+    # libcairo2). RESVG_BINARY_PATH is the dependency-free fallback for Windows
+    # dev — point it at the resvg executable (empty = auto-detect on PATH and in
+    # backend/tools/resvg/). Set EMBED_REGEN_DIAGRAM_IN_DOCX=False to keep the
+    # original figure everywhere (rollback).
+    EMBED_REGEN_DIAGRAM_IN_DOCX: bool = True
+    RESVG_BINARY_PATH: str = ""
+
     # Multi-OCR (Sprint 4; empty by default)
     MATHPIX_APP_ID: str = ""
     MATHPIX_APP_KEY: str = ""

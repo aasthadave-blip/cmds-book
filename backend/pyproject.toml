@@ -39,6 +39,10 @@ dependencies = [
     # control over fonts, spacing, and the no-duplicate-headings rule.
     "python-docx>=1.0.0",
     "pypandoc-binary>=1.13",
+    # SVG → PNG rasterization for embedding regenerated diagrams in Word.
+    # Primary backend (needs system libcairo2 on Linux/prod). The resvg
+    # standalone binary is the dependency-free fallback (see svg_raster.py).
+    "cairosvg>=2.7.0",
 ]
 
 [project.optional-dependencies]

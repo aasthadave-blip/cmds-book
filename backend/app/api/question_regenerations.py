@@ -90,6 +90,24 @@ def _regen_dict(r: QuestionRegeneration, question_count: int = 0) -> dict:
 
 
 def _question_dict(q: Question) -> dict:
+    # Step 2 (chained diagram regen) — surface the LaTeX/SVG payload + the
+    # image-regen hint stored in qc_local so the Regenerated tab can render a
+    # live vector preview. Present only for image-bearing regen variants.
+    image_regen_hint = None
+    regenerated_diagram = None
+    if isinstance(q.qc_local, dict):
+        ir = q.qc_local.get("image_regen")
+        if isinstance(ir, dict) and ir.get("needed"):
+            image_regen_hint = {"needed": True, "reason": ir.get("reason") or ""}
+        rd = q.qc_local.get("regenerated_diagram")
+        if isinstance(rd, dict):
+            regenerated_diagram = {
+                "fallback_to_original": bool(rd.get("fallback_to_original", False)),
+                "subject": rd.get("subject") or "",
+                "latex_code": rd.get("latex_code") or "",
+                "svg_preview": rd.get("svg_preview") or "",
+                "description": rd.get("description") or "",
+            }
     return {
         "id": str(q.id),
         "regen_id": str(q.regen_id) if q.regen_id else None,
@@ -115,6 +133,8 @@ def _question_dict(q: Question) -> dict:
         "solution_text": q.solution_text,
         "has_solution": q.has_solution,
         "kind": q.kind or "exercise",
+        "image_regen_hint": image_regen_hint,
+        "regenerated_diagram": regenerated_diagram,
     }
 
 

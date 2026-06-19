@@ -13,6 +13,7 @@ Endpoints:
 
 from __future__ import annotations
 
+import asyncio
 import json
 import os
 import re
@@ -21,11 +22,13 @@ import tempfile
 from pathlib import Path
 from uuid import UUID
 
-from fastapi import APIRouter, Depends, HTTPException, status
+from fastapi import APIRouter, Body, Depends, HTTPException, status
 from fastapi.responses import Response
+from pydantic import BaseModel, Field
 from sqlalchemy import func, select, update
 from sqlalchemy.ext.asyncio import AsyncSession
 
+from app.core.config import settings
 from app.core.db import get_session
 from app.core.rate_limit import extraction_limit
 from app.models.book import Book
@@ -125,12 +128,23 @@ def _question_dict(q: Question) -> dict:
     # Phase 4 — surface the multimodal regen verdict if present so the
     # frontend can show a "⚠ figure needs regen" hint per regen variant.
     image_regen_hint = None
+    regenerated_diagram = None
     if isinstance(q.qc_local, dict):
         ir = q.qc_local.get("image_regen")
         if isinstance(ir, dict) and ir.get("needed"):
             image_regen_hint = {
                 "needed": True,
                 "reason": ir.get("reason") or "",
+            }
+        # Step 2 — chained LaTeX/SVG diagram payload (see question_regen_v3).
+        rd = q.qc_local.get("regenerated_diagram")
+        if isinstance(rd, dict):
+            regenerated_diagram = {
+                "fallback_to_original": bool(rd.get("fallback_to_original", False)),
+                "subject": rd.get("subject") or "",
+                "latex_code": rd.get("latex_code") or "",
+                "svg_preview": rd.get("svg_preview") or "",
+                "description": rd.get("description") or "",
             }
     return {
         "id": str(q.id),
@@ -158,6 +172,8 @@ def _question_dict(q: Question) -> dict:
         "is_hidden": bool(q.is_hidden),
         # Phase 4 — present only when regen LLM flagged image_needs_regen=true
         "image_regen_hint": image_regen_hint,
+        # Step 2 — LaTeX/SVG vector diagram (present only for regen variants)
+        "regenerated_diagram": regenerated_diagram,
     }
 
 
@@ -1214,3 +1230,47 @@ async def unhide_question(
     q.is_hidden = False
     await session.commit()
     return {"ok": True, "question_id": str(q.id), "is_hidden": False}
+
+
+class DiagramReseedRequest(BaseModel):
+    """Custom-instruction body for a single-question diagram reseed."""
+    custom_instructions: str | None = Field(default=None, max_length=2000)
+
+
+@banks_router.post("/questions/{question_id}/regenerate-diagram")
+async def regenerate_question_diagram(
+    question_id: UUID,
+    payload: DiagramReseedRequest = Body(default_factory=DiagramReseedRequest),
+    session: AsyncSession = Depends(get_session),
+) -> dict:
+    """Reseed ONE regenerated question's LaTeX/SVG diagram with an optional
+    customization instruction (mirrors the "Reseed this section" pattern, but
+    for the figure). Refines the current diagram via Gemini, validates that it
+    rasterizes, persists into qc_local, and returns the new diagram payload.
+
+    Synchronous from the client's view (one Pro call); the blocking work runs
+    in a thread so the event loop stays free.
+    """
+    q = await session.get(Question, question_id)
+    if q is None:
+        raise HTTPException(404, detail="Question not found")
+    if not settings.MULTIMODAL_REGEN_ENABLED:
+        raise HTTPException(400, detail="Multimodal diagram regen is disabled")
+
+    from app.workers.question_regen_v3 import reseed_diagram_for_question
+
+    result = await asyncio.to_thread(
+        reseed_diagram_for_question, question_id, payload.custom_instructions
+    )
+    err = (result or {}).get("_error") if isinstance(result, dict) else None
+    if err == "no_figure":
+        raise HTTPException(
+            400, detail="This question has no attached figure to regenerate"
+        )
+    if not result or err:
+        raise HTTPException(500, detail="Diagram regeneration failed")
+    return {
+        "ok": True,
+        "question_id": str(question_id),
+        "regenerated_diagram": result,
+    }

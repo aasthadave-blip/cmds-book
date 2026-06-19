@@ -29,11 +29,13 @@ import {
   useBookQuestions,
   type QuestionBankDetail,
   type RegenQuestionsResponse,
+  type RegeneratedDiagram,
   listQuestionRegenerations,
   getRegenQuestions,
   retryRegenSection,
   saveQuestionRegeneration,
   hideQuestion,
+  regenerateQuestionDiagram,
 } from '../api/questions';
 import {
   useBookFigures,
@@ -1717,11 +1719,40 @@ function QuestionContent({
   question,
 }: {
   question: {
+    id?: string;
     raw_text?: string;
     has_solution?: boolean;
     solution_text?: string | null;
+    regenerated_diagram?: RegeneratedDiagram | null;
   };
 }) {
+  // Local override so a reseed shows instantly without a full refetch; falls
+  // back to the prop when not yet reseeded.
+  const [override, setOverride] = useState<RegeneratedDiagram | null>(null);
+  const [reseedOpen, setReseedOpen] = useState(false);
+  const [reseedInstr, setReseedInstr] = useState('');
+  const [reseedBusy, setReseedBusy] = useState(false);
+  const [reseedErr, setReseedErr] = useState<string | null>(null);
+  const diagram = override ?? question.regenerated_diagram;
+
+  const runReseed = async () => {
+    if (!question.id) return;
+    setReseedBusy(true);
+    setReseedErr(null);
+    try {
+      const res = await regenerateQuestionDiagram(
+        question.id,
+        reseedInstr.trim() || null,
+      );
+      setOverride(res.regenerated_diagram);
+      setReseedOpen(false);
+      setReseedInstr('');
+    } catch (e) {
+      setReseedErr(e instanceof Error ? e.message : 'Reseed failed');
+    } finally {
+      setReseedBusy(false);
+    }
+  };
   return (
     <>
       <div
@@ -1736,6 +1767,223 @@ function QuestionContent({
           <em style={{ color: 'var(--ink-400)' }}>(no text)</em>
         )}
       </div>
+      {diagram && !diagram.fallback_to_original && diagram.svg_preview && (
+        <div
+          style={{
+            marginTop: 12,
+            padding: 12,
+            borderRadius: 8,
+            border: '1px solid var(--teal-200, #99f6e4)',
+            background: 'var(--teal-50, #f0fdfa)',
+          }}
+        >
+          <div
+            style={{
+              display: 'flex',
+              alignItems: 'center',
+              justifyContent: 'space-between',
+              gap: 8,
+              marginBottom: 8,
+              paddingBottom: 6,
+              borderBottom: '1px solid var(--teal-100, #ccfbf1)',
+            }}
+          >
+            <span
+              style={{
+                fontSize: 10,
+                fontWeight: 700,
+                letterSpacing: '0.08em',
+                textTransform: 'uppercase',
+                color: 'var(--teal-700, #0f766e)',
+              }}
+            >
+              ✨ Vector Diagram{diagram.subject ? ` · ${diagram.subject}` : ''}
+            </span>
+            <span style={{ fontSize: 10, fontStyle: 'italic', color: 'var(--ink-400)' }}>
+              Generated from context
+            </span>
+          </div>
+          <div
+            style={{
+              display: 'flex',
+              justifyContent: 'center',
+              alignItems: 'center',
+              background: '#fff',
+              padding: 12,
+              borderRadius: 6,
+              border: '1px solid var(--line)',
+              overflow: 'auto',
+            }}
+            dangerouslySetInnerHTML={{ __html: diagram.svg_preview }}
+          />
+          {diagram.latex_code && (
+            <details style={{ marginTop: 10 }}>
+              <summary
+                style={{
+                  cursor: 'pointer',
+                  fontSize: 11,
+                  fontWeight: 600,
+                  color: 'var(--teal-700, #0f766e)',
+                  userSelect: 'none',
+                }}
+              >
+                Show LaTeX code
+              </summary>
+              <div style={{ position: 'relative', marginTop: 6 }}>
+                <button
+                  onClick={() => {
+                    void navigator.clipboard?.writeText(diagram.latex_code);
+                  }}
+                  style={{
+                    position: 'absolute',
+                    right: 6,
+                    top: 6,
+                    fontSize: 10,
+                    padding: '2px 8px',
+                    borderRadius: 4,
+                    border: '1px solid #374151',
+                    background: '#1f2937',
+                    color: '#e5e7eb',
+                    cursor: 'pointer',
+                  }}
+                >
+                  Copy
+                </button>
+                <pre
+                  style={{
+                    margin: 0,
+                    padding: 12,
+                    maxHeight: 200,
+                    overflow: 'auto',
+                    borderRadius: 6,
+                    background: '#111827',
+                    color: '#e5e7eb',
+                    fontSize: 11,
+                    lineHeight: 1.5,
+                    fontFamily: 'var(--font-mono)',
+                    whiteSpace: 'pre-wrap',
+                  }}
+                >
+                  {diagram.latex_code}
+                </pre>
+              </div>
+            </details>
+          )}
+          {diagram.description && (
+            <div style={{ marginTop: 8, fontSize: 11, color: 'var(--ink-500)' }}>
+              {diagram.description}
+            </div>
+          )}
+        </div>
+      )}
+      {diagram?.fallback_to_original && (
+        <div
+          style={{
+            marginTop: 12,
+            padding: '8px 12px',
+            borderRadius: 6,
+            border: '1px solid var(--amber-200, #fde68a)',
+            background: 'var(--amber-50, #fffbeb)',
+            fontSize: 11.5,
+            color: 'var(--amber-800, #92400e)',
+          }}
+        >
+          💡 <strong>Note:</strong> This diagram is too complex to vectorize
+          programmatically (e.g. biological/organic graphic). The original
+          figure reference has been preserved as the fallback.
+        </div>
+      )}
+      {question.id && diagram && (
+        <div style={{ marginTop: 8 }}>
+          {!reseedOpen ? (
+            <button
+              onClick={() => setReseedOpen(true)}
+              style={{
+                fontSize: 11,
+                fontWeight: 600,
+                color: 'var(--teal-700, #0f766e)',
+                background: 'transparent',
+                border: '1px dashed var(--teal-200, #99f6e4)',
+                borderRadius: 6,
+                padding: '4px 10px',
+                cursor: 'pointer',
+              }}
+            >
+              🔁 Reseed diagram
+            </button>
+          ) : (
+            <div
+              style={{
+                padding: 10,
+                borderRadius: 6,
+                border: '1px solid var(--teal-200, #99f6e4)',
+                background: 'var(--teal-50, #f0fdfa)',
+              }}
+            >
+              <textarea
+                value={reseedInstr}
+                onChange={(e) => setReseedInstr(e.target.value)}
+                placeholder="Optional: how should the diagram change? e.g. 'label the angle as 45°', 'add the normal as a dashed line', 'use a clearer scale'"
+                rows={2}
+                disabled={reseedBusy}
+                style={{
+                  width: '100%',
+                  boxSizing: 'border-box',
+                  fontSize: 12,
+                  padding: 8,
+                  borderRadius: 4,
+                  border: '1px solid var(--line)',
+                  resize: 'vertical',
+                  fontFamily: 'inherit',
+                }}
+              />
+              {reseedErr && (
+                <div style={{ marginTop: 6, fontSize: 11, color: 'var(--red-600, #dc2626)' }}>
+                  {reseedErr}
+                </div>
+              )}
+              <div style={{ display: 'flex', gap: 8, marginTop: 8 }}>
+                <button
+                  onClick={runReseed}
+                  disabled={reseedBusy}
+                  style={{
+                    fontSize: 11,
+                    fontWeight: 600,
+                    color: '#fff',
+                    background: reseedBusy
+                      ? 'var(--ink-300, #cbd5e1)'
+                      : 'var(--teal-700, #0f766e)',
+                    border: 'none',
+                    borderRadius: 6,
+                    padding: '5px 12px',
+                    cursor: reseedBusy ? 'default' : 'pointer',
+                  }}
+                >
+                  {reseedBusy ? 'Regenerating…' : 'Regenerate diagram'}
+                </button>
+                <button
+                  onClick={() => {
+                    setReseedOpen(false);
+                    setReseedErr(null);
+                  }}
+                  disabled={reseedBusy}
+                  style={{
+                    fontSize: 11,
+                    color: 'var(--ink-500)',
+                    background: 'transparent',
+                    border: '1px solid var(--line)',
+                    borderRadius: 6,
+                    padding: '5px 12px',
+                    cursor: reseedBusy ? 'default' : 'pointer',
+                  }}
+                >
+                  Cancel
+                </button>
+              </div>
+            </div>
+          )}
+        </div>
+      )}
       {question.has_solution && question.solution_text && (
         <details
           style={{

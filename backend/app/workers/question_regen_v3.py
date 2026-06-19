@@ -101,6 +101,11 @@ GEMINI_MODEL = "gemini-2.5-flash"
 GEMINI_TIMEOUT_S = 150
 MAX_OUTPUT_TOKENS = 32768
 
+# Step 2 (chained diagram regen) — Pro for visual fidelity, low temperature
+# for structurally-stable LaTeX/SVG output.
+DIAGRAM_GEN_MODEL = "gemini-2.5-pro"
+DIAGRAM_GEN_TEMPERATURE = 0.2
+
 # Question kind enum allowed in the DB (matches Question.kind column).
 _LEGACY_KINDS = {"exercise", "example", "problem", "mcq", "review", "other"}
 
@@ -374,6 +379,477 @@ async def _regen_one_source(
         return {"ok": False, "items": [], "notes": "", "error": str(e)}
 
 
+async def _generate_latex_diagram_for_question(
+    *,
+    original_image_bytes_list: list[tuple[bytes, str]],
+    regenerated_question_text: str,
+    regenerated_solution_text: str,
+) -> dict[str, Any] | None:
+    """Step 2 (Dual-Step Chained Generation) — diagram regen.
+
+    Given the ORIGINAL diagram image(s) plus the newly regenerated question
+    text and its worked solution, ask Gemini 2.5 Pro to synthesize a
+    compilable standalone LaTeX diagram AND a parallel inline SVG whose
+    labels/values match the regenerated question.
+
+    This runs as a SEPARATE chained call (not folded into the question-regen
+    prompt) so neither task degrades the other. Pro + low temperature is used
+    for structural fidelity. Returns the normalized diagram dict, or None when
+    there are no images / the prompt is missing / the call fails (the caller
+    treats None as "no diagram payload" and proceeds normally).
+    """
+    return await asyncio.to_thread(
+        _generate_diagram_blocking,
+        original_image_bytes_list=original_image_bytes_list,
+        regenerated_question_text=regenerated_question_text,
+        regenerated_solution_text=regenerated_solution_text,
+    )
+
+
+def _image_dimensions(
+    image_bytes_list: list[tuple[bytes, str]] | None,
+) -> tuple[int, int] | None:
+    """Read (width, height) in px of the first source figure, or None."""
+    if not image_bytes_list:
+        return None
+    try:
+        import io as _io
+
+        from PIL import Image
+
+        with Image.open(_io.BytesIO(image_bytes_list[0][0])) as img:
+            return img.size  # (w, h)
+    except Exception:
+        return None
+
+
+def _build_diagram_user_prompt(
+    q_text: str,
+    sol_text: str,
+    *,
+    custom_instructions: str | None = None,
+    previous_diagram: dict[str, Any] | None = None,
+    source_size: tuple[int, int] | None = None,
+    mode: str = "question",
+) -> str:
+    """Build the diagram-gen user prompt.
+
+    mode="question": q_text = regenerated question, sol_text = worked solution.
+    mode="theory":   q_text = regenerated theory content the figure illustrates,
+                     sol_text = the figure's caption/label.
+
+    For a user-driven reseed we also pass the CURRENT diagram (so the model
+    refines rather than starts over) and the user's customization instruction at
+    highest priority. When the original figure's pixel size is known, we pass it
+    so the SVG/LaTeX mirror the source figure's aspect ratio.
+    """
+    if mode == "theory":
+        parts = [
+            "Here is the newly regenerated THEORY content that the attached "
+            "figure illustrates. Regenerate the figure as clean LaTeX + a "
+            "parallel SVG so it matches the NEW theory (updated labels, values, "
+            "structure), based on the original attached figure.",
+            "",
+            f"REGENERATED THEORY (what this figure must illustrate):\n{q_text}",
+            "",
+            f"FIGURE CAPTION / LABEL:\n{sol_text}",
+        ]
+    else:
+        parts = [
+            "Here is the newly regenerated question and its worked solution. "
+            "Generate a corresponding LaTeX diagram and a parallel SVG rendering "
+            "based on the original attached image context.",
+            "",
+            f"REGENERATED QUESTION:\n{q_text}",
+            "",
+            f"REGENERATED SOLUTION:\n{sol_text}",
+        ]
+    if source_size:
+        w, h = source_size
+        aspect = (w / h) if h else 1.0
+        # Suggest a viewBox that keeps the SAME aspect ratio, normalized to a
+        # ~360px-wide canvas (legible when rasterized + embedded in Word).
+        vw = 360
+        vh = max(1, round(360 / aspect)) if aspect else 360
+        parts += [
+            "",
+            "SOURCE FIGURE SIZE — match the book's format: the original diagram "
+            f"is {w}×{h} px (width:height aspect ≈ {aspect:.2f}). Reproduce the "
+            f"SAME shape and proportions: set the SVG to "
+            f'viewBox="0 0 {vw} {vh}" with width="{vw}" height="{vh}", and lay '
+            "out the LaTeX standalone with matching proportions and a small, "
+            "even border — so the regenerated figure occupies the same size "
+            "format as the source. Do NOT stretch or distort to a different "
+            "aspect ratio.",
+        ]
+    if previous_diagram and (
+        previous_diagram.get("latex_code") or previous_diagram.get("svg_preview")
+    ):
+        parts += [
+            "",
+            "CURRENT DIAGRAM (refine THIS — keep what is correct, change only what "
+            "the customization instruction asks, stay consistent with the question):",
+            "LaTeX:\n" + (previous_diagram.get("latex_code") or "(none)"),
+        ]
+    if custom_instructions and custom_instructions.strip():
+        parts += [
+            "",
+            "USER CUSTOMIZATION INSTRUCTION (highest priority — apply this to the "
+            "diagram while keeping it factually consistent with the question and "
+            "obeying every SVG safety rule):",
+            custom_instructions.strip(),
+        ]
+    return "\n".join(parts)
+
+
+def _generate_diagram_blocking(
+    *,
+    original_image_bytes_list: list[tuple[bytes, str]],
+    regenerated_question_text: str,
+    regenerated_solution_text: str,
+    custom_instructions: str | None = None,
+    previous_diagram: dict[str, Any] | None = None,
+    mode: str = "question",
+) -> dict[str, Any] | None:
+    """Synchronous diagram generation (one blocking Gemini call). Shared by the
+    question diagram path and the theory-figure regen (mode="theory")."""
+    if not original_image_bytes_list:
+        return None
+    try:
+        system_prompt = load_raw("latex_diagram_generator")
+    except Exception as e:  # prompt file missing — degrade gracefully
+        logger.warning("latex_diagram_generator prompt unavailable: %s", e)
+        return None
+
+    user_prompt = _build_diagram_user_prompt(
+        regenerated_question_text,
+        regenerated_solution_text,
+        custom_instructions=custom_instructions,
+        previous_diagram=previous_diagram,
+        source_size=_image_dimensions(original_image_bytes_list),
+        mode=mode,
+    )
+
+    try:
+        raw = call_gemini_text_with_images(
+            system_prompt=system_prompt,
+            user_prompt=user_prompt,
+            image_bytes_list=original_image_bytes_list,
+            model=DIAGRAM_GEN_MODEL,          # Pro for high visual fidelity
+            timeout_s=GEMINI_TIMEOUT_S,
+            max_output_tokens=MAX_OUTPUT_TOKENS,
+            temperature=DIAGRAM_GEN_TEMPERATURE,  # low temp → structural stability
+        )
+        data = parse_json(raw)
+        if isinstance(data, dict):
+            return {
+                "fallback_to_original": bool(data.get("fallback_to_original", False)),
+                "subject": str(data.get("subject") or "").strip(),
+                "latex_code": str(data.get("latex_code") or "").strip(),
+                "svg_preview": str(data.get("svg_preview") or "").strip(),
+                "description": str(data.get("description") or "").strip(),
+            }
+    except Exception as e:
+        logger.warning("LaTeX diagram generation call failed: %s", e)
+    return None
+
+
+def _validate_diagram_renderable(diagram: dict[str, Any]) -> None:
+    """Probe that the model's SVG actually rasterizes (sync; run via to_thread).
+
+    Mutates ``diagram`` in place: on render failure WHEN a rasterizer is
+    available, flips ``fallback_to_original`` to True and appends a note so the
+    UI shows the fallback card instead of a diagram that can't be exported. If
+    no rasterizer is installed at all, leaves the diagram untouched (the browser
+    can still render the SVG; the export keeps the original figure).
+    """
+    try:
+        from app.services.svg_raster import (
+            rasterize_svg_to_png,
+            rasterizer_available,
+        )
+        if not rasterizer_available():
+            return
+        if rasterize_svg_to_png(diagram.get("svg_preview")) is None:
+            diagram["fallback_to_original"] = True
+            note = "auto-fallback: generated SVG failed to rasterize"
+            desc = (diagram.get("description") or "").strip()
+            diagram["description"] = f"{desc} ({note})" if desc else note
+    except Exception as e:  # never let validation break the regen run
+        logger.warning("diagram renderability validation errored: %s", e)
+
+
+async def _attach_diagrams_to_items(
+    items: list[dict[str, Any]],
+    image_bytes_list: list[tuple[bytes, str]] | None,
+) -> None:
+    """Run Step 2 diagram regen for each regenerated item that has a source
+    diagram, mutating each item dict in place with a ``regenerated_diagram``
+    payload. No-op when multimodal is off or there are no source images.
+
+    Called from the ASYNC worker context (after _regen_one_source, before the
+    sync persist) so we never nest event loops — the guide's run_until_complete
+    approach would crash inside the already-running asyncio loop.
+    """
+    if not (image_bytes_list and settings.MULTIMODAL_REGEN_ENABLED):
+        return
+    for it in items:
+        q_text = (it.get("question") or "").strip()
+        if not q_text:
+            continue
+        sol_text = (it.get("solution") or it.get("answer") or "").strip()
+        diagram = await _generate_latex_diagram_for_question(
+            original_image_bytes_list=image_bytes_list,
+            regenerated_question_text=q_text,
+            regenerated_solution_text=sol_text,
+        )
+        if diagram:
+            # Layered-Hydration validation: confirm the model's SVG actually
+            # rasterizes BEFORE we commit it, so the browser preview and the
+            # Word export stay consistent. If a rasterizer is available but the
+            # SVG fails to render, downgrade to fallback (keep original figure)
+            # rather than shipping a diagram that previews but won't export.
+            if (
+                not diagram.get("fallback_to_original")
+                and diagram.get("svg_preview")
+            ):
+                await asyncio.to_thread(_validate_diagram_renderable, diagram)
+            it["regenerated_diagram"] = diagram
+
+
+def reseed_diagram_for_question(
+    question_id: UUID,
+    custom_instructions: str | None = None,
+) -> dict[str, Any] | None:
+    """Synchronous, single-question diagram RESEED (custom-instruction driven).
+
+    Mirrors the "Reseed this section" pattern but targets one regenerated
+    question's diagram. Loads the question's inherited source figure image and
+    its CURRENT diagram, regenerates with the user's instruction (refining the
+    existing diagram), validates renderability, and persists the new payload
+    into ``qc_local["regenerated_diagram"]``. Returns the new diagram dict, or
+    ``{"_error": ...}`` for caller-handled failure cases.
+
+    Called from the async API endpoint via ``asyncio.to_thread`` so the blocking
+    Gemini call never stalls the event loop.
+    """
+    from sqlalchemy.orm.attributes import flag_modified
+
+    with SyncSession() as session:
+        q = session.get(Question, question_id)
+        if q is None:
+            return {"_error": "not_found"}
+        # Load the original diagram image. Prefer the regen question's own
+        # inherited figure_references, but the post-regen embedder pass can
+        # re-materialize (and drop) those, so fall back to the SOURCE question's
+        # figure — which is exactly what the original auto-gen used.
+        image_bytes_list = _load_source_image_bytes(session, q.book_id, question_id)
+        if not image_bytes_list:
+            src_qid = getattr(q, "source_question_id", None)
+            if src_qid:
+                image_bytes_list = _load_source_image_bytes(
+                    session, q.book_id, src_qid
+                )
+        if not image_bytes_list:
+            return {"_error": "no_figure"}
+
+        prev = None
+        if isinstance(q.qc_local, dict):
+            rd = q.qc_local.get("regenerated_diagram")
+            if isinstance(rd, dict):
+                prev = rd
+
+        diagram = _generate_diagram_blocking(
+            original_image_bytes_list=image_bytes_list,
+            regenerated_question_text=q.raw_text or "",
+            regenerated_solution_text=q.solution_text or "",
+            custom_instructions=custom_instructions,
+            previous_diagram=prev,
+        )
+        if not diagram:
+            return {"_error": "generation_failed"}
+
+        _validate_diagram_renderable(diagram)
+
+        qc = dict(q.qc_local) if isinstance(q.qc_local, dict) else {}
+        qc["regenerated_diagram"] = diagram
+        qc["image_regen"] = {
+            "needed": not diagram.get("fallback_to_original", False),
+            "reason": diagram.get("description") or "Reseeded diagram",
+        }
+        q.qc_local = qc
+        flag_modified(q, "qc_local")
+        session.commit()
+        return diagram
+
+
+def _blocks_to_text(
+    blocks: list[dict[str, Any]] | None,
+    *,
+    around: int | None = None,
+    window: int = 4,
+) -> str:
+    """Flatten theory blocks to plain text. When ``around`` (a block index) is
+    given, only the ±window blocks near it are used (the text the figure
+    actually illustrates); otherwise a capped prefix of the section."""
+    if not blocks:
+        return ""
+    if around is not None:
+        lo = max(0, around - window)
+        hi = min(len(blocks), around + window + 1)
+        sel = blocks[lo:hi]
+    else:
+        sel = blocks[:12]
+    out: list[str] = []
+    for b in sel:
+        if not isinstance(b, dict):
+            continue
+        t = b.get("t")
+        if t in ("p", "h3", "kp"):
+            c = b.get("c")
+            if c:
+                out.append(str(c))
+        elif t == "def":
+            term = (b.get("term") or "").strip()
+            c = (b.get("c") or "").strip()
+            out.append((f"{term}: {c}" if term else c).strip())
+        elif t == "eq":
+            c = b.get("c")
+            if c:
+                out.append(f"Equation: {c}")
+        elif t == "list":
+            out.extend(str(x) for x in (b.get("items") or []))
+        elif t == "fig":
+            c = b.get("c")
+            if c:
+                out.append(f"[Figure: {c}]")
+    return "\n".join(p for p in out if p).strip()[:4000]
+
+
+def _theory_context_for_figure(session: Session, fig: Any) -> str:
+    """Build the regenerated-theory context for a theory figure: the caption
+    plus the regenerated blocks around the figure's placement. Falls back to the
+    original section blocks when the section has no regeneration yet."""
+    from app.models.figure_reference import FigureReference
+    from app.models.regeneration import Regeneration
+    from app.models.section import Section
+
+    ref = (
+        session.execute(
+            select(FigureReference)
+            .where(FigureReference.figure_id == fig.id)
+            .where(FigureReference.context == "theory")
+        )
+        .scalars()
+        .first()
+    )
+    section_ref = (ref.section_ref if ref else None) or fig.section_id
+    block_idx = ref.placement_block_idx if ref else None
+
+    blocks: list[dict[str, Any]] | None = None
+    regen = (
+        session.execute(
+            select(Regeneration)
+            .where(Regeneration.book_id == fig.book_id)
+            .order_by(Regeneration.created_at.desc())
+        )
+        .scalars()
+        .first()
+    )
+    if regen and isinstance(regen.blocks_by_section, dict):
+        blocks = regen.blocks_by_section.get(section_ref)
+    if not blocks:
+        sec = (
+            session.execute(
+                select(Section)
+                .where(Section.book_id == fig.book_id)
+                .where(Section.section_id == section_ref)
+            )
+            .scalars()
+            .first()
+        )
+        blocks = sec.blocks if sec else []
+
+    parts: list[str] = []
+    if getattr(fig, "caption", None):
+        parts.append(f"Caption: {fig.caption}")
+    body = _blocks_to_text(blocks, around=block_idx, window=4)
+    if body:
+        parts.append(body)
+    return "\n\n".join(parts)[:4500]
+
+
+def regenerate_theory_figure(
+    figure_id: UUID,
+    custom_instructions: str | None = None,
+) -> dict[str, Any]:
+    """Manual, on-demand regen of a THEORY figure to match the regenerated
+    theory — same LaTeX/SVG engine as question diagrams. NEVER auto-runs; only
+    when the user hits Regenerate.
+
+    On success rasterizes the SVG to PNG and stores it as the figure's APPROVED
+    regen variant (``regen_image_bytes`` + ``approved_at``), so Preview /
+    Composer / Export pick it up via their existing regen-variant path. The
+    LaTeX/SVG payload is kept in ``regen_meta`` for re-use/inspection. On a
+    fallback verdict the original figure is left untouched.
+    """
+    from datetime import datetime, timezone
+
+    from sqlalchemy.orm.attributes import flag_modified
+
+    from app.models.figure import Figure
+    from app.services.svg_raster import rasterize_svg_to_png
+
+    with SyncSession() as session:
+        fig = session.get(Figure, figure_id)
+        if fig is None:
+            return {"_error": "not_found"}
+        if not fig.image_bytes:
+            return {"_error": "no_image"}
+        image_bytes_list = [(fig.image_bytes, fig.mime_type or "image/png")]
+        context = _theory_context_for_figure(session, fig)
+        caption = (getattr(fig, "caption", None) or "").strip()
+        prev = None
+        if isinstance(fig.regen_meta, dict):
+            rd = fig.regen_meta.get("diagram")
+            if isinstance(rd, dict):
+                prev = rd
+
+        diagram = _generate_diagram_blocking(
+            original_image_bytes_list=image_bytes_list,
+            regenerated_question_text=context,
+            regenerated_solution_text=caption,
+            custom_instructions=custom_instructions,
+            previous_diagram=prev,
+            mode="theory",
+        )
+        if not diagram:
+            return {"_error": "generation_failed"}
+        _validate_diagram_renderable(diagram)
+        if diagram.get("fallback_to_original") or not diagram.get("svg_preview"):
+            return {"_error": "fallback", "description": diagram.get("description") or ""}
+
+        png = rasterize_svg_to_png(diagram["svg_preview"])
+        if not png:
+            return {"_error": "rasterize_failed"}
+
+        fig.regen_image_bytes = png
+        fig.approved_at = datetime.now(timezone.utc)
+        meta = dict(fig.regen_meta) if isinstance(fig.regen_meta, dict) else {}
+        meta["diagram"] = diagram
+        meta["source"] = "theory_latex_diagram"
+        meta.pop("discarded", None)
+        fig.regen_meta = meta
+        flag_modified(fig, "regen_meta")
+        session.commit()
+        return {
+            "ok": True,
+            "figure_id": str(figure_id),
+            "subject": diagram.get("subject") or "",
+            "description": diagram.get("description") or "",
+        }
+
+
 def _persist_regen_items(
     session: Session,
     *,
@@ -435,6 +911,21 @@ def _persist_regen_items(
             qc_local["image_regen"] = {
                 "needed": True,
                 "reason": (it.get("image_regen_reason") or "").strip(),
+            }
+
+        # Step 2 — chained LaTeX/SVG diagram regen (attached upstream in the
+        # async worker by _attach_diagrams_to_items). Stored verbatim inside
+        # qc_local["regenerated_diagram"] so no DB migration is needed. When
+        # the model could synthesize a vector equivalent (not a fallback), we
+        # also surface the image_regen hint so the UI flags that the figure
+        # was reconstructed to match the new values.
+        regen_diagram = it.get("regenerated_diagram")
+        if isinstance(regen_diagram, dict):
+            qc_local["regenerated_diagram"] = regen_diagram
+            qc_local["image_regen"] = {
+                "needed": not regen_diagram.get("fallback_to_original", False),
+                "reason": regen_diagram.get("description")
+                or "Generated LaTeX/SVG vector equivalent",
             }
 
         row = Question(
@@ -664,6 +1155,10 @@ async def _run_regen_v3(regen_id: UUID, job_id: UUID) -> dict[str, Any]:
             image_bytes_list=image_bytes_list or None,
             image_addendum_prompt=image_addendum_prompt,
         )
+        # Step 2 — chained diagram regen for image-bearing questions. Mutates
+        # each item with a `regenerated_diagram` payload before persistence.
+        if result.get("ok") and result.get("items"):
+            await _attach_diagrams_to_items(result["items"], image_bytes_list or None)
         # Persist within a fresh session.
         if result.get("ok") and result.get("items"):
             with SyncSession() as own:
@@ -932,6 +1427,9 @@ async def _run_regen_one_section_v3(
             image_bytes_list=image_bytes_list or None,
             image_addendum_prompt=image_addendum_prompt,
         )
+        # Step 2 — chained diagram regen (same as the full-regen path).
+        if result.get("ok") and result.get("items"):
+            await _attach_diagrams_to_items(result["items"], image_bytes_list or None)
         if result.get("ok") and result.get("items"):
             with SyncSession() as own:
                 src = own.get(Question, qid)

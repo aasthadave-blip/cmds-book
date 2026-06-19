@@ -4,7 +4,15 @@
 import { useState } from 'react';
 
 import { Icon } from '../Icon';
-import { figureImageUrl, type Figure, type SectionFigures } from '../../api/figures';
+import {
+  figureImageUrl,
+  regenerateFigureDiagram,
+  redrawFigure,
+  approveFigure,
+  unapproveFigure,
+  type Figure,
+  type SectionFigures,
+} from '../../api/figures';
 
 type Props = {
   sectionRef: string | null;
@@ -149,18 +157,98 @@ function FigureCard({
 }) {
   const [imgErr, setImgErr] = useState(false);
   const [compareOpen, setCompareOpen] = useState(false);
+  // Manual per-figure regen — two methods: 'latex' (vector, theory-aligned) and
+  // 'clean' (image-model clean redraw). On-demand only.
+  const [regenMethod, setRegenMethod] = useState<'latex' | 'clean' | null>(null);
+  const [regenInstr, setRegenInstr] = useState('');
+  const [regenBusy, setRegenBusy] = useState(false);
+  const [regenMsg, setRegenMsg] = useState<string | null>(null);
+  const [forceRegen, setForceRegen] = useState(false);
+  const [bust, setBust] = useState(0);
+  // Original ⇄ Regenerated choice (reversible approve/unapprove). When approved,
+  // the regenerated image is what Preview/Composer/Export use; when not, the
+  // ORIGINAL is used. Mirrors the figure's approval state.
+  const [approved, setApproved] = useState<boolean>(f.is_approved ?? false);
+  const [approveBusy, setApproveBusy] = useState(false);
 
-  // Default rule: if a regenerated variant exists, show it. Else fall back
-  // to the original. No more Original/Regenerated toggle — the side-by-side
-  // comparison lives behind a single ↔ button so the default card is clean.
-  const showingRegen = f.has_regen;
-  const url = showingRegen
+  const hasRegen = forceRegen || f.has_regen;
+  // The card shows whatever is actually IN USE downstream: regen iff approved.
+  const showingRegen = hasRegen && approved;
+  const baseUrl = showingRegen
     ? figureImageUrl(f.id, true)
     : f.has_original
       ? figureImageUrl(f.id)
-      : null;
+      : hasRegen
+        ? figureImageUrl(f.id, true)
+        : null;
+  // Cache-bust after a regen / variant switch so the browser re-fetches.
+  const url = baseUrl
+    ? bust
+      ? baseUrl + (baseUrl.includes('?') ? '&' : '?') + '_t=' + bust
+      : baseUrl
+    : null;
 
-  const canCompare = f.has_original && f.has_regen;
+  const canCompare = f.has_original && hasRegen;
+
+  const toggleVariant = async () => {
+    if (!hasRegen) return;
+    setApproveBusy(true);
+    try {
+      if (approved) {
+        await unapproveFigure(f.id);
+        setApproved(false);
+      } else {
+        await approveFigure(f.id);
+        setApproved(true);
+      }
+      setBust(Date.now());
+      setImgErr(false);
+    } catch (_e) {
+      /* leave state unchanged on failure */
+    } finally {
+      setApproveBusy(false);
+    }
+  };
+
+  const runRegen = async () => {
+    if (!regenMethod) return;
+    setRegenBusy(true);
+    setRegenMsg(null);
+    try {
+      const instr = regenInstr.trim() || null;
+      if (regenMethod === 'latex') {
+        const r = await regenerateFigureDiagram(f.id, instr);
+        if (r.ok) {
+          setForceRegen(true);
+          setApproved(true); // regen buttons auto-approve on the backend
+          setBust(Date.now());
+          setImgErr(false);
+          setRegenMethod(null);
+          setRegenInstr('');
+        } else if (r.fallback) {
+          setRegenMsg(r.message || 'Diagram too complex to vectorize — original kept.');
+        } else {
+          setRegenMsg('Regeneration failed.');
+        }
+      } else {
+        const r = await redrawFigure(f.id, { custom_instructions: instr });
+        if (r.ok) {
+          setForceRegen(true);
+          setApproved(true); // regen buttons auto-approve on the backend
+          setBust(Date.now());
+          setImgErr(false);
+          setRegenMethod(null);
+          setRegenInstr('');
+        } else {
+          setRegenMsg('Redraw failed.');
+        }
+      }
+    } catch (e) {
+      setRegenMsg(e instanceof Error ? e.message : 'Request failed');
+    } finally {
+      setRegenBusy(false);
+    }
+  };
 
   return (
     <div
@@ -358,6 +446,167 @@ function FigureCard({
         >
           {f.page_number && <span>p.{f.page_number}</span>}
           {f.semantic_type && <span>{f.semantic_type}</span>}
+        </div>
+
+        {/* Original ⇄ Regenerated toggle — only when a regen variant exists.
+            Controls which image Preview/Composer/Export use (reversible). */}
+        {hasRegen && (
+          <div
+            style={{
+              marginTop: 10,
+              display: 'flex',
+              alignItems: 'center',
+              gap: 8,
+              flexWrap: 'wrap',
+            }}
+          >
+            <span style={{ fontSize: 11, color: 'var(--ink-500)' }}>
+              In use:{' '}
+              <strong style={{ color: showingRegen ? 'var(--teal-700, #0f766e)' : 'var(--ink-800)' }}>
+                {showingRegen ? 'Regenerated' : 'Original'}
+              </strong>
+            </span>
+            <button
+              onClick={toggleVariant}
+              disabled={approveBusy}
+              title={
+                showingRegen
+                  ? 'Use the ORIGINAL figure in Preview / Composer / Export'
+                  : 'Use the REGENERATED figure in Preview / Composer / Export'
+              }
+              style={{
+                fontSize: 11,
+                fontWeight: 600,
+                color: 'var(--ink-800)',
+                background: 'var(--surface)',
+                border: '1px solid var(--line)',
+                borderRadius: 6,
+                padding: '3px 10px',
+                cursor: approveBusy ? 'default' : 'pointer',
+              }}
+            >
+              {approveBusy
+                ? 'Switching…'
+                : showingRegen
+                  ? '↩ Use original'
+                  : '✨ Use regenerated'}
+            </button>
+          </div>
+        )}
+
+        {/* Manual per-figure regen — two methods. On-demand only; never
+            auto-updates. LaTeX = vector, aligned to regenerated theory/question.
+            Redraw cleanly = image-model clean raster redraw. */}
+        <div style={{ marginTop: 10, borderTop: '1px dashed var(--line)', paddingTop: 10 }}>
+          {!regenMethod ? (
+            <div style={{ display: 'flex', gap: 8, flexWrap: 'wrap' }}>
+              <button
+                onClick={() => { setRegenMethod('latex'); setRegenMsg(null); setRegenInstr(''); }}
+                title="Regenerate as LaTeX/SVG vector, aligned to the regenerated theory/question"
+                style={{
+                  fontSize: 11,
+                  fontWeight: 600,
+                  color: 'var(--teal-700, #0f766e)',
+                  background: 'transparent',
+                  border: '1px dashed var(--teal-200, #99f6e4)',
+                  borderRadius: 6,
+                  padding: '4px 10px',
+                  cursor: 'pointer',
+                }}
+              >
+                🔁 Regenerate (LaTeX)
+              </button>
+              <button
+                onClick={() => { setRegenMethod('clean'); setRegenMsg(null); setRegenInstr(''); }}
+                title="Redraw this figure cleanly with AI (image model) — cosmetic clean-up of the existing figure"
+                style={{
+                  fontSize: 11,
+                  fontWeight: 600,
+                  color: 'var(--indigo-700)',
+                  background: 'transparent',
+                  border: '1px dashed var(--indigo-200, #c7d2fe)',
+                  borderRadius: 6,
+                  padding: '4px 10px',
+                  cursor: 'pointer',
+                }}
+              >
+                🎨 Redraw cleanly
+              </button>
+            </div>
+          ) : (
+            <div>
+              <div style={{ fontSize: 11, fontWeight: 700, marginBottom: 6, color: 'var(--ink-600)' }}>
+                {regenMethod === 'latex'
+                  ? 'Regenerate as LaTeX (vector, theory/question-aligned)'
+                  : 'Redraw cleanly (AI image redraw)'}
+              </div>
+              <textarea
+                value={regenInstr}
+                onChange={(e) => setRegenInstr(e.target.value)}
+                placeholder={
+                  regenMethod === 'latex'
+                    ? "Optional: how should the figure change to match the new content? e.g. 'relabel axes', 'use the new values', 'solid black lines'"
+                    : "Optional: redraw guidance, e.g. 'flat clean style', 'remove watermark', 'sharper labels'"
+                }
+                rows={2}
+                disabled={regenBusy}
+                style={{
+                  width: '100%',
+                  boxSizing: 'border-box',
+                  fontSize: 12,
+                  padding: 8,
+                  borderRadius: 4,
+                  border: '1px solid var(--line)',
+                  resize: 'vertical',
+                  fontFamily: 'inherit',
+                }}
+              />
+              <div style={{ display: 'flex', gap: 8, marginTop: 8 }}>
+                <button
+                  onClick={runRegen}
+                  disabled={regenBusy}
+                  style={{
+                    fontSize: 11,
+                    fontWeight: 600,
+                    color: '#fff',
+                    background: regenBusy
+                      ? 'var(--ink-300, #cbd5e1)'
+                      : regenMethod === 'latex'
+                        ? 'var(--teal-700, #0f766e)'
+                        : 'var(--indigo-700)',
+                    border: 'none',
+                    borderRadius: 6,
+                    padding: '5px 12px',
+                    cursor: regenBusy ? 'default' : 'pointer',
+                  }}
+                >
+                  {regenBusy
+                    ? regenMethod === 'latex' ? 'Regenerating…' : 'Redrawing…'
+                    : regenMethod === 'latex' ? 'Regenerate diagram' : 'Redraw figure'}
+                </button>
+                <button
+                  onClick={() => { setRegenMethod(null); setRegenMsg(null); }}
+                  disabled={regenBusy}
+                  style={{
+                    fontSize: 11,
+                    color: 'var(--ink-500)',
+                    background: 'transparent',
+                    border: '1px solid var(--line)',
+                    borderRadius: 6,
+                    padding: '5px 12px',
+                    cursor: regenBusy ? 'default' : 'pointer',
+                  }}
+                >
+                  Cancel
+                </button>
+              </div>
+            </div>
+          )}
+          {regenMsg && (
+            <div style={{ marginTop: 6, fontSize: 11, color: 'var(--amber-800, #92400e)' }}>
+              {regenMsg}
+            </div>
+          )}
         </div>
       </div>
 

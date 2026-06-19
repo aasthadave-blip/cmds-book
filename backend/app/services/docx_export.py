@@ -29,6 +29,8 @@ from docx import Document
 from docx.enum.text import WD_ALIGN_PARAGRAPH
 from docx.shared import Cm, Pt, RGBColor
 
+from app.core.config import settings
+
 
 # ---------------------------------------------------------------------------
 # Shared building blocks
@@ -694,6 +696,35 @@ def _render_question_tail(b: _DocBuilder, q: dict) -> None:
     b.question_gap()
 
 
+def _maybe_embed_regen_diagram(b: _DocBuilder, q: dict) -> bool:
+    """Step 2 — embed the regenerated LaTeX/SVG diagram (rasterized to PNG)
+    when the question carries one and it is NOT a fallback.
+
+    Returns True when a diagram image was embedded, so the caller can SKIP the
+    original figure (the new diagram REPLACES it). Returns False — meaning keep
+    the original figure — when the feature is off, no diagram is present, the
+    model fell back to the original, the SVG is empty, or rasterization failed.
+    """
+    if not settings.EMBED_REGEN_DIAGRAM_IN_DOCX:
+        return False
+    rd = q.get("regenerated_diagram")
+    if not isinstance(rd, dict) or rd.get("fallback_to_original"):
+        return False
+    svg = (rd.get("svg_preview") or "").strip()
+    if not svg:
+        return False
+    from app.services.svg_raster import rasterize_svg_to_png
+
+    png = rasterize_svg_to_png(svg)
+    if not png:
+        # Neither cairosvg nor resvg could render it — keep the original figure.
+        return False
+    subject = (rd.get("subject") or "").strip()
+    label = "Regenerated diagram" + (f" · {subject}" if subject else "")
+    b.image(png, label=label, caption="")
+    return True
+
+
 def _render_question(b: _DocBuilder, q: dict, *, label: str | None = None) -> None:
     """Backward-compatible single-call render — stem + options + answer
     + solution + gap. Used by the question-bank export path which has no
@@ -701,6 +732,9 @@ def _render_question(b: _DocBuilder, q: dict, *, label: str | None = None) -> No
     _render_question_head + figures + _render_question_tail so figures
     sit between stem and solution."""
     _render_question_head(b, q, label=label)
+    # Step 2 — embed the regenerated diagram between stem and solution when
+    # present (no-op for bank questions, which never carry one).
+    _maybe_embed_regen_diagram(b, q)
     _render_question_tail(b, q)
 
 
@@ -1039,13 +1073,17 @@ def build_final_draft_docx(
             # them past the solution text — wrong position relative to
             # the source PDF.
             _render_question_head(b, q)
-            for f in q.get("embedded_figures") or []:
-                fid = str(f.get("figure_id") or "")
-                data = figure_bytes_map.get(fid)
-                if data:
-                    b.image(data, label=f.get("label") or "", caption=f.get("caption") or "")
-                else:
-                    b.figure_callout(f.get("label") or "image", f.get("caption") or "")
+            # Step 2 — if a regenerated diagram is present (and not a fallback),
+            # embed it IN PLACE OF the original figures. Otherwise fall back to
+            # the original embedded_figures (current behavior).
+            if not _maybe_embed_regen_diagram(b, q):
+                for f in q.get("embedded_figures") or []:
+                    fid = str(f.get("figure_id") or "")
+                    data = figure_bytes_map.get(fid)
+                    if data:
+                        b.image(data, label=f.get("label") or "", caption=f.get("caption") or "")
+                    else:
+                        b.figure_callout(f.get("label") or "image", f.get("caption") or "")
             _render_question_tail(b, q)
             continue
         if t == "custom_text":
