@@ -108,6 +108,12 @@ from app.workers import questions_v3 as _question_v3_tasks  # noqa: E402, F401
 from app.workers import qa as _qa_tasks  # noqa: E402, F401
 from app.workers import figures_tasks as _figures_v2_tasks  # noqa: E402, F401
 from app.workers import orchestrator as _orchestrator_tasks  # noqa: E402, F401
+# Register the question-regen v3 tasks at startup. Without this, the API path
+# imports question_regen_v3 lazily inside its endpoint, but orphan-recovery
+# (and any other dispatch before that endpoint runs) fires before the module
+# loads → "Inline task not registered: extract_questions_regen_v3". Importing
+# here makes register_task() run at boot, same as every other worker above.
+from app.workers import question_regen_v3 as _question_regen_v3_tasks  # noqa: E402, F401
 
 
 _watchdog_task: "asyncio.Task[None] | None" = None

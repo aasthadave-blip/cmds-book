@@ -29,6 +29,9 @@ from docx import Document
 from docx.enum.text import WD_ALIGN_PARAGRAPH
 from docx.shared import Cm, Pt, RGBColor
 
+from app.services.latex_omml import latex_to_omml_element
+from app.services.latex_normalize import normalize_latex
+
 
 # ---------------------------------------------------------------------------
 # Shared building blocks
@@ -303,6 +306,11 @@ def _render_inline(p, text: str) -> None:
     # caught by _normalise_math_prose's tail, but inline paths can
     # bypass that (e.g. table cells) so we do it here too.
     text = _sanitize_xml(text or "")
+    # Wrap bare / partially-delimited LaTeX math (incl. \ce) in $...$ so the
+    # OMML pass below renders it — covers un-delimited math anywhere,
+    # including table cells. Idempotent; preserves existing $...$ and
+    # figure placeholders. Mirrors the frontend normalizeLatex.
+    text = normalize_latex(text)
     # First substitute figure placeholders → bracketed callouts (still
     # processed inline so they stay in flow with surrounding prose).
     parts: list[tuple[str, str]] = []  # (kind, content) kind in {text, math, fig}
@@ -331,9 +339,17 @@ def _render_inline(p, text: str) -> None:
             r = p.add_run(_normalise_math_prose(payload))
             r.font.size = Pt(10)
         elif kind == "math":
-            r = p.add_run(_normalise_math_prose(payload))
-            r.italic = True
-            r.font.size = Pt(10)
+            # Native Word equation (OMML) — fractions, integrals, roots,
+            # matrices, \ce reactions render properly, matching the preview.
+            omath = latex_to_omml_element(payload)
+            if omath is not None:
+                p._p.append(omath)
+            else:
+                # Fallback: legacy unicode-approximation for the long tail
+                # of LaTeX the converter can't handle (never crash the doc).
+                r = p.add_run(_normalise_math_prose(payload))
+                r.italic = True
+                r.font.size = Pt(10)
         elif kind == "fig":
             # Strip the placeholder silently. The actual figure is rendered
             # separately below the question text via the embedded_figures
@@ -384,6 +400,28 @@ def _split_answer_from_solution(sol: str) -> tuple[str, str]:
 # ---------------------------------------------------------------------------
 # Heading + spacing helpers (with de-dup guard)
 # ---------------------------------------------------------------------------
+
+def _parse_latex_tabular(text: str):
+    """Parse a LaTeX ``\\begin{tabular}{...} ... \\end{tabular}`` block into
+    (headers, rows). Cells split on ``&``, rows on ``\\\\``; rules (\\hline,
+    booktabs) are dropped. First row becomes the header. Returns
+    (None, None) if no tabular is present (caller leaves the block as-is)."""
+    if not text or "\\begin{tabular}" not in text:
+        return None, None
+    m = re.search(
+        r"\\begin\{tabular\}(?:\{[^}]*\})?(.*?)\\end\{tabular\}", text, re.DOTALL
+    )
+    if not m:
+        return None, None
+    body = re.sub(
+        r"\\hline|\\toprule|\\midrule|\\bottomrule|\\cline\{[^}]*\}", "", m.group(1)
+    )
+    raw_rows = [r.strip() for r in re.split(r"\\\\", body) if r.strip()]
+    if not raw_rows:
+        return None, None
+    cells = [[c.strip() for c in r.split("&")] for r in raw_rows]
+    return cells[0], cells[1:]
+
 
 class _DocBuilder:
     """Holds a Document plus a last-heading tracker so de-dup works
@@ -456,14 +494,21 @@ class _DocBuilder:
         _render_inline(p, (text or "").strip())
 
     def equation(self, text: str) -> None:
-        text = _sanitize_xml(text or "")
+        text = _sanitize_xml(text or "").strip()
+        if not text:
+            return
         p = self.doc.add_paragraph()
         p.alignment = WD_ALIGN_PARAGRAPH.CENTER
         p.paragraph_format.space_before = Pt(4)
         p.paragraph_format.space_after = Pt(4)
-        r = p.add_run(text.strip())
-        r.italic = True
-        r.font.size = Pt(10)
+        # Native display equation (OMML) for the whole expression; if the
+        # converter can't handle it, fall back to the inline renderer (which
+        # handles $...$ spans + unicode approximation).
+        omath = latex_to_omml_element(text)
+        if omath is not None:
+            p._p.append(omath)
+        else:
+            _render_inline(p, text)
 
     def labeled(self, label: str, body: str) -> None:
         """A 'Label: body' paragraph with hanging indent so wrapped lines
@@ -548,10 +593,27 @@ class _DocBuilder:
         _render_inline(p, body)
 
     def bullets(self, items: list[str]) -> None:
+        # Double-pointer fix: list items frequently already carry their own
+        # ordinal ("1." / "i." / "(a)"). The "List Bullet" style ALSO adds a
+        # marker → "• 1. text". When the source items carry their own
+        # numbering, render them as plain indented paragraphs (the source
+        # ordinal IS the single marker, numbering preserved); otherwise use
+        # the bullet style. Either way: exactly ONE marker per item.
+        _ord = re.compile(r"^\s*(?:\(?\d+\)?[.)]|\(?[ivxIVXa-eA-E]\)?[.)])\s+")
+        has_ordinals = sum(1 for it in items if _ord.match(str(it))) >= max(
+            1, (len(items) + 1) // 2
+        )
         for item in items:
-            p = self.doc.add_paragraph(style="List Bullet")
-            p.paragraph_format.space_after = Pt(2)
-            _render_inline(p, item)
+            s = str(item).strip()
+            if has_ordinals:
+                p = self.doc.add_paragraph()
+                p.paragraph_format.left_indent = Cm(0.6)
+                p.paragraph_format.space_after = Pt(2)
+                _render_inline(p, s)
+            else:
+                p = self.doc.add_paragraph(style="List Bullet")
+                p.paragraph_format.space_after = Pt(2)
+                _render_inline(p, s)
 
     def table(self, headers: list[str], rows: list[list[str]]) -> None:
         if not headers and not rows:
@@ -569,9 +631,11 @@ class _DocBuilder:
             for i, h in enumerate(headers):
                 cell = tbl.rows[0].cells[i]
                 cell.text = ""
-                run = cell.paragraphs[0].add_run(_normalise_math_prose(h))
-                run.bold = True
-                run.font.size = Pt(10)
+                # Route through _render_inline so equation/chem LaTeX in the
+                # header renders as a native equation; then bold the text runs.
+                _render_inline(cell.paragraphs[0], str(h))
+                for run in cell.paragraphs[0].runs:
+                    run.bold = True
             row_offset = 1
         for ri, row in enumerate(rows):
             for ci, val in enumerate(row):
@@ -579,8 +643,7 @@ class _DocBuilder:
                     continue
                 cell = tbl.rows[ri + row_offset].cells[ci]
                 cell.text = ""
-                run = cell.paragraphs[0].add_run(_normalise_math_prose(str(val)))
-                run.font.size = Pt(10)
+                _render_inline(cell.paragraphs[0], str(val))
 
     def question_gap(self) -> None:
         """Visual breather between two questions in the same group."""
@@ -856,7 +919,16 @@ def _render_theory_block(b: _DocBuilder, block: dict, section_title_key: str,
         items = block.get("items") or []
         b.bullets(items)
     elif t == "table":
-        b.table(block.get("headers") or [], block.get("rows") or [])
+        headers = block.get("headers") or []
+        rows = block.get("rows") or []
+        if not headers and not rows:
+            # Real data stores tables as raw `\begin{tabular}` in `c` (no
+            # structured headers/rows) → parse it so it renders as a Word
+            # table instead of being silently dropped.
+            ph, pr = _parse_latex_tabular(c)
+            if ph is not None:
+                headers, rows = ph, pr
+        b.table(headers, rows)
     elif t == "figure":
         b.figure_callout(block.get("label") or "unlabelled",
                          block.get("caption") or "")

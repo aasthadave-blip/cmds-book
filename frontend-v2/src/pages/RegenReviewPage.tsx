@@ -275,31 +275,36 @@ export default function RegenReviewPage() {
       // earlier schema walk). Match on either:
       //   (a) the excluded title appearing as a bank section_ref, OR
       //   (b) the excluded section_id appearing as a bank section_ref.
+      // Add a sidebar entry for EVERY regenerated/extracted section_ref that
+      // isn't already a Cat A example. This is driven off the actual question
+      // data (regen sections, else original bank sections) — NOT the schema's
+      // bare excluded titles, which never matched: end-of-chapter banks are
+      // stored as "<bank title>::<sub-wing>" (e.g. "CLASSROOM WING::Short
+      // Answer Type Questions"), so a bare-title match dropped every excluded
+      // bank from the sidebar. Driving it off the real refs guarantees all
+      // excluded banks (and their sub-wings) always show.
       const knownIds = new Set(realCatA.map((s) => s.section_id));
-      const bankRefSet = new Set(
-        (banksDetail?.sections ?? []).map((s) => s.section_ref),
-      );
-      const syntheticExcluded: Section[] = excludedQs
-        .filter((eq) => {
-          if (knownIds.has(eq.section_id)) return false;
-          return bankRefSet.has(eq.section_id) || bankRefSet.has(eq.title);
-        })
-        .map((eq) => {
-          // Bank uses title as section_ref if id isn't keyed.
-          const refUsedInBank = bankRefSet.has(eq.section_id)
-            ? eq.section_id
-            : eq.title;
-          return {
-            id: `syn-${refUsedInBank}`,
-            book_id: bookId,
-            section_id: refUsedInBank,
-            title: eq.title,
-            blocks: [],
-            attempts: 0,
-            status: 'passed' as const,
-            level: 2,
-          } as unknown as Section;
-        });
+      const dataSections =
+        (questionRegen?.sections?.length
+          ? questionRegen.sections
+          : banksDetail?.sections) ?? [];
+      const seenRefs = new Set<string>();
+      const syntheticExcluded: Section[] = [];
+      for (const ds of dataSections) {
+        const ref = ds.section_ref;
+        if (!ref || knownIds.has(ref) || seenRefs.has(ref)) continue;
+        seenRefs.add(ref);
+        syntheticExcluded.push({
+          id: `syn-${ref}`,
+          book_id: bookId,
+          section_id: ref,
+          title: ds.section_title || ref,
+          blocks: [],
+          attempts: 0,
+          status: 'passed' as const,
+          level: 2,
+        } as unknown as Section);
+      }
       return [...realCatA, ...syntheticExcluded];
     }
     // figures
@@ -310,7 +315,7 @@ export default function RegenReviewPage() {
         .map((s) => s.section_ref),
     );
     return allSections.filter((s) => slugs.has(s.section_id)).sort(sortBySchema);
-  }, [topTab, allSections, catBIds, catAIds, sortBySchema, figuresData]);
+  }, [topTab, allSections, catBIds, catAIds, sortBySchema, figuresData, questionRegen, banksDetail, bookId]);
 
   // ── Regen blocks by section (for "Regenerated" + "Compare") ──────
   const regenBlocksBySection: Record<string, Array<{ t: string; [k: string]: unknown }>> =

@@ -483,10 +483,11 @@ function renderItem(item: FinalDraftItem): React.ReactElement | null {
           fontSize: 14,
           color: 'var(--ink-900)',
           lineHeight: 1.6,
-          whiteSpace: 'pre-wrap',
         }}
       >
-        {item.content || <em style={{ color: 'var(--ink-400)' }}>(empty custom text)</em>}
+        {item.content
+          ? <MathMarkdown>{item.content}</MathMarkdown>
+          : <em style={{ color: 'var(--ink-400)' }}>(empty custom text)</em>}
       </div>
     );
   }
@@ -496,7 +497,7 @@ function renderItem(item: FinalDraftItem): React.ReactElement | null {
 function BlockRow({ block }: { block: Block }) {
   const t = String(block.t ?? '');
   const c = String((block as { c?: string }).c ?? '');
-  if (t === 'h3') return <h3 style={{ fontSize: 17, fontWeight: 700, marginTop: 18, marginBottom: 8, color: 'var(--ink-900)' }}>{c}</h3>;
+  if (t === 'h3') return <h3 style={{ fontSize: 17, fontWeight: 700, marginTop: 18, marginBottom: 8, color: 'var(--ink-900)' }}><MathMarkdown inline>{c}</MathMarkdown></h3>;
   if (t === 'p') return (
     <div style={{ marginBottom: 12, lineHeight: 1.65, fontSize: 15, color: 'var(--ink-900)' }}>
       <MathMarkdown>{c}</MathMarkdown>
@@ -576,6 +577,57 @@ function BlockRow({ block }: { block: Block }) {
     return <div style={{ marginBottom: 12, padding: '12px 14px', background: 'var(--bg-tint)', borderRadius: 6, fontSize: 12, color: 'var(--ink-500)' }}>
       📷 {c || 'Figure placeholder'}
     </div>;
+  }
+  if (t === 'table') {
+    // Two shapes occur in real data:
+    //   (a) structured: headers[] + rows[][]
+    //   (b) raw LaTeX `\begin{tabular}...` in `c`  ← what extraction actually
+    //       emits today (all observed table blocks)
+    // Both render the same way: structured → real <table>; raw → MathMarkdown,
+    // where normalizeLatex turns \begin{tabular} into a GFM markdown table.
+    // Cells/caption go through MathMarkdown so equation/chem LaTeX renders.
+    // (Previously this block had no case → `return null` → tables vanished.)
+    const headers = ((block as { headers?: string[] }).headers ?? []);
+    const rows = ((block as { rows?: string[][] }).rows ?? []);
+    const caption = String((block as { caption?: string }).caption ?? '');
+    const cap = caption
+      ? <div style={{ fontSize: 12, color: 'var(--ink-500)', fontStyle: 'italic', marginTop: 4 }}><MathMarkdown inline>{caption}</MathMarkdown></div>
+      : null;
+
+    if (headers.length === 0 && rows.length === 0) {
+      // Raw `\begin{tabular}` (or other markup) lives in `c` → let
+      // normalizeLatex + GFM render it as a table.
+      return (
+        <div style={{ marginBottom: 12, overflowX: 'auto' }}>
+          <MathMarkdown>{c}</MathMarkdown>
+          {cap}
+        </div>
+      );
+    }
+    const cell = { border: '1px solid var(--line)', padding: '6px 10px', fontSize: 14, textAlign: 'left' as const, verticalAlign: 'top' as const };
+    return (
+      <div style={{ marginBottom: 12, overflowX: 'auto' }}>
+        <table style={{ borderCollapse: 'collapse', width: '100%' }}>
+          {headers.length > 0 && (
+            <thead>
+              <tr>{headers.map((h, i) => (
+                <th key={i} style={{ ...cell, background: 'var(--surface-2)', fontWeight: 700 }}>
+                  <MathMarkdown inline>{String(h)}</MathMarkdown>
+                </th>
+              ))}</tr>
+            </thead>
+          )}
+          <tbody>
+            {rows.map((row, ri) => (
+              <tr key={ri}>{row.map((c2, ci) => (
+                <td key={ci} style={cell}><MathMarkdown inline>{String(c2)}</MathMarkdown></td>
+              ))}</tr>
+            ))}
+          </tbody>
+        </table>
+        {cap}
+      </div>
+    );
   }
   if (t === 'example_ref' || t === 'exercise_ref' || t === 'question_ref') {
     const label = String((block as { label?: string }).label ?? '');

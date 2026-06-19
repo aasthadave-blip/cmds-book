@@ -28,6 +28,8 @@ import 'katex/dist/katex.min.css';
 // Side-effect import — registers \ce, \pu, \bond commands globally with KaTeX.
 import 'katex/contrib/mhchem';
 
+import { normalizeLatex } from '../lib/latexNormalize';
+
 type Props = {
   children: string;
   inline?: boolean;
@@ -35,8 +37,14 @@ type Props = {
 
 export function MathMarkdown({ children, inline = false }: Props) {
   // Don't crash on undefined/null input — render empty silently.
-  const safe = typeof children === 'string' ? children : '';
-  if (!safe.trim()) return null;
+  const raw = typeof children === 'string' ? children : '';
+  if (!raw.trim()) return null;
+  // Single normalization point: any LaTeX/markup-bearing text — math, chem,
+  // code, LaTeX tables, text-formatting, un-delimited inline math — is made
+  // renderable here, so EVERY caller (theory blocks, defs, lists, key points,
+  // equations, question text/solutions, table cells, headings) renders
+  // identically. See lib/latexNormalize.
+  const safe = normalizeLatex(raw);
 
   // ReactMarkdown wraps everything in <p> by default — for inline use
   // (e.g. inside a span) we strip the wrapping paragraph so it can sit

@@ -676,42 +676,47 @@ def _flatten_sections(
 
         children = node.subsections or []
 
-        # Decide whether to emit THIS node. Skip only if children's page
-        # coverage fully includes the parent's range (no residual theory
-        # pages sit outside the children).
-        emit_self = True
+        # Decide whether to emit THIS node as its own Cat A unit. Suppress it
+        # when its children already OWN its content — either because:
+        #   (a) the children's page ranges fully cover the parent's range, OR
+        #   (b) the parent has Cat A (question) children.
+        # The schema may over-report parent.page_end vs the leaves' actual
+        # coverage (observed Indefinite Integrals book: parent
+        # 4-critical-thinking claims pages 434-435 but its only leaf claims
+        # 434 only → 26 questions on page 435 would attach to the parent
+        # instead of the leaf), so the Cat-A-children check (b) suppresses the
+        # parent even when (a) leaves residual pages. Either way the children
+        # are the real extraction units; the parent is just a container.
+        #
+        # ONE exception — a chapter WRAPPER carrying its own loose §10.4
+        # questions directly under the chapter heading. Those have no
+        # enclosing subsection, so the children NEVER cover them, and the
+        # wrapper's expQ counts ONLY those loose questions (it does not roll
+        # up children) — so it must still be emitted. Previously this was two
+        # separate suppressors: a page-coverage check with NO wrapper
+        # exemption (which ran first) + this Cat-A-children check WITH one —
+        # so a wrapper sharing its page with a Cat A child (e.g. a one-page
+        # book) was wrongly suppressed and its loose questions silently
+        # dropped. Unified here so the exemption applies to BOTH conditions.
+        # (If real prelude theory exists before the first child's heading,
+        # the theory pipeline still extracts it via the next_title hard-stop,
+        # extract.py:411-416.)
+        is_chapter_wrapper = (node.type or "").lower() == "chapter"
+        has_cat_a_children = any(
+            "questions" in (c.content_types or [])
+            for c in children
+        )
+        pages_fully_covered = False
         if children and node.page_start is not None and node.page_end is not None:
             covered: set[int] = set()
             for c in children:
                 if c.page_start is not None and c.page_end is not None:
                     covered.update(range(c.page_start, c.page_end + 1))
             parent_pages = set(range(node.page_start, node.page_end + 1))
-            residual = parent_pages - covered
-            if not residual:
-                emit_self = False
+            pages_fully_covered = not (parent_pages - covered)
 
-        # P-1 HARD STOP: if the parent has ANY Cat A (questions) children,
-        # NEVER emit the parent itself as a Cat A unit — even when the
-        # page-coverage check above leaves residual pages. The schema may
-        # over-report parent.page_end vs the leaves' actual coverage
-        # (observed Indefinite Integrals book: parent 4-critical-thinking
-        # claims pages 434-435 but its only leaf claims 434 only → 26
-        # questions on page 435 attached to the parent instead of the
-        # leaf). Children own the question pool; the parent is purely a
-        # container for grouping. If real prelude theory exists before
-        # the first child's heading, the theory pipeline still extracts
-        # it via the existing next_title hard-stop (extract.py:411-416).
-        # P-1 HARD STOP applies to numbered Cat B containers, NOT to the
-        # chapter wrapper. The wrapper's expQ counts only loose questions
-        # directly under the chapter heading (§10.4) — it does NOT roll
-        # up children — so emitting the wrapper alongside its Cat A
-        # children does not double-extract.
-        is_chapter_wrapper = (node.type or "").lower() == "chapter"
-        has_cat_a_children = any(
-            "questions" in (c.content_types or [])
-            for c in children
-        )
-        if has_cat_a_children and not is_chapter_wrapper:
+        emit_self = True
+        if (has_cat_a_children or pages_fully_covered) and not is_chapter_wrapper:
             emit_self = False
 
         if emit_self:

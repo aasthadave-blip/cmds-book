@@ -39,6 +39,8 @@ dependencies = [
     # control over fonts, spacing, and the no-duplicate-headings rule.
     "python-docx>=1.0.0",
     "pypandoc-binary>=1.13",
+    "latex2mathml>=3.81.0",
+    "mathml2omml>=0.0.2",
 ]
 
 [project.optional-dependencies]
