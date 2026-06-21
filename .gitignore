@@ -42,6 +42,9 @@ miniodata/
 *.db-journal
 *.db-wal
 *.db-shm
+# DB backup snapshots (e.g. cmds.db.bak_qlatex) — large, never commit
+*.bak_*
+cmds.db.bak*
 
 # Local storage (uploaded PDFs, artifacts)
 backend/storage/
