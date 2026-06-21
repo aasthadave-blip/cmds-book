@@ -13,12 +13,15 @@ from __future__ import annotations
 
 import re
 
-_MATH_CHARSET = re.compile(r"^[\\A-Za-z0-9^_{}()+\-=*/.,|<>\[\]'’]+$")
-_SIGNAL = re.compile(r"[\\^_=+\-*/0-9{}]")
+# Charset/signal include Greek (Ͱ-Ͽ) + math-unicode (× ÷ ± ≤ ≥ → ⇌ ∑ ∫ …)
+# so well-formed expressions with those symbols are detected as math.
+_MATH_CHARSET = re.compile(r"^[\\A-Za-z0-9^_{}()+\-=*/.,|<>\[\]'’°±·×÷Ͱ-Ͽ⁰-₟←-⇿∀-⋿]+$")
+_SIGNAL = re.compile(r"[\\^_=+\-*/0-9{}±×÷←-⇿∀-⋿]")
 _SHORT_ALPHA = re.compile(r"^[A-Za-z]{2,3}[.,;:]?$")
 _OPER_END = re.compile(r"[+\-*/=^_]$")
 _FRAG_MATH = re.compile(
-    r"[\^_]|\\[a-zA-Z]+|[A-Za-z0-9]\s*[+\-*/=]\s*[A-Za-z0-9\\]|\\(?:frac|sqrt|sum|int)"
+    r"[\^_]|\\[a-zA-Z]+|[A-Za-z0-9Ͱ-Ͽ]\s*[+\-*/=]\s*[A-Za-z0-9\\Ͱ-Ͽ]"
+    r"|\\(?:frac|sqrt|sum|int)|[±×÷←-⇿∀-⋿]"
 )
 # existing delimited / chem segments to preserve verbatim
 _SEG = re.compile(r"\$\$[\s\S]*?\$\$|\$[^$]*\$|\\ce\{(?:[^{}]|\{[^{}]*\})*\}")
@@ -30,7 +33,7 @@ def _is_math_token(tok: str) -> bool:
     # 3+ consecutive letters (ignoring \commands) = a word → never math.
     if re.search(r"[A-Za-z]{3,}", re.sub(r"\\[a-zA-Z]+", "", tok)):
         return False
-    if re.fullmatch(r"[A-Za-z0-9]", tok):
+    if re.fullmatch(r"[A-Za-z0-9Ͱ-Ͽ]", tok):  # single var / digit / Greek
         return True
     return bool(_MATH_CHARSET.match(tok)) and bool(_SIGNAL.search(tok))
 

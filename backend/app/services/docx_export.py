@@ -298,6 +298,48 @@ def _set_default_font(doc: Document) -> None:
     style.font.size = Pt(10)
 
 
+# Inline markdown: **bold**, __bold__, \textbf{}, *italic*, \textit/\emph{},
+# `code`. Math ($...$) is handled separately by _render_inline before this.
+_MD_INLINE = re.compile(
+    r"\*\*(?P<b>.+?)\*\*"
+    r"|__(?P<b2>.+?)__"
+    r"|\\textbf\{(?P<b3>[^}]*)\}"
+    r"|(?<![\w*])\*(?P<i>[^*\s][^*]*?)\*(?![\w*])"
+    r"|\\(?:textit|emph)\{(?P<i2>[^}]*)\}"
+    r"|`(?P<code>[^`]+)`"
+)
+
+
+def _emit_text_runs(p, text: str, *, bold_all: bool = False) -> None:
+    """Emit runs for a plain-text segment, rendering inline markdown
+    (**bold**, *italic*, `code`, \\textbf/\\textit) as real Word formatting
+    instead of leaking the literal markers (** , `, \\textbf{}) into the doc.
+    ``bold_all`` forces every run bold (used for leaked heading lines)."""
+    pos = 0
+    for m in _MD_INLINE.finditer(text):
+        if m.start() > pos:
+            r = p.add_run(_normalise_math_prose(text[pos:m.start()]))
+            r.font.size = Pt(10); r.bold = r.bold or bold_all
+        bold = m.group("b") or m.group("b2") or m.group("b3")
+        ital = m.group("i") or m.group("i2")
+        code = m.group("code")
+        if bold is not None:
+            r = p.add_run(_normalise_math_prose(bold)); r.bold = True
+        elif ital is not None:
+            r = p.add_run(_normalise_math_prose(ital)); r.italic = True
+            if bold_all:
+                r.bold = True
+        else:
+            r = p.add_run(code); r.font.name = "Consolas"
+            if bold_all:
+                r.bold = True
+        r.font.size = Pt(10)
+        pos = m.end()
+    if pos < len(text):
+        r = p.add_run(_normalise_math_prose(text[pos:]))
+        r.font.size = Pt(10); r.bold = r.bold or bold_all
+
+
 def _render_inline(p, text: str) -> None:
     """Add inline runs to paragraph p. Math chunks render italic;
     figure placeholders render as muted bracketed callouts."""
@@ -311,6 +353,20 @@ def _render_inline(p, text: str) -> None:
     # including table cells. Idempotent; preserves existing $...$ and
     # figure placeholders. Mirrors the frontend normalizeLatex.
     text = normalize_latex(text)
+    # A markdown heading marker (#, ##, ###) leaking into an inline context
+    # (e.g. "## Solution" inside a solution body that paragraph() didn't
+    # split) — strip the markers and bold the line so no literal #'s reach
+    # the doc. Block-level headings are handled earlier in paragraph().
+    _force_bold = False
+    _hm = re.match(r"^\s*#{1,6}\s+(.*\S)\s*$", text)
+    if _hm:
+        text = _hm.group(1)
+        _force_bold = True
+    elif re.search(r"(?m)^[ \t]*#{1,6}[ \t]+", text):
+        # Multi-line body with a leaked heading marker (e.g. "## Solution\n…")
+        # that paragraph()/labeled() didn't split — strip the leading #'s per
+        # line so no literal hashes reach the doc (context supplies the heading).
+        text = re.sub(r"(?m)^[ \t]*#{1,6}[ \t]+", "", text)
     # First substitute figure placeholders → bracketed callouts (still
     # processed inline so they stay in flow with surrounding prose).
     parts: list[tuple[str, str]] = []  # (kind, content) kind in {text, math, fig}
@@ -336,8 +392,7 @@ def _render_inline(p, text: str) -> None:
 
     for kind, payload in parts:
         if kind == "text":
-            r = p.add_run(_normalise_math_prose(payload))
-            r.font.size = Pt(10)
+            _emit_text_runs(p, payload, bold_all=_force_bold)
         elif kind == "math":
             # Native Word equation (OMML) — fractions, integrals, roots,
             # matrices, \ce reactions render properly, matching the preview.
@@ -487,11 +542,30 @@ class _DocBuilder:
 
     def paragraph(self, text: str, *, space_after_pt: int = 3,
                   left_indent_cm: float = 0.0) -> None:
+        text = (text or "").strip()
+        # Markdown content may carry heading lines (#, ##, ###) and blank-line
+        # paragraph breaks. Split on newlines: a `#{1,6} ` line becomes a
+        # sub-heading; everything else is a paragraph with inline markdown.
+        if "\n" in text or re.match(r"^#{1,6}\s", text):
+            for raw in re.split(r"\n+", text):
+                line = raw.strip()
+                if not line:
+                    continue
+                hm = re.match(r"^#{1,6}\s+(.+)$", line)
+                if hm:
+                    self.sub_heading(hm.group(1).strip())
+                else:
+                    p = self.doc.add_paragraph()
+                    p.paragraph_format.space_after = Pt(space_after_pt)
+                    if left_indent_cm:
+                        p.paragraph_format.left_indent = Cm(left_indent_cm)
+                    _render_inline(p, line)
+            return
         p = self.doc.add_paragraph()
         p.paragraph_format.space_after = Pt(space_after_pt)
         if left_indent_cm:
             p.paragraph_format.left_indent = Cm(left_indent_cm)
-        _render_inline(p, (text or "").strip())
+        _render_inline(p, text)
 
     def equation(self, text: str) -> None:
         text = _sanitize_xml(text or "").strip()
@@ -1054,9 +1128,9 @@ def _render_custom_text(b: _DocBuilder, content: str) -> None:
         chunk = chunk.strip()
         if not chunk:
             continue
-        p = b.doc.add_paragraph()
-        p.paragraph_format.space_after = Pt(6)
-        _render_inline(p, chunk)
+        # Route through paragraph() so markdown headings (#, ##, ###) and
+        # inline bold/italic/code render as real Word formatting.
+        b.paragraph(chunk, space_after_pt=6)
 
 
 def build_final_draft_docx(

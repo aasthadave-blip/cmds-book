@@ -115,17 +115,19 @@ function isMathToken(tok: string): boolean {
   // when a math signal is present (handled below), so "mv^2" is math but
   // "by"/"of" are not.
   if (/[A-Za-z]{3,}/.test(tok.replace(/\\[a-zA-Z]+/g, ''))) return false;
-  if (/^[A-Za-z0-9]$/.test(tok)) return true; // single var / digit
-  // math charset only: letters, digits, operators, braces, backslash
-  return /^[\\A-Za-z0-9^_{}()+\-=*/.,|<>[\]'’]+$/.test(tok) &&
-    /[\\^_=+\-*/0-9{}]/.test(tok); // must carry a signal
+  // single variable / digit / Greek letter (α, β, θ, ω …)
+  if (/^[A-Za-z0-9Ͱ-Ͽ]$/.test(tok)) return true;
+  // math charset: letters, digits, Greek, math-unicode (× ÷ ± ≤ ≥ → ⇌ ∑ ∫),
+  // operators, braces, backslash.
+  return /^[\\A-Za-z0-9^_{}()+\-=*/.,|<>[\]'’°±·×÷Ͱ-Ͽ⁰-₟←-⇿∀-⋿]+$/.test(tok) &&
+    /[\\^_=+\-*/0-9{}±×÷←-⇿∀-⋿]/.test(tok); // signal
 }
 
 // A fragment qualifies for wrapping only if it carries a STRONG math signal
 // (sub/superscript, a LaTeX command, or an operator between operands) — a lone
 // variable or number is left as prose.
 function fragmentIsMath(frag: string): boolean {
-  return /[\^_]|\\[a-zA-Z]+|[A-Za-z0-9]\s*[+\-*/=]\s*[A-Za-z0-9\\]|\\(?:frac|sqrt|sum|int)/.test(frag);
+  return /[\^_]|\\[a-zA-Z]+|[A-Za-z0-9Ͱ-Ͽ]\s*[+\-*/=]\s*[A-Za-z0-9\\Ͱ-Ͽ]|\\(?:frac|sqrt|sum|int)|[±×÷←-⇿∀-⋿]/.test(frag);
 }
 
 // Last non-whitespace token currently buffered ends with a math operator?
