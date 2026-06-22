@@ -28,5 +28,10 @@ CELERY_PID=$!
 # Forward shutdown signals to celery so it drains in-flight tasks.
 trap 'echo "[start.sh] SIGTERM → stopping celery (pid=$CELERY_PID)"; kill -TERM "$CELERY_PID" 2>/dev/null; wait "$CELERY_PID"' TERM INT
 
-echo "[start.sh] launching uvicorn on port ${PORT:-8000}"
-exec uvicorn app.main:app --host 0.0.0.0 --port "${PORT:-8000}"
+echo "[start.sh] launching uvicorn on port ${PORT:-8000} (workers=${UVICORN_WORKERS:-2})"
+# --workers 2 (override via UVICORN_WORKERS env var): 2x API concurrency so
+# 5-10 active users don't serialize through a single worker. Conservative
+# pick — the watchdog + orphan-recovery startup hooks aren't multi-worker-
+# safe (no DB advisory lock), so 4+ workers risks duplicate orphan
+# re-dispatch. Bump higher only after that's refactored.
+exec uvicorn app.main:app --host 0.0.0.0 --port "${PORT:-8000}" --workers "${UVICORN_WORKERS:-2}"
