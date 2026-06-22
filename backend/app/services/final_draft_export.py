@@ -165,9 +165,14 @@ def _normalise_latex(text: str) -> str:
     """
     if not text:
         return text
-    # Pass 1 — literal backslash-command form
+    # Pass 1 — literal backslash-command form.
+    # The trailing group consumes an OPTIONAL EMPTY-BRACE PAIR `{}` (e.g.
+    # `\theta{}` → θ) but MUST NOT swallow a lone `}` — otherwise a symbol
+    # command sitting just before an enclosing brace, like the \theta in
+    # `\frac{180-2\theta}{2}`, would eat \frac's closing brace and corrupt the
+    # whole fraction (\frac{180-2θ{2} → OMML fails → lossy raw fallback).
     for cmd, unicode_char in _TEX_TO_UNICODE:
-        pattern = re.escape(cmd) + r"(?![A-Za-z])\s?\{?\}?"
+        pattern = re.escape(cmd) + r"(?![A-Za-z])\s?(?:\{\})?"
         text = re.sub(pattern, unicode_char, text)
     # Pass 2 — JSON-escape collision recovery. Each tuple is
     # (control_char + tail, replacement). Control chars come from:

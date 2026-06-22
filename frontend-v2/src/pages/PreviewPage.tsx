@@ -372,6 +372,9 @@ function renderItem(item: FinalDraftItem): React.ReactElement | null {
       description?: string;
       variant?: string;
       image_url: string;
+      // Which body this figure belongs to: stem ("question") vs "solution".
+      // null = legacy/unknown → treated as question-side.
+      body_target?: 'question' | 'solution' | null;
     }> }).embedded_figures ?? [];
     // Step 2 — a regenerated vector diagram REPLACES the original figure here
     // (mirrors the Word export). Falls back to the original when absent/fallback.
@@ -380,6 +383,48 @@ function renderItem(item: FinalDraftItem): React.ReactElement | null {
     const showDiagram = !!(
       diagram && !diagram.fallback_to_original && diagram.svg_preview
     );
+    // Split embedded figures by body_target so each renders in the right
+    // body: question-stem figures under the question text, solution figures
+    // inside the Solution block. null/legacy → question-side. Mirrors the
+    // extraction/regen review view (QuestionsView).
+    const figsQ = embedded.filter((ef) => (ef.body_target ?? 'question') !== 'solution');
+    const figsS = embedded.filter((ef) => ef.body_target === 'solution');
+    const renderFig = (ef: (typeof embedded)[number]) => {
+      const src = ef.image_url.startsWith('http')
+        ? ef.image_url
+        : `${API_BASE}${ef.image_url}`;
+      return (
+        <figure key={ef.ref_id ?? ef.figure_id} style={{ margin: 0, textAlign: 'center' }}>
+          <img
+            src={src}
+            alt={ef.caption || ef.label || 'Figure'}
+            style={{
+              maxWidth: '100%',
+              maxHeight: 320,
+              borderRadius: 6,
+              border: '1px solid var(--line-2)',
+              background: 'var(--surface-2)',
+            }}
+            onError={(e) => { (e.target as HTMLImageElement).style.display = 'none'; }}
+          />
+          <figcaption
+            style={{ fontSize: 12, color: 'var(--ink-500)', marginTop: 4, fontStyle: 'italic' }}
+          >
+            {ef.label || ef.caption ? (
+              <>
+                {ef.label && <strong>{ef.label}</strong>}
+                {ef.label && ef.caption && ' — '}
+                {ef.caption}
+              </>
+            ) : ef.description ? (
+              <>📷 {ef.description}</>
+            ) : (
+              <>📷 Figure</>
+            )}
+          </figcaption>
+        </figure>
+      );
+    };
     return (
       <div
         key={item.id}
@@ -407,54 +452,10 @@ function renderItem(item: FinalDraftItem): React.ReactElement | null {
         </div>
         {/* Regenerated diagram replaces the original figure when present */}
         {showDiagram && <DiagramPreview diagram={diagram} />}
-        {/* Embedded figures inline at the bottom of the question text */}
-        {!showDiagram && embedded.length > 0 && (
+        {/* Question-body figures render under the question text. */}
+        {!showDiagram && figsQ.length > 0 && (
           <div style={{ marginTop: 10, display: 'flex', flexDirection: 'column', gap: 10 }}>
-            {embedded.map((ef) => {
-              const src = ef.image_url.startsWith('http')
-                ? ef.image_url
-                : `${API_BASE}${ef.image_url}`;
-              return (
-                <figure key={ef.ref_id ?? ef.figure_id} style={{ margin: 0, textAlign: 'center' }}>
-                  <img
-                    src={src}
-                    alt={ef.caption || ef.label || 'Figure'}
-                    style={{
-                      maxWidth: '100%',
-                      maxHeight: 320,
-                      borderRadius: 6,
-                      border: '1px solid var(--line-2)',
-                      background: 'var(--surface-2)',
-                    }}
-                    onError={(e) => { (e.target as HTMLImageElement).style.display = 'none'; }}
-                  />
-                  {/* Same fallback chain as the standalone figure item:
-                      label/caption → description → generic "Figure". The
-                      figcaption now ALWAYS renders so the reader gets
-                      context even when Gemini failed to extract metadata. */}
-                  <figcaption
-                    style={{
-                      fontSize: 12,
-                      color: 'var(--ink-500)',
-                      marginTop: 4,
-                      fontStyle: 'italic',
-                    }}
-                  >
-                    {ef.label || ef.caption ? (
-                      <>
-                        {ef.label && <strong>{ef.label}</strong>}
-                        {ef.label && ef.caption && ' — '}
-                        {ef.caption}
-                      </>
-                    ) : ef.description ? (
-                      <>📷 {ef.description}</>
-                    ) : (
-                      <>📷 Figure</>
-                    )}
-                  </figcaption>
-                </figure>
-              );
-            })}
+            {figsQ.map(renderFig)}
           </div>
         )}
         {q.solution_text && (
@@ -475,6 +476,12 @@ function renderItem(item: FinalDraftItem): React.ReactElement | null {
                   + tables (the "| X | 0 | 1 |" raw pipes bug) all
                   display consistently. */}
               <MathMarkdown>{q.solution_text}</MathMarkdown>
+              {/* Solution-body figures render inside the Solution block. */}
+              {!showDiagram && figsS.length > 0 && (
+                <div style={{ marginTop: 10, display: 'flex', flexDirection: 'column', gap: 10 }}>
+                  {figsS.map(renderFig)}
+                </div>
+              )}
             </div>
           </details>
         )}

@@ -25,7 +25,7 @@ in one request for instant-feedback drag/edit sessions.
 from __future__ import annotations
 
 import logging
-from datetime import datetime
+from datetime import datetime, timezone
 from typing import Any
 from uuid import UUID
 
@@ -72,6 +72,28 @@ def _draft_to_dict(draft: FinalDraft) -> dict[str, Any]:
     }
 
 
+def _source_newer_than_seed(book: Book, draft: FinalDraft) -> bool:
+    """True if the book's content changed since the draft was last seeded.
+
+    Signal = ``book.updated_at`` (bumped on every stage transition, so a new
+    extraction, regen, or figure re-embed moves it forward) vs the draft's
+    ``last_seeded_at``. A draft that was never seeded (None) is treated as
+    stale. Timestamps are normalised to aware-UTC before comparison so a
+    naive/aware mismatch can never raise in the GET path.
+    """
+    seeded = draft.last_seeded_at
+    if seeded is None:
+        return True
+    upd = getattr(book, "updated_at", None)
+    if upd is None:
+        return False
+    if seeded.tzinfo is None:
+        seeded = seeded.replace(tzinfo=timezone.utc)
+    if upd.tzinfo is None:
+        upd = upd.replace(tzinfo=timezone.utc)
+    return upd > seeded
+
+
 async def _load_or_seed(
     session: AsyncSession,
     book_id: UUID,
@@ -114,13 +136,20 @@ async def _load_or_seed(
     # any failure we serve whatever items were last persisted. Mirrors
     # the auto-heal failure handling in build_final_merge.
     if existing is not None:
-        # Preserve manual edits: once the user has edited the draft
-        # (is_dirty), DO NOT auto-reseed — otherwise their delete/reorder/
-        # edit would be overwritten by fresh final-merge and never reflect in
-        # Preview. A clean (un-edited) draft still auto-reseeds so new regen /
-        # figures / schema edits surface automatically. Explicit reseed /
-        # merge-regen clears is_dirty.
-        if auto_reseed and not existing.is_dirty:
+        # SOURCE-AWARE reseed — resolves the freshness-vs-edits tension:
+        #   • A CLEAN draft (no manual edits) always reseeds, so new
+        #     regen / figures / schema edits surface automatically.
+        #   • A DIRTY draft (user edited) is normally preserved so their
+        #     reorder/delete/edit isn't overwritten.
+        #   • EXCEPTION: if the underlying book data changed since we last
+        #     seeded (a new extraction / regen / figure re-embed bumps
+        #     book.updated_at past last_seeded_at), the stale edits are
+        #     superseded by the new content — so we reseed anyway and clear
+        #     the dirty flag. This guarantees the Composer/Preview ALWAYS
+        #     reflect the latest correct merge after extraction or regen,
+        #     which is the whole point of "perfect as a book".
+        source_changed = _source_newer_than_seed(book, existing)
+        if auto_reseed and (not existing.is_dirty or source_changed):
             try:
                 fresh_items = await seed_draft_items_from_merge(
                     session, book_id, prefer_regen=prefer_regen
@@ -128,6 +157,9 @@ async def _load_or_seed(
                 existing.items = fresh_items
                 existing.last_seeded_at = datetime.utcnow()
                 existing.prefer_regen = prefer_regen
+                if source_changed:
+                    # New source data supersedes stale edits; resume freshness.
+                    existing.is_dirty = False
                 await session.commit()
                 await session.refresh(existing)
             except Exception as e:

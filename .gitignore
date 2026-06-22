@@ -15,8 +15,9 @@ dist/
 .vite/
 *.log
 
-# Env
+# Env (any .env variant — local-prod, .env.foo, etc. — keep secrets out)
 .env
+.env.*
 .env.local
 .env.*.local
 

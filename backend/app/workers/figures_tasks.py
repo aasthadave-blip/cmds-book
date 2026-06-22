@@ -246,7 +246,14 @@ def _extract_figures_v2_impl(book_id: str, job_id: str) -> dict[str, Any]:
             message="Calling Gemini for figure detection",
         )
     try:
-        metadata, images = fig_extractor.extract(pdf_bytes)
+        # Heartbeat thread (beats every 10s) so the figures job is a true
+        # liveness signal — without it, figures was the ONE stage the
+        # watchdog/driver couldn't distinguish "dead worker" from "busy
+        # worker" (single long Gemini call, no per-step heartbeat). Now all
+        # four stages beat uniformly, enabling fast dead-worker detection.
+        from app.core.heartbeat import Heartbeat
+        with Heartbeat(job_uuid, "Calling Gemini for figure detection", 15):
+            metadata, images = fig_extractor.extract(pdf_bytes)
     except Exception as e:
         logger.exception("extract_figures_v2: Gemini extract failed")
         with _sync_session()() as session:

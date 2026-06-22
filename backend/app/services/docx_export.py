@@ -1231,18 +1231,30 @@ def build_final_draft_docx(
             # them past the solution text — wrong position relative to
             # the source PDF.
             _render_question_head(b, q)
-            # Step 2 — if a regenerated diagram is present (and not a fallback),
-            # embed it IN PLACE OF the original figures. Otherwise fall back to
-            # the original embedded_figures (current behavior).
-            if not _maybe_embed_regen_diagram(b, q):
-                for f in q.get("embedded_figures") or []:
+            # A regenerated diagram REPLACES the original figures (→ empty list
+            # so nothing else emits). Otherwise split the embedded figures by
+            # body_target: question-stem figures render UNDER THE STEM (before
+            # the solution), solution figures render AFTER THE SOLUTION — so each
+            # figure lands in the body it belongs to. NULL body_target defaults
+            # to the question side. Matches the review view + Preview/Composer.
+            _efs = [] if _maybe_embed_regen_diagram(b, q) else (
+                q.get("embedded_figures") or []
+            )
+            _q_figs = [f for f in _efs if (f.get("body_target") or "question") != "solution"]
+            _s_figs = [f for f in _efs if f.get("body_target") == "solution"]
+
+            def _emit_qfigs(_figs: list) -> None:
+                for f in _figs:
                     fid = str(f.get("figure_id") or "")
                     data = figure_bytes_map.get(fid)
                     if data:
                         b.image(data, label=f.get("label") or "", caption=f.get("caption") or "")
                     else:
                         b.figure_callout(f.get("label") or "image", f.get("caption") or "")
-            _render_question_tail(b, q)
+
+            _emit_qfigs(_q_figs)           # question-body figures under the stem
+            _render_question_tail(b, q)    # solution text
+            _emit_qfigs(_s_figs)           # solution-body figures after the solution
             continue
         if t == "custom_text":
             _render_custom_text(b, it.get("content") or "")

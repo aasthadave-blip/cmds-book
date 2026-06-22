@@ -591,6 +591,11 @@ def _figure_dict(
         "placement_kind": ref.placement_kind or "appended",
         "placement_block_idx": ref.placement_block_idx,
         "placement_char_offset": ref.placement_char_offset,
+        # Which part of a question this figure belongs to: "question" (stem)
+        # vs "solution". Lets Preview/Composer/DOCX render it in the correct
+        # body — matching the extraction/regen review view. NULL = legacy /
+        # unknown → renderers default it to the question side.
+        "body_target": ref.body_target,
     }
 
 
@@ -802,6 +807,11 @@ async def build_final_merge(
         if r.is_hidden:
             continue
         if r.placement_kind == "unattached":
+            # Keep the section_ref + label on the dict so the draft seeder can
+            # bind this figure to its matching `fig` placeholder block BY LABEL
+            # (the same way the extraction/regen review view places it inline in
+            # the right section). Anything the seeder can't label-bind stays in
+            # the global "Unattached Figures" tray.
             d2 = {**d, "context": r.context, "section_ref": r.section_ref,
                   "page_number": f.page_number}
             unattached_figs.append(d2)

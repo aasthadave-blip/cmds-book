@@ -28,8 +28,13 @@ from app.models.job import Job
 
 logger = logging.getLogger(__name__)
 
-# How often to check for stale jobs.
-CHECK_INTERVAL_S = 60
+# How often the watchdog ticks. This is now also the cadence of the
+# state-driven driver (_drive_active_books), so it doubles as the maximum
+# delay before a book with a lost dispatch message gets re-driven. 20s is
+# responsive enough that a dropped hand-off is invisible to users, while
+# the per-tick work (a handful of indexed queries + idempotent coordinator
+# calls over only the active books) stays negligible.
+CHECK_INTERVAL_S = 20
 # A running job is stale if its heartbeat (or started_at, when heartbeat is
 # NULL — e.g. a job started before this column existed) is older than this.
 #
@@ -99,8 +104,129 @@ MAX_RECOVERY_ATTEMPTS = 5
 _INFLIGHT_STATUSES = ("analysing", "extracting", "processing", "schema_ready")
 
 
+# Fast dead-worker detection (fix #3 completion). Every stage worker runs a
+# background heartbeat thread that beats every 10s (theory/questions/figures)
+# or 30s (schema), independent of what Gemini is doing. So a stage that is
+# `running` whose job heartbeat has gone stale beyond this threshold means the
+# WORKER PROCESS IS DEAD (crash / OOM / SIGKILL), not merely busy. The driver
+# fails such a stage immediately so the coordinator re-drives it on the same
+# tick — crash recovery in ~2 min instead of waiting for the 15-min stale-job
+# killer. 120s = comfortably above the 30s max beat interval × slack, so a
+# live-but-slow worker is never false-killed.
+WORKER_DEAD_AFTER_S = 120
+
+# Map each book stage-status column to the Job.type that backs it (set by
+# orchestrator._new_job). Used to find the heartbeat for a running stage.
+_STAGE_JOB_TYPE = {
+    "schema_status": "analyse",
+    "theory_status": "extract",
+    "questions_status": "extract_questions",
+    "figures_status": "extract_figures",
+}
+
+# Per-stage retry counter used to BOUND crash re-drives (so a poison input
+# that crashes the worker every time can't loop forever burning Gemini).
+_STAGE_RETRY_ATTR = {
+    "schema": "schema_retries",
+    "theory": "theory_retries",
+    "questions": "questions_retries",
+    "figures": "figures_retries",
+}
+
+# How many times we'll re-drive a stage after a worker crash before giving up
+# and marking it failed. Generous (crashes are infrastructure, not bad input)
+# but bounded. Distinct from MAX_AUTO_RETRIES (content-failure retries): a
+# crash means the stage NEVER COMPLETED, so we re-run it fresh (→ pending)
+# rather than consuming the content-retry budget (→ failed).
+MAX_CRASH_REDRIVES = 5
+
+
 _engine = create_engine(settings.SYNC_DATABASE_URL, pool_pre_ping=True)
 _WatchdogSession = sessionmaker(bind=_engine, class_=Session, autoflush=False)
+
+
+def _fail_dead_worker_stages(session, book_id) -> int:
+    """Fail any stage whose backing worker is dead (stale heartbeat).
+
+    A stage is considered dead-worker ONLY when its job has beaten at least
+    once (``last_heartbeat_at`` is not NULL) and then gone stale beyond
+    WORKER_DEAD_AFTER_S. The "beaten at least once" guard is critical: it
+    avoids false-killing a job that hasn't started its heartbeat yet (e.g.
+    a figures job blocked on its in-flight semaphore, or any job in the brief
+    window between dispatch and entering its Heartbeat context). Those rare
+    pre-first-beat deaths are left to the slower 900s stale-job killer.
+
+    On detection: CAS the stage running→failed and fail the orphan Job row.
+    The coordinator (called right after, by the driver) then sees `failed`
+    and retries it (subject to MAX_AUTO_RETRIES).
+
+    Returns the number of stages failed.
+    """
+    from app.models.book import Book
+    from app.workers.orchestrator import cas_set_stage
+
+    book = session.get(Book, book_id)
+    if book is None:
+        return 0
+
+    dead_cutoff = datetime.now(timezone.utc) - timedelta(seconds=WORKER_DEAD_AFTER_S)
+    failed = 0
+    for stage_attr, job_type in _STAGE_JOB_TYPE.items():
+        if getattr(book, stage_attr) != "running":
+            continue
+        job = session.execute(
+            select(Job)
+            .where(Job.book_id == book_id, Job.type == job_type)
+            .order_by(Job.created_at.desc())
+        ).scalars().first()
+        # Only act on a job that beat at least once then went stale. NULL
+        # heartbeat → hasn't started beating yet → not our case (900s killer).
+        if job is None or job.last_heartbeat_at is None:
+            continue
+        hb = job.last_heartbeat_at
+        if hb.tzinfo is None:
+            hb = hb.replace(tzinfo=timezone.utc)
+        if hb >= dead_cutoff:
+            continue  # heartbeat fresh → worker alive
+        # Worker is dead. The stage NEVER COMPLETED (the worker died mid-run),
+        # so the correct recovery is to RE-RUN IT FRESH → revert to `pending`,
+        # NOT `failed`. `pending` routes the coordinator to dispatch_* (a clean
+        # re-dispatch) instead of retry_* — so a crash does not consume the
+        # content-failure retry budget (MAX_AUTO_RETRIES) and can't strand the
+        # book. Crash-loops are bounded separately by MAX_CRASH_REDRIVES.
+        stage = stage_attr.replace("_status", "")
+        retry_attr = _STAGE_RETRY_ATTR[stage]
+        attempts = getattr(book, retry_attr, 0) or 0
+        if attempts >= MAX_CRASH_REDRIVES:
+            target, give_up = "failed", True
+        else:
+            setattr(book, retry_attr, attempts + 1)
+            session.commit()  # persist the bump before the CAS
+            target, give_up = "pending", False
+        if cas_set_stage(session, book_id, stage, target, from_states=("running",)):
+            if job.status == "running":
+                job.status = "failed"
+                job.finished_at = datetime.now(timezone.utc)
+                job.error = (
+                    f"Watchdog: worker dead — no heartbeat for "
+                    f">{WORKER_DEAD_AFTER_S}s."
+                )
+                session.commit()
+            failed += 1
+            age = int((datetime.now(timezone.utc) - hb).total_seconds())
+            if give_up:
+                logger.error(
+                    "driver: dead-worker stage book=%s stage=%s exceeded "
+                    "%d crash re-drives — marking FAILED (likely poison input)",
+                    book_id, stage, MAX_CRASH_REDRIVES,
+                )
+            else:
+                logger.warning(
+                    "driver: dead-worker stage book=%s stage=%s "
+                    "(heartbeat %ss stale) → pending, re-run %d/%d",
+                    book_id, stage, age, attempts + 1, MAX_CRASH_REDRIVES,
+                )
+    return failed
 
 
 def _scan_once() -> int:
@@ -421,14 +547,99 @@ def _reconcile_stalled_books(session) -> int:
     return acted
 
 
+def _drive_active_books() -> int:
+    """PRIMARY state-driven engine — step every active book forward.
+
+    This is fix #3 (the Kubernetes-controller pattern): instead of relying
+    on a worker-delivered ``coordinate_extraction`` message to advance each
+    book (message-driven → a lost message strands the book forever), we
+    continuously re-read DB state and drive every non-terminal book through
+    the coordinator on a fast tick.
+
+    Two deliberate design choices make this robust:
+
+    1. We run the coordinator **inline, in this (API) process** — NOT via
+       ``dispatch("coordinate_extraction")``. The coordinator does no heavy
+       work (pure DB inspection + stage-worker dispatch), so it's safe and
+       fast to run here. Crucially, this means forward progress continues
+       **even if the Celery worker is dead** — the API process drives the
+       state machine and the worker only does the actual extraction.
+
+    2. We drive **every** active book unconditionally, with no staleness
+       gate. The coordinator is idempotent, lock-guarded (CAS extraction
+       lock), and returns ``no_action`` when work is genuinely in-flight,
+       so calling it on a busy book every tick is cheap and side-effect
+       free. A lost dispatch message becomes a ≤CHECK_INTERVAL_S delay
+       instead of a permanent stall.
+
+    The happy-path worker-tail dispatches still fire (instant hand-off);
+    they're now a latency optimization, not a correctness requirement.
+
+    Returns the number of books driven.
+    """
+    from app.models.book import Book
+
+    # Materialise the id list in a short-lived session, then run the
+    # coordinator (which opens its own session) per book — no nested-cursor
+    # entanglement.
+    with _WatchdogSession() as session:
+        book_ids = session.execute(
+            select(Book.id).where(Book.status.in_(_INFLIGHT_STATUSES))
+        ).scalars().all()
+
+    if not book_ids:
+        return 0
+
+    from app.workers.orchestrator import _coordinate_extraction
+
+    driven = 0
+    for book_id in book_ids:
+        # 1. Liveness: fail any stage whose worker is dead (stale heartbeat),
+        #    so the coordinator below retries it THIS tick (~2 min crash
+        #    recovery) instead of waiting for the 15-min stale-job killer.
+        try:
+            with _WatchdogSession() as s:
+                _fail_dead_worker_stages(s, book_id)
+        except Exception as e:
+            logger.warning(
+                "driver: liveness check failed for book=%s: %s", book_id, e,
+            )
+        # 2. Drive the state machine forward (a just-failed stage → retry;
+        #    a genuinely in-flight stage → no_action).
+        try:
+            _coordinate_extraction(str(book_id))
+            driven += 1
+        except Exception as e:
+            logger.warning(
+                "driver: coordinator failed for book=%s: %s", book_id, e,
+            )
+    logger.debug("driver: stepped %d active book(s)", driven)
+    return driven
+
+
 async def watchdog_loop() -> None:
-    """Run forever, polling every CHECK_INTERVAL_S. Cancelled on shutdown."""
+    """Run forever, polling every CHECK_INTERVAL_S. Cancelled on shutdown.
+
+    Each tick runs two phases:
+      • _drive_active_books() — the PRIMARY state-driven engine (fix #3):
+        steps every active book's state machine forward, in-process, so a
+        lost dispatch message never strands a book.
+      • _scan_once() — the cleanup/backstop layer: reaps dead jobs, fails
+        orphan stages, releases stale locks, and (via the reconciler) fails
+        books that are genuinely broken past the recovery cap.
+    """
     logger.info(
-        "watchdog started — interval=%ss stale_after=%ss",
+        "watchdog started — interval=%ss stale_after=%ss (state-driven driver active)",
         CHECK_INTERVAL_S,
         STALE_AFTER_S,
     )
     while True:
+        # Phase 1: drive forward progress (cheap, every tick).
+        try:
+            await asyncio.to_thread(_drive_active_books)
+        except Exception:
+            logger.exception("watchdog driver failed")
+        # Phase 2: reap dead work + fail genuinely-stuck books.
         try:
             await asyncio.to_thread(_scan_once)
         except Exception:

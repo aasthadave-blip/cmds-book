@@ -31,3 +31,14 @@ class Job(Base):
     last_heartbeat_at: Mapped[datetime | None] = mapped_column(
         DateTime(timezone=True), index=True
     )
+    # When the Job row was first inserted (dispatch time). Needed by the
+    # watchdog to detect "zombie queued" jobs — rows that have been in
+    # `queued` for longer than QUEUE_STALE_AFTER_S without a Celery worker
+    # picking them up. Without this column, a queued job has neither
+    # `started_at` nor `last_heartbeat_at`, so its age can't be measured.
+    created_at: Mapped[datetime] = mapped_column(
+        DateTime(timezone=True),
+        nullable=False,
+        server_default=sa.text("CURRENT_TIMESTAMP"),
+        index=True,
+    )

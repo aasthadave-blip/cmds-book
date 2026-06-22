@@ -31,16 +31,45 @@ logger = logging.getLogger(__name__)
 # single block; anything past 150s is a hung request we want to abandon.
 DEFAULT_TIMEOUT_S = 150
 
-# Process-wide concurrency cap on in-flight Gemini calls. Without this, a
-# 39-section book with parallel workers fires 30+ simultaneous calls, hits
-# Gemini quota, and triggers timeouts that look like hangs.
-# 8 in-flight is the sweet spot for Railway's container memory budget —
-# tried 12 and Celery workers were OOM-killed by the kernel (SIGKILL)
-# during figure extraction. Each in-flight call holds the PDF slice,
-# Gemini request buffer, and (for figures) PNG bytes — memory adds up
-# fast. Stay at 8 until the container is upgraded.
-_MAX_IN_FLIGHT = 8
+# CONTAINER-WIDE memory ceiling on concurrent Gemini calls. 8 is the safe
+# total for Railway's memory budget — tried 12 and Celery workers were
+# OOM-killed by the kernel (SIGKILL) during figure extraction. Each in-flight
+# call holds the PDF slice, Gemini request buffer, and (for figures) PNG bytes,
+# so memory adds up fast. Override via GEMINI_GLOBAL_INFLIGHT only after a
+# container upgrade.
+_GLOBAL_INFLIGHT_CAP = int(os.environ.get("GEMINI_GLOBAL_INFLIGHT", "8"))
+
+
+def _worker_concurrency() -> int:
+    """Number of worker processes sharing this container's memory.
+
+    Celery prefork forks CELERY_CONCURRENCY child processes; EACH imports this
+    module and gets its OWN semaphore. So the real container-wide in-flight
+    total is (per-process cap) × (concurrency). Inline/dev mode is a single
+    process → 1.
+    """
+    try:
+        return max(1, int(os.environ.get("CELERY_CONCURRENCY", "1")))
+    except (TypeError, ValueError):
+        return 1
+
+
+# Per-process cap = global budget DIVIDED across the worker processes, so the
+# container-wide total stays at _GLOBAL_INFLIGHT_CAP regardless of how
+# CELERY_CONCURRENCY is tuned. This makes OOM architecturally impossible:
+# bumping concurrency for throughput can no longer multiply memory load
+# (the bug that SIGKILL-ed workers → orphaned jobs → "stuck extraction").
+#   concurrency=1 → 8/proc → 8 total   concurrency=2 → 4/proc → 8 total
+#   concurrency=3 → 2/proc → 6 total   concurrency=4 → 2/proc → 8 total
+# Trade-off: at higher concurrency a single book's section fan-out is narrower
+# (it shares the global budget), but total memory/throughput stay bounded —
+# the right behaviour for many concurrent books.
+_MAX_IN_FLIGHT = max(1, _GLOBAL_INFLIGHT_CAP // _worker_concurrency())
 _inflight_sem = threading.BoundedSemaphore(_MAX_IN_FLIGHT)
+logger.info(
+    "gemini_runtime: in-flight cap = %d/process (global=%d ÷ concurrency=%d)",
+    _MAX_IN_FLIGHT, _GLOBAL_INFLIGHT_CAP, _worker_concurrency(),
+)
 
 # Retry policy on transient errors (5xx, timeouts, connection resets). Total
 # attempts = 1 + RETRY_ATTEMPTS (so default = 3 tries with exponential backoff

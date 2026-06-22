@@ -43,6 +43,17 @@ if settings.TASK_EXECUTOR == "celery":
         # tasks in its registry. Missing a module = silent "task not found"
         # on dispatch.
         include=[
+            # The orchestrator MUST be first/explicit: it defines
+            # `coordinate_extraction` and `verify_dispatch`, the tasks that
+            # drive every stage handoff. Previously it was only registered
+            # as a transitive side-effect of importing extract.py, which is
+            # timing-dependent — on a fresh worker (startup, max-tasks-per-
+            # child respawn, redeploy) a coordinate_extraction message could
+            # arrive BEFORE the task was registered → KeyError → Celery
+            # silently drops the message → the book stalls at its current
+            # stage forever. Listing it explicitly guarantees registration
+            # at worker boot, deterministically.
+            "app.workers.orchestrator",
             "app.workers.extract",
             "app.workers.questions",
             "app.workers.questions_v2",
@@ -66,6 +77,18 @@ if settings.TASK_EXECUTOR == "celery":
         task_reject_on_worker_lost=True,
         # One task at a time per worker slot — prevents slow tasks starving the queue.
         worker_prefetch_multiplier=1,
+        # #4 — Redis broker visibility timeout. With acks_late, an in-flight
+        # task's message stays "reserved" (invisible) until the worker acks OR
+        # this timeout expires, at which point Redis REDELIVERS it. The
+        # INVARIANT: visibility_timeout MUST exceed task_time_limit, otherwise
+        # a long-but-healthy task gets redelivered while still running →
+        # DUPLICATE execution. We set it just above the 30-min hard limit so:
+        #   • no duplicate execution of a legitimately long task, and
+        #   • a crashed worker's orphaned task is redelivered within ~35 min
+        #     (broker-level backstop). The PRIMARY fast crash-recovery is the
+        #     watchdog driver's dead-worker detection (~2 min via heartbeat);
+        #     this is the belt-and-suspenders layer beneath it.
+        broker_transport_options={"visibility_timeout": 60 * 35},
     )
 else:
     celery_app = _NoopCeleryApp()

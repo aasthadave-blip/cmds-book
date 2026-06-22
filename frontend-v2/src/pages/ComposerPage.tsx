@@ -683,6 +683,41 @@ function ItemContent({ item }: { item: FinalDraftItem }) {
     const q = item.question;
     const diagram = (q as { regenerated_diagram?: RegeneratedDiagram | null })
       .regenerated_diagram ?? null;
+    const showDiagram = !!(
+      diagram && !diagram.fallback_to_original && diagram.svg_preview
+    );
+    // Embedded figures, routed by body_target exactly like the extraction /
+    // regen review view: question-stem figures render under the question text,
+    // solution figures inside the Solution block. null = question-side. A
+    // regenerated diagram replaces the originals (→ no embedded figs shown).
+    type _EF = {
+      ref_id?: string; figure_id?: string; label?: string;
+      caption?: string; image_url: string;
+      body_target?: 'question' | 'solution' | null;
+    };
+    const _allEf = ((q as { embedded_figures?: _EF[] }).embedded_figures) ?? [];
+    const figsQ = showDiagram ? [] : _allEf.filter((ef) => (ef.body_target ?? 'question') !== 'solution');
+    const figsS = showDiagram ? [] : _allEf.filter((ef) => ef.body_target === 'solution');
+    const renderFig = (ef: _EF) => {
+      const src = ef.image_url?.startsWith('http') ? ef.image_url : `${API_BASE}${ef.image_url}`;
+      return (
+        <figure key={ef.ref_id ?? ef.figure_id} style={{ margin: '6px 0 0', textAlign: 'center' }}>
+          <img
+            src={src}
+            alt={ef.caption || ef.label || 'Figure'}
+            style={{ maxWidth: '100%', maxHeight: 220, borderRadius: 6, border: '1px solid var(--line-2)' }}
+            onError={(e) => { (e.target as HTMLImageElement).style.display = 'none'; }}
+          />
+          {(ef.label || ef.caption) && (
+            <figcaption style={{ fontSize: 11, color: 'var(--ink-500)', marginTop: 3, fontStyle: 'italic' }}>
+              {ef.label && <strong>{ef.label}</strong>}
+              {ef.label && ef.caption && ' — '}
+              {ef.caption}
+            </figcaption>
+          )}
+        </figure>
+      );
+    };
     return (
       <div>
         <div style={{ fontSize: 13, color: 'var(--ink-900)', lineHeight: 1.55 }}>
@@ -690,9 +725,13 @@ function ItemContent({ item }: { item: FinalDraftItem }) {
         </div>
         {/* Step 2 — regenerated vector diagram (replaces the original figure) */}
         <DiagramPreview diagram={diagram} compact />
+        {/* Question-body figures under the question text */}
+        {figsQ.map(renderFig)}
         {q.solution_text && (
           <div style={{ marginTop: 6, padding: '8px 10px', background: 'var(--bg-tint)', borderRadius: 6, fontSize: 12, color: 'var(--ink-700)', lineHeight: 1.55 }}>
             <strong>Solution:</strong> {String(q.solution_text)}
+            {/* Solution-body figures inside the Solution block */}
+            {figsS.map(renderFig)}
           </div>
         )}
       </div>

@@ -14,6 +14,7 @@ Two responsibilities:
 
 from __future__ import annotations
 
+import re
 import uuid
 from typing import Any
 from uuid import UUID
@@ -32,6 +33,31 @@ def _new_id() -> str:
 
 def _is_chip(block: dict[str, Any]) -> bool:
     return block.get("t") in ("example_ref", "exercise_ref", "question_ref")
+
+
+# LaTeX commands that take an immediate label argument with NO braces and so
+# MUST be followed by a space (e.g. \angle BAC). Models frequently glue the
+# label on (\angleBAC), which KaTeX/OMML parse as ONE undefined control
+# sequence → the whole $$…$$ block fails to render and shows raw source in
+# BOTH the Preview and the DOCX export. Re-inserting the space makes the math
+# valid again. Idempotent: \angle BAC (already spaced) is unaffected because
+# the lookahead requires a letter IMMEDIATELY after the command.
+_GLUED_CMD_RE = re.compile(r"\\(angle|triangle)(?=[A-Za-z])")
+
+
+def _deglue_latex(value: Any) -> Any:
+    """Recursively repair glued label-commands (\\angleBAC → \\angle BAC) in
+    every string field of an item. Walks dicts/lists so it covers eq/text
+    blocks, question raw_text/solution_text, custom_text, captions, etc.
+    Safe on prose: the regex only matches the literal \\angle / \\triangle
+    commands, which never appear outside LaTeX."""
+    if isinstance(value, str):
+        return _GLUED_CMD_RE.sub(r"\\\1 ", value)
+    if isinstance(value, list):
+        return [_deglue_latex(v) for v in value]
+    if isinstance(value, dict):
+        return {k: _deglue_latex(v) for k, v in value.items()}
+    return value
 
 
 async def seed_draft_items_from_merge(
@@ -63,6 +89,24 @@ async def seed_draft_items_from_merge(
         s["section_id"]: s for s in doc["sections"]
     }
     items: list[dict[str, Any]] = []
+
+    # Book-level label → unattached-figure map. The embedder sometimes marks a
+    # figure "unattached" (no inline anchor found, e.g. when a section's theory
+    # text was too OCR-garbled to anchor against) — yet the theory STILL
+    # carries a `fig` placeholder block for it in the CORRECT section (e.g.
+    # "Figure 6.1" in Symmetry). The extraction/regen review view binds the
+    # image to that placeholder BY LABEL; we do the same here so Preview /
+    # Composer / DOCX match it, instead of exiling the figure to the trailing
+    # "Unattached figures" tray. Anything not label-bound stays in the tray.
+    def _norm_label(s: str) -> str:
+        return re.sub(r"[^a-z0-9.]", "", (s or "").lower())
+
+    _unattached_by_label: dict[str, dict[str, Any]] = {}
+    for _f in (doc.get("unattached_figures") or []):
+        _lbl = _norm_label(_f.get("figure_number") or _f.get("label") or "")
+        if _lbl and _lbl not in _unattached_by_label:
+            _unattached_by_label[_lbl] = _f
+    _label_bound_ids: set[str] = set()  # figure ids consumed via label-binding
 
     # Derive chip-based parent→children mapping. A chip in section X
     # pointing to in-doc section Y declares Y as a child of X. First
@@ -299,8 +343,27 @@ async def seed_draft_items_from_merge(
                         })
                     _emit_inlined_at(str(i))
                     continue
-                # No adjacent figure → keep the fig block as a visible
-                # placeholder. Fall through to the normal emit-block path.
+                # No adjacent figure → try to BIND a figure to this
+                # placeholder BY LABEL (matches the extraction/regen review
+                # view). If a label-matched unattached figure exists, emit its
+                # image here and skip the empty placeholder; otherwise keep
+                # the placeholder as before.
+                _flbl = _norm_label(b.get("label") or b.get("c") or "")
+                _bound = _unattached_by_label.get(_flbl) if _flbl else None
+                if _bound is not None:
+                    _bid = str(_bound.get("figure_id") or _bound.get("id") or "")
+                    if _bid and _bid not in _label_bound_ids:
+                        _label_bound_ids.add(_bid)
+                        items.append({
+                            "id": _new_id(),
+                            "type": "figure",
+                            "parent_section_id": section_id,
+                            "figure": _bound,
+                        })
+                        _emit_inlined_at(str(i))
+                        continue
+                # No adjacent figure and no label match → keep the fig block
+                # as a visible placeholder. Fall through to the emit-block path.
             # Resolve block + its anchored figures into ordered nodes via the
             # single positional-truth resolver. For non-list blocks (and lists
             # without interior char-offset figures) this returns exactly
@@ -369,7 +432,12 @@ async def seed_draft_items_from_merge(
     # see them in the document view — they only appear in the Figures
     # tab. Rendered with a synthetic parent_section_id so the front-end
     # can group them under an "Unattached figures" heading.
-    unattached = doc.get("unattached_figures") or []
+    # Drop any figure already label-bound to an inline placeholder above, so
+    # it isn't ALSO shown in the trailing tray (no duplicates).
+    unattached = [
+        f for f in (doc.get("unattached_figures") or [])
+        if str(f.get("figure_id") or f.get("id") or "") not in _label_bound_ids
+    ]
     if unattached:
         # Synthetic section heading so the tray sits visually distinct.
         items.append({
@@ -389,6 +457,10 @@ async def seed_draft_items_from_merge(
                 "figure": f,
             })
 
+    # Final pass: repair glued LaTeX label-commands (\angleBAC → \angle BAC)
+    # across every item, so math renders in BOTH the Preview (KaTeX) and the
+    # DOCX export (OMML) — they both consume these exact items.
+    items = [_deglue_latex(it) for it in items]
     return items
 
 
