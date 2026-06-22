@@ -27,7 +27,20 @@ class _NoopCeleryApp:
 
 
 if settings.TASK_EXECUTOR == "celery":
+    import os
+
     from celery import Celery  # type: ignore[import-not-found]
+
+    # Hard/soft per-task limits — the backstop that auto-kills a genuinely hung
+    # task and frees its slot WITHOUT a human/restart. Tightened from 30→20 min
+    # so a true hang recovers faster, but kept generous enough that legitimate
+    # long stages (big scanned books) finish well under it. Env-overridable so
+    # an unusually large book can be given more headroom without a code change.
+    _HARD_LIMIT_S = int(os.getenv("CELERY_TASK_TIME_LIMIT", str(60 * 20)))
+    _SOFT_LIMIT_S = int(os.getenv("CELERY_TASK_SOFT_TIME_LIMIT", str(60 * 17)))
+    # INVARIANT (see below): broker visibility_timeout MUST exceed the hard
+    # limit, else a long-but-healthy task gets redelivered while still running.
+    _VISIBILITY_S = max(60 * 35, _HARD_LIMIT_S + 60 * 5)
 
     # NOTE: no result backend configured. Our app tracks task state via Job
     # rows in Postgres (status/progress/error fields) — we never call
@@ -68,8 +81,8 @@ if settings.TASK_EXECUTOR == "celery":
         accept_content=["json"],
         # No result backend → no task_track_started (would require result store).
         task_ignore_result=True,
-        task_time_limit=60 * 30,
-        task_soft_time_limit=60 * 25,
+        task_time_limit=_HARD_LIMIT_S,
+        task_soft_time_limit=_SOFT_LIMIT_S,
         worker_max_tasks_per_child=50,
         # Crash safety: don't ack until task fully completes.
         # If the worker is killed mid-task, the broker re-queues it automatically.
@@ -88,7 +101,7 @@ if settings.TASK_EXECUTOR == "celery":
         #     (broker-level backstop). The PRIMARY fast crash-recovery is the
         #     watchdog driver's dead-worker detection (~2 min via heartbeat);
         #     this is the belt-and-suspenders layer beneath it.
-        broker_transport_options={"visibility_timeout": 60 * 35},
+        broker_transport_options={"visibility_timeout": _VISIBILITY_S},
     )
 else:
     celery_app = _NoopCeleryApp()

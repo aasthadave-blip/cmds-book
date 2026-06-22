@@ -3,17 +3,16 @@
 from __future__ import annotations
 
 import asyncio
-from datetime import datetime
 from uuid import UUID
 
 from fastapi import APIRouter, Depends, HTTPException
 from fastapi.responses import StreamingResponse
-from sqlalchemy import select, update
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from app.core.db import async_session_factory, get_session
 from app.models.job import Job
 from app.schemas.job import JobOut
+from app.services.cancellation import cancel_books
 from app.utils.sse import sse_event
 
 router = APIRouter(prefix="/api/jobs", tags=["jobs"])
@@ -25,28 +24,19 @@ _TERMINAL_STATUSES = {"succeeded", "failed", "cancelled"}
 async def cancel_all_jobs(
     session: AsyncSession = Depends(get_session),
 ) -> dict:
-    """Mark every non-terminal job as cancelled.
+    """Cancel every in-flight job FOR REAL — no backend restart required.
 
-    Doesn't actually kill the underlying Celery task (those need a worker
-    restart to stop mid-flight), but flips their DB status so the UI
-    stops showing them as in-flight, and the worker's per-task code can
-    see Job.status == 'cancelled' and bail early on next checkpoint.
-
-    Returns the count of jobs that were transitioned.
+    Kills the running Celery tasks (``revoke(terminate=True)`` via the Job-id
+    == task-id link) and moves their books to a terminal ``cancelled`` status
+    so the state-driven driver stops re-driving them. See
+    ``app.services.cancellation`` for the full rationale.
     """
-    result = await session.execute(
-        update(Job)
-        .where(Job.status.in_(["queued", "running", "started", "pending"]))
-        .values(
-            status="cancelled",
-            error="Cancelled via /api/jobs/cancel-all",
-            finished_at=datetime.utcnow(),
-        )
-    )
-    await session.commit()
+    result = await cancel_books(session, book_ids=None,
+                                reason="Cancelled via /api/jobs/cancel-all")
     return {
-        "cancelled": int(result.rowcount or 0),
-        "message": "Restart the backend service to actually stop running tasks.",
+        "cancelled": result["jobs_cancelled"],
+        **result,
+        "message": "Tasks revoked and books terminated — no restart needed.",
     }
 
 

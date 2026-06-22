@@ -257,6 +257,26 @@ async def get_book_quality(
     return await verify_book(session, book_id)
 
 
+@router.post("/{book_id}/cancel")
+async def cancel_book(
+    book_id: UUID, session: AsyncSession = Depends(get_session)
+) -> dict:
+    """Stop a book's extraction FOR REAL and keep it stopped.
+
+    Kills the running Celery task(s) for this book and moves the book to a
+    terminal ``cancelled`` status so the state-driven driver won't restart it.
+    After this the book is immediately deletable (no in-flight jobs remain).
+    No backend restart required — this is the production cancel path.
+    """
+    from app.services.cancellation import cancel_books
+
+    book = await session.get(Book, book_id)
+    if book is None:
+        raise HTTPException(404, detail="Book not found")
+    result = await cancel_books(session, book_ids=[book_id], reason="Cancelled by user")
+    return {"book_id": str(book_id), **result}
+
+
 @router.delete("/{book_id}", status_code=status.HTTP_204_NO_CONTENT)
 async def delete_book(book_id: UUID, session: AsyncSession = Depends(get_session)) -> None:
     book = await session.get(Book, book_id)

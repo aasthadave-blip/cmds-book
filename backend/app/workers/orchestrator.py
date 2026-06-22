@@ -413,7 +413,7 @@ def _dispatch_theory(session, book: Book) -> None:
     session.commit()
     from datetime import datetime, timezone
     from app.workers.runner import dispatch, dispatch_after
-    dispatch("extract_book", str(book.id), str(job_id))
+    dispatch("extract_book", str(book.id), str(job_id), task_id=str(job_id))
     # Self-verify: if the dispatch was lost, this re-fires the coordinator
     # 60s later. Worker-side CAS makes duplicate dispatches a no-op.
     dispatch_after(
@@ -447,7 +447,7 @@ def _dispatch_analyse(session, book: Book) -> UUID | None:
     book.status = "analysing"
     session.commit()
     from app.workers.runner import dispatch
-    dispatch("analyse_book", str(book.id), str(job_id))
+    dispatch("analyse_book", str(book.id), str(job_id), task_id=str(job_id))
     logger.info(
         "orchestrator: dispatched analyse_book book=%s job=%s",
         book.id, job_id,
@@ -509,6 +509,7 @@ def _dispatch_questions(session, book: Book) -> None:
     dispatch(
         "extract_questions_v3",
         str(book.id), str(bank_id), str(job_id),
+        task_id=str(job_id),
     )
     dispatch_after(
         "verify_dispatch", _VERIFY_DELAY_S,
@@ -533,7 +534,7 @@ def _dispatch_figures(session, book: Book) -> None:
     session.commit()
     from datetime import datetime, timezone
     from app.workers.runner import dispatch, dispatch_after
-    dispatch("extract_figures_v2", str(book.id), str(job_id))
+    dispatch("extract_figures_v2", str(book.id), str(job_id), task_id=str(job_id))
     dispatch_after(
         "verify_dispatch", _VERIFY_DELAY_S,
         str(book.id), "figures", datetime.now(timezone.utc).isoformat(),
