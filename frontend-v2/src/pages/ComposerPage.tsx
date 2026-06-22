@@ -44,6 +44,8 @@ import { API_BASE, ApiError, req } from '../api/client';
 import { useBook } from '../api/books';
 import { Icon } from '../components/Icon';
 import { MathMarkdown } from '../components/MathMarkdown';
+import { DiagramPreview } from '../components/DiagramPreview';
+import type { RegeneratedDiagram } from '../api/questions';
 import { stripFigPlaceholders } from '../lib/questionText';
 
 type Block = { t: string; [k: string]: unknown };
@@ -679,11 +681,15 @@ function ItemContent({ item }: { item: FinalDraftItem }) {
   }
   if (item.type === 'question') {
     const q = item.question;
+    const diagram = (q as { regenerated_diagram?: RegeneratedDiagram | null })
+      .regenerated_diagram ?? null;
     return (
       <div>
         <div style={{ fontSize: 13, color: 'var(--ink-900)', lineHeight: 1.55 }}>
           {stripFigPlaceholders(q.raw_text) || '(no question text)'}
         </div>
+        {/* Step 2 — regenerated vector diagram (replaces the original figure) */}
+        <DiagramPreview diagram={diagram} compact />
         {q.solution_text && (
           <div style={{ marginTop: 6, padding: '8px 10px', background: 'var(--bg-tint)', borderRadius: 6, fontSize: 12, color: 'var(--ink-700)', lineHeight: 1.55 }}>
             <strong>Solution:</strong> {String(q.solution_text)}

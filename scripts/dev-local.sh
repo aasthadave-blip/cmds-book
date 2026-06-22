@@ -29,7 +29,13 @@ set +a
 # Start backend
 pushd backend >/dev/null
 echo "==> Starting backend on :8001"
-UVICORN_RELOAD_ACTIVE=1 "$UV" run uvicorn app.main:app --host 0.0.0.0 --port 8001 --reload &
+# --reload-dir app: watch ONLY the app/ source tree. Without this, uvicorn
+# watches the whole CWD including .venv, so a `uv`/`pip` install (e.g. adding
+# cairosvg) reloads the server and KILLS any in-flight inline regen/extraction
+# job (progress resets to 5%). Scoping to app/ keeps dependency installs and
+# stray files from bouncing the backend. (Prompts in prompts/ are read fresh
+# per call, so they don't need to trigger a reload.)
+UVICORN_RELOAD_ACTIVE=1 "$UV" run uvicorn app.main:app --host 0.0.0.0 --port 8001 --reload --reload-dir app &
 BACK_PID=$!
 popd >/dev/null
 

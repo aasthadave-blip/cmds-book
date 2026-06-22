@@ -59,3 +59,7 @@ COST_MODEL.xlsx
 # Dev-only sample generators — not part of the prod export pipeline
 backend/sample_export_format_a.py
 backend/sample_export_theory.py
+
+# resvg standalone binary — Windows-dev SVG->PNG fallback (prod uses cairosvg).
+# Download per backend/tools/resvg/README.md; not committed (platform-specific binary).
+backend/tools/resvg/

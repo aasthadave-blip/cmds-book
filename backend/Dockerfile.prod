@@ -8,12 +8,16 @@ ENV PYTHONDONTWRITEBYTECODE=1 \
 
 WORKDIR /app
 
-# pandoc is required at runtime for docx export (pypandoc shells out to it).
+# pandoc — docx export (pypandoc shells out to it).
+# libcairo2 — runtime system library cairosvg needs to rasterize the Step-2
+#   regenerated LaTeX/SVG diagrams to PNG for embedding in the Word export.
+#   Without it, cairosvg can't load and diagrams fall back to no figure.
 RUN apt-get update && apt-get install -y --no-install-recommends \
     build-essential \
     curl \
     libpq-dev \
     pandoc \
+    libcairo2 \
     && rm -rf /var/lib/apt/lists/*
 
 COPY pyproject.toml ./

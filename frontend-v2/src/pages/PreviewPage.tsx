@@ -13,6 +13,8 @@ import { API_BASE, ApiError, req } from '../api/client';
 import { useBook } from '../api/books';
 import { Icon } from '../components/Icon';
 import { MathMarkdown } from '../components/MathMarkdown';
+import { DiagramPreview } from '../components/DiagramPreview';
+import type { RegeneratedDiagram } from '../api/questions';
 import { stripFigPlaceholders } from '../lib/questionText';
 
 type Block = { t: string; [k: string]: unknown };
@@ -371,6 +373,13 @@ function renderItem(item: FinalDraftItem): React.ReactElement | null {
       variant?: string;
       image_url: string;
     }> }).embedded_figures ?? [];
+    // Step 2 — a regenerated vector diagram REPLACES the original figure here
+    // (mirrors the Word export). Falls back to the original when absent/fallback.
+    const diagram = (q as { regenerated_diagram?: RegeneratedDiagram | null })
+      .regenerated_diagram ?? null;
+    const showDiagram = !!(
+      diagram && !diagram.fallback_to_original && diagram.svg_preview
+    );
     return (
       <div
         key={item.id}
@@ -396,8 +405,10 @@ function renderItem(item: FinalDraftItem): React.ReactElement | null {
         <div style={{ fontSize: 14, color: 'var(--ink-900)', lineHeight: 1.55 }}>
           <MathMarkdown>{stripFigPlaceholders(q.raw_text) || '(no text)'}</MathMarkdown>
         </div>
+        {/* Regenerated diagram replaces the original figure when present */}
+        {showDiagram && <DiagramPreview diagram={diagram} />}
         {/* Embedded figures inline at the bottom of the question text */}
-        {embedded.length > 0 && (
+        {!showDiagram && embedded.length > 0 && (
           <div style={{ marginTop: 10, display: 'flex', flexDirection: 'column', gap: 10 }}>
             {embedded.map((ef) => {
               const src = ef.image_url.startsWith('http')

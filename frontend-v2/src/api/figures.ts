@@ -63,6 +63,66 @@ export const regenerateSectionFigures = (
     { method: 'POST', body: JSON.stringify(body) },
   );
 
+// Manual per-figure LaTeX/SVG diagram regen aligned to the regenerated theory.
+// On-demand only (the figure is never auto-updated). On success the backend
+// stores the rasterized PNG as the approved regen variant — refetch + cache-bust
+// the image afterward to show it.
+export const regenerateFigureDiagram = (
+  figureId: string,
+  customInstructions?: string | null,
+) =>
+  req<{
+    ok: boolean;
+    fallback?: boolean;
+    figure_id: string;
+    subject?: string;
+    description?: string;
+    message?: string;
+  }>(`/api/figures/${figureId}/regenerate-diagram`, {
+    method: 'POST',
+    body: JSON.stringify({ custom_instructions: customInstructions ?? null }),
+  });
+
+// On-demand "Redraw cleanly" for ONE figure — the image-model raster redraw
+// (same engine as the section batch), auto-approved so it shows immediately.
+// Distinct from regenerateFigureDiagram (LaTeX/SVG vector). Refetch + cache-bust
+// the image afterward.
+export const redrawFigure = (
+  figureId: string,
+  opts: {
+    style?: 'enhanced' | 'original';
+    custom_instructions?: string | null;
+    watermark_clean?: boolean;
+    overlay?: boolean;
+  } = {},
+) =>
+  req<{ ok: boolean; figure_id: string; style?: string }>(
+    `/api/figures/${figureId}/redraw`,
+    {
+      method: 'POST',
+      body: JSON.stringify({
+        style: opts.style ?? 'enhanced',
+        custom_instructions: opts.custom_instructions ?? null,
+        watermark_clean: opts.watermark_clean ?? false,
+        overlay: opts.overlay ?? false,
+      }),
+    },
+  );
+
+// Approve / unapprove a single figure's regen variant. Approving makes the
+// REGENERATED image the one used in Preview/Composer/Export; unapproving falls
+// back to the ORIGINAL. Reversible and non-destructive (the regen is kept).
+export const approveFigure = (figureId: string) =>
+  req<{ figure_id: string; approved_at: string }>(
+    `/api/figures/${figureId}/approve`,
+    { method: 'POST' },
+  );
+
+export const unapproveFigure = (figureId: string) =>
+  req<{ figure_id: string }>(`/api/figures/${figureId}/unapprove`, {
+    method: 'POST',
+  });
+
 // ─── Hook ─────────────────────────────────────────────────────────
 type State =
   | { kind: 'loading' }

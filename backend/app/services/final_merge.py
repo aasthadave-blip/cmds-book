@@ -64,6 +64,30 @@ def _extract_image_regen_hint(q: Question) -> dict[str, Any] | None:
     return {"needed": True, "reason": ir.get("reason") or ""}
 
 
+def _extract_regenerated_diagram(q: Question) -> dict[str, Any] | None:
+    """Step 2 — surface the regenerated LaTeX/SVG diagram payload from qc_local.
+
+    The Composer seeds its draft from these question dicts, so without this the
+    Final/Export DOCX path can never embed the new diagram. With it present, the
+    docx builder rasterizes ``svg_preview`` to PNG and embeds it IN PLACE OF the
+    original figure (honoring fallback_to_original). None when there is no regen
+    diagram on the question.
+    """
+    qc = getattr(q, "qc_local", None)
+    if not isinstance(qc, dict):
+        return None
+    rd = qc.get("regenerated_diagram")
+    if not isinstance(rd, dict):
+        return None
+    return {
+        "fallback_to_original": bool(rd.get("fallback_to_original", False)),
+        "subject": rd.get("subject") or "",
+        "latex_code": rd.get("latex_code") or "",
+        "svg_preview": rd.get("svg_preview") or "",
+        "description": rd.get("description") or "",
+    }
+
+
 # ---------------------------------------------------------------------------
 # Chip ↔ Question merge
 # ---------------------------------------------------------------------------
@@ -967,19 +991,17 @@ async def build_final_merge(
             "has_solution": bool(q.has_solution),
             "solution_text": q.solution_text or "",
             "kind": q.kind,
-            # Regen variants have no figure_references of their own (the
-            # embedder runs on the original extraction), so fall back to the
-            # SOURCE question's figures — the variant shows the same figure as
-            # the original. Keeps Composer/Preview consistent with the
-            # RegenReview page (own-then-source). Originals (no
-            # source_question_id) just use their own.
-            "embedded_figures": (
-                question_figures_by_qid.get(str(q.id))
-                or question_figures_by_qid.get(
-                    str(getattr(q, "source_question_id", None)), []
-                )
-            ),
+            # Regen variants do NOT inherit the SOURCE question's figure: a
+            # regenerated question has new values, so the original figure would
+            # be misleading. The regenerated LaTeX/SVG diagram (below) is the
+            # only image a variant shows — and if that's absent/failed, the
+            # variant shows no figure (never the stale original). Originals
+            # (no source_question_id) use their own figures as before.
+            "embedded_figures": question_figures_by_qid.get(str(q.id), []),
             "image_regen_hint": _extract_image_regen_hint(q),
+            # Step 2 — carry the regen diagram so the Composer/Final DOCX export
+            # can embed it in place of the original figure.
+            "regenerated_diagram": _extract_regenerated_diagram(q),
         }
         if origin_section_id is not None:
             qd["_origin_section_id"] = origin_section_id
@@ -1116,13 +1138,14 @@ async def build_final_merge(
             "has_solution": bool(q.has_solution),
             "solution_text": q.solution_text or "",
             "kind": q.kind,
-            "embedded_figures": (
-                question_figures_by_qid.get(str(q.id))
-                or question_figures_by_qid.get(
-                    str(getattr(q, "source_question_id", None)), []
-                )
-            ),
+            # Regen variants do NOT inherit the source figure (would be stale);
+            # they show the regenerated diagram below, or no figure. Originals
+            # use their own figures.
+            "embedded_figures": question_figures_by_qid.get(str(q.id), []),
             "image_regen_hint": _extract_image_regen_hint(q),
+            # Step 2 — carry the regen diagram so excluded-bank regen questions
+            # embed it in place of the original figure (same as regular sections).
+            "regenerated_diagram": _extract_regenerated_diagram(q),
         }
 
     def _min_page(qs) -> int:

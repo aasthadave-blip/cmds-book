@@ -31,6 +31,7 @@ from docx.shared import Cm, Pt, RGBColor
 
 from app.services.latex_omml import latex_to_omml_element
 from app.services.latex_normalize import normalize_latex
+from app.core.config import settings
 
 
 # ---------------------------------------------------------------------------
@@ -390,9 +391,21 @@ def _render_inline(p, text: str) -> None:
     if cursor < len(text):
         parts.append(("text", text[cursor:]))
 
+    # Bold state is tracked ACROSS parts: a markdown bold span that wraps a
+    # `$math$` chunk (e.g. "**Case (1): $S_1$ closed:**") would otherwise be
+    # severed by the math-split above, leaking literal `**`. We split each text
+    # part on `**` and toggle bold at every marker, so the span stays bold
+    # across the math boundary and no stray stars reach the doc. Within each
+    # piece, _emit_text_runs still handles *italic*, `code`, and \textbf{}.
+    bold_state = _force_bold
     for kind, payload in parts:
         if kind == "text":
-            _emit_text_runs(p, payload, bold_all=_force_bold)
+            segs = payload.split("**")
+            for i, seg in enumerate(segs):
+                if seg:
+                    _emit_text_runs(p, seg, bold_all=bold_state)
+                if i < len(segs) - 1:
+                    bold_state = not bold_state  # toggle at each **
         elif kind == "math":
             # Native Word equation (OMML) — fractions, integrals, roots,
             # matrices, \ce reactions render properly, matching the preview.
@@ -404,6 +417,7 @@ def _render_inline(p, text: str) -> None:
                 # of LaTeX the converter can't handle (never crash the doc).
                 r = p.add_run(_normalise_math_prose(payload))
                 r.italic = True
+                r.bold = bold_state
                 r.font.size = Pt(10)
         elif kind == "fig":
             # Strip the placeholder silently. The actual figure is rendered
@@ -831,6 +845,35 @@ def _render_question_tail(b: _DocBuilder, q: dict) -> None:
     b.question_gap()
 
 
+def _maybe_embed_regen_diagram(b: _DocBuilder, q: dict) -> bool:
+    """Step 2 — embed the regenerated LaTeX/SVG diagram (rasterized to PNG)
+    when the question carries one and it is NOT a fallback.
+
+    Returns True when a diagram image was embedded, so the caller can SKIP the
+    original figure (the new diagram REPLACES it). Returns False — meaning keep
+    the original figure — when the feature is off, no diagram is present, the
+    model fell back to the original, the SVG is empty, or rasterization failed.
+    """
+    if not settings.EMBED_REGEN_DIAGRAM_IN_DOCX:
+        return False
+    rd = q.get("regenerated_diagram")
+    if not isinstance(rd, dict) or rd.get("fallback_to_original"):
+        return False
+    svg = (rd.get("svg_preview") or "").strip()
+    if not svg:
+        return False
+    from app.services.svg_raster import rasterize_svg_to_png
+
+    png = rasterize_svg_to_png(svg)
+    if not png:
+        # Neither cairosvg nor resvg could render it — keep the original figure.
+        return False
+    subject = (rd.get("subject") or "").strip()
+    label = "Regenerated diagram" + (f" · {subject}" if subject else "")
+    b.image(png, label=label, caption="")
+    return True
+
+
 def _render_question(b: _DocBuilder, q: dict, *, label: str | None = None) -> None:
     """Backward-compatible single-call render — stem + options + answer
     + solution + gap. Used by the question-bank export path which has no
@@ -838,6 +881,9 @@ def _render_question(b: _DocBuilder, q: dict, *, label: str | None = None) -> No
     _render_question_head + figures + _render_question_tail so figures
     sit between stem and solution."""
     _render_question_head(b, q, label=label)
+    # Step 2 — embed the regenerated diagram between stem and solution when
+    # present (no-op for bank questions, which never carry one).
+    _maybe_embed_regen_diagram(b, q)
     _render_question_tail(b, q)
 
 
@@ -1185,13 +1231,17 @@ def build_final_draft_docx(
             # them past the solution text — wrong position relative to
             # the source PDF.
             _render_question_head(b, q)
-            for f in q.get("embedded_figures") or []:
-                fid = str(f.get("figure_id") or "")
-                data = figure_bytes_map.get(fid)
-                if data:
-                    b.image(data, label=f.get("label") or "", caption=f.get("caption") or "")
-                else:
-                    b.figure_callout(f.get("label") or "image", f.get("caption") or "")
+            # Step 2 — if a regenerated diagram is present (and not a fallback),
+            # embed it IN PLACE OF the original figures. Otherwise fall back to
+            # the original embedded_figures (current behavior).
+            if not _maybe_embed_regen_diagram(b, q):
+                for f in q.get("embedded_figures") or []:
+                    fid = str(f.get("figure_id") or "")
+                    data = figure_bytes_map.get(fid)
+                    if data:
+                        b.image(data, label=f.get("label") or "", caption=f.get("caption") or "")
+                    else:
+                        b.figure_callout(f.get("label") or "image", f.get("caption") or "")
             _render_question_tail(b, q)
             continue
         if t == "custom_text":

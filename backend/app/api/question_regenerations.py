@@ -100,9 +100,10 @@ def _question_dict(
     figure_serializer.serialize_embedded_figures(context="question").
     Figure resolution:
       • a SOURCE/original question → its own figures (by q.id)
-      • a REGEN VARIANT → it has no figure_references of its own (the
-        embedder only runs on the original extraction), so it INHERITS
-        its source question's figures (by q.source_question_id).
+      • a REGEN VARIANT → NO inherited figure. A regenerated question has new
+        values, so the source's original figure would be misleading. The
+        variant shows its regenerated LaTeX/SVG diagram (below) or, if that's
+        absent/failed, no figure at all — never the stale original.
     Each figure_dict carries body_target so the frontend renders it
     under the question stem vs inside the solution block — identical to
     the extracted-content question view.
@@ -110,8 +111,24 @@ def _question_dict(
     embedded: list[dict] = []
     if figs_by_qid is not None:
         embedded = figs_by_qid.get(str(q.id)) or []
-        if not embedded and q.source_question_id is not None:
-            embedded = figs_by_qid.get(str(q.source_question_id)) or []
+    # Step 2 (chained diagram regen) — surface the LaTeX/SVG payload + the
+    # image-regen hint stored in qc_local so the Regenerated tab can render a
+    # live vector preview. Present only for image-bearing regen variants.
+    image_regen_hint = None
+    regenerated_diagram = None
+    if isinstance(q.qc_local, dict):
+        ir = q.qc_local.get("image_regen")
+        if isinstance(ir, dict) and ir.get("needed"):
+            image_regen_hint = {"needed": True, "reason": ir.get("reason") or ""}
+        rd = q.qc_local.get("regenerated_diagram")
+        if isinstance(rd, dict):
+            regenerated_diagram = {
+                "fallback_to_original": bool(rd.get("fallback_to_original", False)),
+                "subject": rd.get("subject") or "",
+                "latex_code": rd.get("latex_code") or "",
+                "svg_preview": rd.get("svg_preview") or "",
+                "description": rd.get("description") or "",
+            }
     return {
         "id": str(q.id),
         "regen_id": str(q.regen_id) if q.regen_id else None,
@@ -142,6 +159,10 @@ def _question_dict(
         # frontend can badge a retained-original variant ("couldn't
         # regenerate — original retained") and offer a retry.
         "qc_local": q.qc_local,
+        # Step 2 — the regenerated diagram payload + image-needed hint, so the
+        # Regenerated tab shows the new diagram (or a "diagram unavailable" note).
+        "image_regen_hint": image_regen_hint,
+        "regenerated_diagram": regenerated_diagram,
     }
 
 

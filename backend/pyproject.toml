@@ -41,6 +41,10 @@ dependencies = [
     "pypandoc-binary>=1.13",
     "latex2mathml>=3.81.0",
     "mathml2omml>=0.0.2",
+    # SVG → PNG rasterization for embedding regenerated diagrams in Word.
+    # Primary backend (needs system libcairo2 on Linux/prod). The resvg
+    # standalone binary is the dependency-free fallback (see svg_raster.py).
+    "cairosvg>=2.7.0",
 ]
 
 [project.optional-dependencies]
