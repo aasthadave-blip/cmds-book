@@ -103,11 +103,26 @@ from app.workers.runner import register as register_task
 logger = logging.getLogger(__name__)
 
 
+# Module-level engine + sessionmaker (created ONCE). The previous version
+# built a NEW create_engine() on every _sync_session() call — and this is
+# called several times per figure extraction — so each call leaked a fresh
+# connection pool that was never disposed. Under repeated figure runs the
+# leaked pools exhausted Postgres's connection limit → new connections block
+# → the whole worker hangs silently ("queued — waiting for worker" forever).
+# One bounded, reused engine fixes the leak.
+_FIG_SYNC_ENGINE = create_engine(
+    settings.SYNC_DATABASE_URL,
+    pool_pre_ping=True, future=True,
+    pool_size=3, max_overflow=4, pool_timeout=20, pool_recycle=900,
+)
+_FIG_SESSIONMAKER = sessionmaker(
+    bind=_FIG_SYNC_ENGINE, future=True, expire_on_commit=False,
+)
+
+
 def _sync_session() -> sessionmaker:
-    """Build a sync sessionmaker against the same DB the async sessions use."""
-    sync_url = settings.SYNC_DATABASE_URL
-    engine = create_engine(sync_url, pool_pre_ping=True, future=True)
-    return sessionmaker(bind=engine, future=True, expire_on_commit=False)
+    """Return the shared sync sessionmaker (single reused engine — no leak)."""
+    return _FIG_SESSIONMAKER
 
 
 def _update_job(session: Session, job_id: UUID, **fields: Any) -> None:

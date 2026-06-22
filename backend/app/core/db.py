@@ -20,8 +20,16 @@ class Base(DeclarativeBase):
 engine = create_async_engine(
     settings.DATABASE_URL,
     pool_pre_ping=True,
-    pool_size=10,
-    max_overflow=20,
+    # Small bounded pool. There are MANY engines in this app (this async one
+    # per uvicorn worker, plus sync engines in heartbeat/watchdog/qa/extract/
+    # claude — each created in every uvicorn AND every Celery worker child).
+    # Their pools SUM against Postgres's max_connections; oversized pools
+    # exhaust it under concurrent load and new connections block → the worker
+    # hangs silently. Keep each pool tight + fail-fast instead of blocking.
+    pool_size=5,
+    max_overflow=5,
+    pool_timeout=20,
+    pool_recycle=1800,
     future=True,
 )
 

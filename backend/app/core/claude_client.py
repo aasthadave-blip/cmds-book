@@ -19,6 +19,7 @@ logger = logging.getLogger(__name__)
 
 _client: AsyncAnthropic | None = None
 _client_key: str | None = None  # track which key the cached client was built with
+_keylookup_engine = None  # cached engine for the key lookup (created once)
 
 
 def _resolve_api_key() -> str | None:
@@ -39,8 +40,16 @@ def _resolve_api_key() -> str | None:
     from app.models.user_provider_key import UserProviderKey
 
     try:
-        engine = create_engine(settings.SYNC_DATABASE_URL, pool_pre_ping=True)
-        with Session(engine) as session:
+        # Cache the engine module-level — the old code built a NEW engine on
+        # every call (and never disposed it), leaking a connection pool per
+        # Claude-key lookup.
+        global _keylookup_engine
+        if _keylookup_engine is None:
+            _keylookup_engine = create_engine(
+                settings.SYNC_DATABASE_URL, pool_pre_ping=True,
+                pool_size=1, max_overflow=2, pool_timeout=10, pool_recycle=900,
+            )
+        with Session(_keylookup_engine) as session:
             row = session.execute(
                 select(UserProviderKey).where(
                     UserProviderKey.user_id == DEV_USER_ID,

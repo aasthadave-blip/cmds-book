@@ -30,7 +30,11 @@ from app.models.job import Job
 
 logger = logging.getLogger(__name__)
 
-_engine = create_engine(settings.SYNC_DATABASE_URL, pool_pre_ping=True)
+_engine = create_engine(
+    settings.SYNC_DATABASE_URL,
+    pool_pre_ping=True,
+    pool_size=2, max_overflow=3, pool_timeout=10, pool_recycle=900,
+)
 _HeartbeatSession = sessionmaker(bind=_engine, class_=Session, autoflush=False)
 
 

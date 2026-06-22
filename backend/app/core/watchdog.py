@@ -141,7 +141,11 @@ _STAGE_RETRY_ATTR = {
 MAX_CRASH_REDRIVES = 5
 
 
-_engine = create_engine(settings.SYNC_DATABASE_URL, pool_pre_ping=True)
+_engine = create_engine(
+    settings.SYNC_DATABASE_URL,
+    pool_pre_ping=True,
+    pool_size=2, max_overflow=3, pool_timeout=10, pool_recycle=900,
+)
 _WatchdogSession = sessionmaker(bind=_engine, class_=Session, autoflush=False)
 
 

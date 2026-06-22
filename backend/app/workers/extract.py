@@ -43,7 +43,11 @@ from app.workers.runner import register as register_task
 
 logger = logging.getLogger(__name__)
 
-_sync_engine = create_engine(settings.SYNC_DATABASE_URL, pool_pre_ping=True)
+_sync_engine = create_engine(
+    settings.SYNC_DATABASE_URL,
+    pool_pre_ping=True,
+    pool_size=5, max_overflow=5, pool_timeout=20, pool_recycle=900,
+)
 SyncSession = sessionmaker(bind=_sync_engine, class_=Session, autoflush=False)
 
 

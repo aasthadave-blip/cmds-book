@@ -213,7 +213,11 @@ async def _do_recover_orphaned_jobs() -> None:
     from app.models.regeneration import Regeneration
     from app.workers.runner import dispatch
 
-    sync_engine = create_engine(settings.SYNC_DATABASE_URL, pool_pre_ping=True)
+    sync_engine = create_engine(
+        settings.SYNC_DATABASE_URL,
+        pool_pre_ping=True,
+        pool_size=2, max_overflow=2, pool_timeout=10, pool_recycle=900,
+    )
     SyncSession = sessionmaker(bind=sync_engine, class_=Session, autoflush=False)
 
     recovered = 0

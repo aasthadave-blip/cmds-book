@@ -46,7 +46,11 @@ logger = logging.getLogger(__name__)
 # Sync SQLAlchemy session for Celery tasks (mirror of the pattern in
 # workers/extract.py). The shared async session in app.core.db isn't
 # usable inside Celery's synchronous task functions.
-_sync_engine = create_engine(settings.SYNC_DATABASE_URL, pool_pre_ping=True)
+_sync_engine = create_engine(
+    settings.SYNC_DATABASE_URL,
+    pool_pre_ping=True,
+    pool_size=3, max_overflow=4, pool_timeout=15, pool_recycle=900,
+)
 SyncSession = sessionmaker(bind=_sync_engine, class_=Session, autoflush=False)
 
 
