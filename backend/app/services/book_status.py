@@ -54,8 +54,18 @@ def derive_book_status(book: Book) -> str:
     existing book.status unchanged — don't retroactively reclassify
     pre-v2 books as 'queued' when they're already in their final state.
     """
+    # 'needs_review' is a TERMINAL schema state — the schema IS built, just
+    # flagged for optional human review (the orchestrator's coordinator even
+    # auto-heals needs_review→done once downstream stages finish). Treat it as
+    # done-equivalent here. Without this, a fully-extracted book whose schema is
+    # 'needs_review' never satisfies the all-'done' check below, so it hangs at
+    # "processing" forever — never flips to "ready", and the UI never shows the
+    # "View extracted / Regenerate" CTAs even though every stage is complete.
+    schema_status = (
+        "done" if book.schema_status == "needs_review" else book.schema_status
+    )
     stages = (
-        book.schema_status,
+        schema_status,
         book.theory_status,
         book.questions_status,
         book.figures_status,
