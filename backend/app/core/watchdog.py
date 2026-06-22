@@ -81,10 +81,22 @@ ORCH_LOCK_TIMEOUT_MIN = 10
 RECONCILE_BATCH = 5
 MAX_RECOVERY_ATTEMPTS = 5
 
-# In-flight book.status values the reconciler is allowed to touch. NEVER
-# includes terminal states (ready/failed/partial) or schema_ready (which
-# covers schema_status == 'done' awaiting approval AND needs_review).
-_INFLIGHT_STATUSES = ("analysing", "extracting", "processing")
+# In-flight book.status values the reconciler is allowed to touch.
+#
+# `schema_ready` was originally excluded because it could mean "user needs
+# to approve" (needs_review path). But in practice, the orchestrator's
+# coordinator AUTO-ADVANCES books with schema_status in ('done','needs_review')
+# straight to theory dispatch — there is no user-approval gate in code.
+#
+# The architectural gap: analyser worker fires the coordinator via Celery
+# dispatch, but that one message can be lost (broker hiccup, container
+# restart in the ack window, queue purge). When lost, the book sits at
+# schema_ready forever because the reconciler never sees it.
+#
+# Including schema_ready here closes the gap: the reconciler will re-fire
+# the coordinator within ~15 min, which then auto-advances the book.
+# Terminal states (ready/failed/partial) remain excluded.
+_INFLIGHT_STATUSES = ("analysing", "extracting", "processing", "schema_ready")
 
 
 _engine = create_engine(settings.SYNC_DATABASE_URL, pool_pre_ping=True)
