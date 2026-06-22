@@ -621,6 +621,86 @@ def _drive_active_books() -> int:
     return driven
 
 
+# Job / book statuses at which a still-running worker task is a ZOMBIE.
+_TERMINAL_JOB_STATUSES = frozenset(
+    {"cancelled", "succeeded", "failed", "done", "error", "completed"}
+)
+_TERMINAL_BOOK_STATUSES = frozenset({"cancelled", "failed", "ready", "partial"})
+
+
+def _reap_zombie_tasks() -> int:
+    """Automatically kill redelivered zombie tasks — no cancel-all needed.
+
+    Celery's crash-safety settings (task_acks_late + task_reject_on_worker_lost)
+    REDELIVER every task that was in-flight at a container restart. For a book
+    that has since been cancelled / failed / completed, that redelivered task
+    re-runs its full multi-minute extraction, saturates the worker, and blocks
+    fresh uploads ("queued — waiting for worker"). This reaps exactly those.
+
+    How it stays surgical (zero false positives):
+      • Stage tasks are dispatched with Celery task_id == Job id (see
+        runner.dispatch), so the active task's id IS its job id.
+      • A LEGIT running task → its job is still 'running'/'queued' → skipped.
+      • A ZOMBIE → its job is already terminal (the original run finished or was
+        cancelled) AND its book is terminal → killed.
+      • A regen / coordinator / verify task → its id is NOT a job id → the
+        lookup misses → skipped. So live regen work is never touched.
+
+    Runs every watchdog tick. No-op inline or when the worker doesn't answer.
+    """
+    if settings.TASK_EXECUTOR != "celery":
+        return 0
+    try:
+        from app.workers.celery_app import celery_app
+
+        active = celery_app.control.inspect(timeout=5).active() or {}
+    except Exception as e:  # broker hiccup / worker busy — try again next tick
+        logger.debug("reaper: inspect failed: %s", e)
+        return 0
+
+    task_ids = [
+        t.get("id")
+        for tasks in active.values()
+        for t in (tasks or [])
+        if t.get("id")
+    ]
+    if not task_ids:
+        return 0
+
+    from uuid import UUID
+
+    from app.models.book import Book
+
+    reaped = 0
+    with _WatchdogSession() as session:
+        for tid in task_ids:
+            try:
+                job_uuid = UUID(str(tid))
+            except (ValueError, TypeError):
+                continue  # not a job-keyed task (regen/coordinator/verify) → leave it
+            job = session.get(Job, job_uuid)
+            if job is None or job.status not in _TERMINAL_JOB_STATUSES:
+                continue  # legit in-flight task → leave it running
+            # Job terminal but task still executing. Confirm the book is also
+            # terminal before killing, so we never cut the tail of a task that
+            # just marked its job done while the book is still finalizing.
+            book = session.get(Book, job.book_id) if job.book_id else None
+            if book is not None and book.status not in _TERMINAL_BOOK_STATUSES:
+                continue
+            try:
+                celery_app.control.revoke(str(tid), terminate=True, signal="SIGTERM")
+                reaped += 1
+                logger.info(
+                    "reaper: killed zombie task=%s (job.status=%s book.status=%s)",
+                    tid, job.status, book.status if book else "deleted",
+                )
+            except Exception as e:
+                logger.warning("reaper: revoke failed task=%s: %s", tid, e)
+    if reaped:
+        logger.info("reaper: killed %d zombie task(s) this tick", reaped)
+    return reaped
+
+
 async def watchdog_loop() -> None:
     """Run forever, polling every CHECK_INTERVAL_S. Cancelled on shutdown.
 
@@ -648,6 +728,12 @@ async def watchdog_loop() -> None:
             await asyncio.to_thread(_scan_once)
         except Exception:
             logger.exception("watchdog scan failed")
+        # Phase 3: kill redelivered zombie tasks whose book/job is already
+        # terminal — the automatic replacement for manual cancel-all purges.
+        try:
+            await asyncio.to_thread(_reap_zombie_tasks)
+        except Exception:
+            logger.exception("watchdog reaper failed")
         try:
             await asyncio.sleep(CHECK_INTERVAL_S)
         except asyncio.CancelledError:
