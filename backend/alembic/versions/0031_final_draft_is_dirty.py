@@ -21,13 +21,17 @@ depends_on: Union[str, Sequence[str], None] = None
 
 
 def upgrade() -> None:
+    # server_default must be the SQL literal "false", not "0". SQLite is
+    # permissive (reads "0" as Boolean false), but PostgreSQL is strict —
+    # `boolean DEFAULT 0` raises DatatypeMismatch on the prod deploy.
+    # sa.text("false") works for both dialects.
     op.add_column(
         "final_drafts",
         sa.Column(
             "is_dirty",
             sa.Boolean(),
             nullable=False,
-            server_default=sa.text("0"),
+            server_default=sa.text("false"),
         ),
     )
 
