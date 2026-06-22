@@ -707,6 +707,7 @@ export function useExtractionPipeline(): UseExtractionPipeline {
             return 'unknown';
           };
           const bk = book as BackendBookOut & {
+            schema_status?: string;
             theory_status?: string;
             questions_status?: string;
             figures_status?: string;
@@ -714,6 +715,29 @@ export function useExtractionPipeline(): UseExtractionPipeline {
 
           apply((prev) => {
             const patch: Partial<ExtractionState> = { bookStatus: book.status };
+            // Schema — driven by book.schema_status when the client holds no
+            // schema jobId. This is the COMMON path: the backend auto-analyses
+            // on upload (no client POST → no jobId), and every page revisit
+            // re-attaches without one. Without this sync the Schema row sat at
+            // 0%/blank/"queued" while schema was actually running on the
+            // backend — the "BUILDING SCHEMA 0%, refresh-to-see-it" bug.
+            // 'needs_review' means the schema IS built (just flagged), so it
+            // counts as done. Mirrors the theory/questions/figures sync below.
+            const scStatus =
+              bk.schema_status === 'needs_review'
+                ? 'done'
+                : mapStage(bk.schema_status);
+            if (!prev.schema.jobId) {
+              if (scStatus === 'done' && prev.schema.status !== 'done') {
+                patch.schema = { ...prev.schema, status: 'done', progress: 100, message: 'Schema built' };
+              } else if (scStatus === 'failed' && prev.schema.status !== 'failed') {
+                patch.schema = { ...prev.schema, status: 'failed', error: 'Schema build failed' };
+              } else if (scStatus === 'running' && prev.schema.status !== 'running' && prev.schema.status !== 'done') {
+                patch.schema = { ...prev.schema, status: 'running', message: 'Building schema…', lastProgressAt: Date.now() };
+              } else if (scStatus === 'queued' && prev.schema.status === 'unknown') {
+                patch.schema = { ...prev.schema, status: 'queued', message: 'Queued — waiting for worker' };
+              }
+            }
             // Theory — driven by book.theory_status when no client-side
             // jobId (server auto-proceed path). Without the 'running'
             // branch, theoryActive (line ~815) never goes true on
@@ -1149,9 +1173,19 @@ export function useExtractionPipeline(): UseExtractionPipeline {
         }
       } else if (book.status === 'analysing') {
         // Backend is still analysing. We don't know the job_id so we can't
-        // poll directly — but the next tick will check book.status again
-        // and pick up the transition via repeated GET /api/books/:id.
-        apply(() => ({ phase: 'analysing' }));
+        // poll directly — the tick's book-poll syncs book.schema_status.
+        // Seed the Schema row to 'running' NOW so a (re)visit shows live
+        // status immediately instead of a blank 0% flash before the first
+        // poll returns.
+        apply((prev) => ({
+          phase: 'analysing',
+          schema: {
+            ...prev.schema,
+            status: 'running',
+            message: 'Building schema…',
+            lastProgressAt: Date.now(),
+          },
+        }));
         dbg('book is already analysing; no jobId tracked — will detect transition by polling book');
       } else if (book.status === 'schema_ready') {
         // First-time path — use /approve.
