@@ -47,6 +47,19 @@ CHECK_INTERVAL_S = 60
 # zero heartbeat is unambiguous.
 STALE_AFTER_S = 900
 
+# A QUEUED job is "zombie" if it's been sitting in `queued` (never started)
+# for longer than this. In prod (Celery+Redis) this happens when:
+#   • a worker died after acking the Celery message but before starting work
+#   • the dispatch landed in Redis but no worker is consuming (broker hiccup,
+#     container restart between dispatch and pickup, queue saturation)
+# The original watchdog only killed RUNNING jobs with stale heartbeats — a
+# job stuck in `queued` has neither started_at nor heartbeat, so it slipped
+# through and shielded the book from reconciliation (reconciler skips books
+# that have ANY queued/running job). 5 minutes is comfortably longer than a
+# legitimate queue wait, and short enough that the next reconciler scan
+# (~60s later) actually re-drives the book.
+QUEUE_STALE_AFTER_S = 300
+
 # ORCH Day 11 — how long to wait before force-releasing an
 # extraction_lock_at. Matches MAX orchestrator lock timeout
 # (workers/orchestrator.py:LOCK_TIMEOUT_MIN). 5 min after watchdog
@@ -81,8 +94,41 @@ _WatchdogSession = sessionmaker(bind=_engine, class_=Session, autoflush=False)
 def _scan_once() -> int:
     """Mark stale running jobs as failed. Returns count killed."""
     cutoff = datetime.now(timezone.utc) - timedelta(seconds=STALE_AFTER_S)
+    queue_cutoff = datetime.now(timezone.utc) - timedelta(seconds=QUEUE_STALE_AFTER_S)
     killed = 0
     with _WatchdogSession() as session:
+        # ── Fix A — zombie QUEUED jobs ──────────────────────────────────
+        # A job stuck in `queued` past QUEUE_STALE_AFTER_S means no Celery
+        # worker ever picked it up (broker hiccup, container restart in the
+        # ack window, or queue saturation). Without killing these, the
+        # reconciler's "has_live_job" check stays True and the book never
+        # gets re-driven. Failing them here frees the reconciler to act on
+        # its next scan (within ~60s).
+        stale_queued = session.execute(
+            select(Job).where(
+                Job.status == "queued",
+                Job.created_at < queue_cutoff,
+                Job.finished_at.is_(None),
+            )
+        ).scalars().all()
+        for job in stale_queued:
+            created_at = job.created_at
+            if created_at and created_at.tzinfo is None:
+                created_at = created_at.replace(tzinfo=timezone.utc)
+            age_s = int((datetime.now(timezone.utc) - created_at).total_seconds()) if created_at else -1
+            job.status = "failed"
+            job.finished_at = datetime.now(timezone.utc)
+            job.error = (
+                f"Watchdog: queued for {age_s}s with no worker pick-up "
+                f"(threshold {QUEUE_STALE_AFTER_S}s). Likely Celery worker "
+                "died or broker hiccup. Reconciler will re-drive the book."
+            )
+            killed += 1
+            logger.warning(
+                "watchdog killed zombie queued job %s type=%s age=%ss book=%s",
+                job.id, job.type, age_s, job.book_id,
+            )
+
         rows = session.execute(
             select(Job).where(
                 Job.status == "running",
@@ -277,11 +323,45 @@ def _reconcile_stalled_books(session) -> int:
         if acted >= RECONCILE_BATCH:
             break  # anti-thundering-herd — leave the rest for next scan
 
-        # Skip if a live Job exists (legitimate in-flight work).
+        # ── Fix B — heartbeat-aware liveness check ──────────────────────
+        # A Job row in queued/running is treated as "live work" ONLY if it
+        # is FRESH (running with a recent heartbeat, OR queued within the
+        # last QUEUE_STALE_AFTER_S). Without this, a zombie queued Job
+        # (worker never picked it up) made the book look in-flight and the
+        # reconciler skipped it forever. Fix A above will eventually kill
+        # the zombie, but this guard makes the reconciler immune even if
+        # _scan_once hasn't run yet.
+        from sqlalchemy import or_, and_
+        heartbeat_cutoff = datetime.now(timezone.utc) - timedelta(seconds=180)
+        queued_freshness_cutoff = (
+            datetime.now(timezone.utc) - timedelta(seconds=QUEUE_STALE_AFTER_S)
+        )
         has_live_job = session.execute(
             select(Job).where(
                 Job.book_id == book.id,
                 Job.status.in_(["queued", "running"]),
+                or_(
+                    # Running job with a recent heartbeat → genuinely alive.
+                    and_(
+                        Job.status == "running",
+                        Job.last_heartbeat_at.is_not(None),
+                        Job.last_heartbeat_at > heartbeat_cutoff,
+                    ),
+                    # Running job without heartbeat but started recently
+                    # (the heartbeat hasn't ticked yet on the first cycle).
+                    and_(
+                        Job.status == "running",
+                        Job.last_heartbeat_at.is_(None),
+                        Job.started_at.is_not(None),
+                        Job.started_at > heartbeat_cutoff,
+                    ),
+                    # Queued job that's still fresh (likely will be picked
+                    # up imminently). Anything older is a zombie.
+                    and_(
+                        Job.status == "queued",
+                        Job.created_at > queued_freshness_cutoff,
+                    ),
+                ),
             ).limit(1)
         ).scalars().first()
         if has_live_job is not None:
