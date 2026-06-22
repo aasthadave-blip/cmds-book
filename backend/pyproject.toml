@@ -41,6 +41,13 @@ dependencies = [
     "pypandoc-binary>=1.13",
     "latex2mathml>=3.81.0",
     "mathml2omml>=0.0.2",
+    # LaTeX → rendered-Unicode normalization for figure anchor matching
+    # (figure_normalizer.py). Used transitively by the theory, questions, and
+    # figures stages — was imported in code but never declared here, so the
+    # clean prod container build (pip install -e .) shipped WITHOUT it and
+    # every post-schema stage crashed with ModuleNotFoundError: No module
+    # named 'pylatexenc'. That was the root cause of "no book extracts in prod".
+    "pylatexenc>=2.10",
     # SVG → PNG rasterization for embedding regenerated diagrams in Word.
     # Primary backend (needs system libcairo2 on Linux/prod). The resvg
     # standalone binary is the dependency-free fallback (see svg_raster.py).
