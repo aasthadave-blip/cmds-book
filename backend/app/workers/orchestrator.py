@@ -407,8 +407,15 @@ def _dispatch_theory(session, book: Book) -> None:
     job_id = _new_job(session, book.id, "extract")
     book.status = "extracting"
     session.commit()
-    from app.workers.runner import dispatch
+    from datetime import datetime, timezone
+    from app.workers.runner import dispatch, dispatch_after
     dispatch("extract_book", str(book.id), str(job_id))
+    # Self-verify: if the dispatch was lost, this re-fires the coordinator
+    # 60s later. Worker-side CAS makes duplicate dispatches a no-op.
+    dispatch_after(
+        "verify_dispatch", _VERIFY_DELAY_S,
+        str(book.id), "theory", datetime.now(timezone.utc).isoformat(),
+    )
     logger.info(
         "orchestrator: dispatched extract_book book=%s job=%s",
         book.id, job_id,
@@ -493,10 +500,15 @@ def _dispatch_questions(session, book: Book) -> None:
     book.status = "extracting"
     session.commit()
 
-    from app.workers.runner import dispatch
+    from datetime import datetime, timezone
+    from app.workers.runner import dispatch, dispatch_after
     dispatch(
         "extract_questions_v3",
         str(book.id), str(bank_id), str(job_id),
+    )
+    dispatch_after(
+        "verify_dispatch", _VERIFY_DELAY_S,
+        str(book.id), "questions", datetime.now(timezone.utc).isoformat(),
     )
     logger.info(
         "orchestrator: dispatched extract_questions_v3 for book=%s "
@@ -515,8 +527,13 @@ def _dispatch_figures(session, book: Book) -> None:
     job_id = _new_job(session, book.id, "extract_figures")
     book.status = "extracting"
     session.commit()
-    from app.workers.runner import dispatch
+    from datetime import datetime, timezone
+    from app.workers.runner import dispatch, dispatch_after
     dispatch("extract_figures_v2", str(book.id), str(job_id))
+    dispatch_after(
+        "verify_dispatch", _VERIFY_DELAY_S,
+        str(book.id), "figures", datetime.now(timezone.utc).isoformat(),
+    )
     logger.info(
         "orchestrator: dispatched extract_figures_v2 book=%s job=%s",
         book.id, job_id,
@@ -690,9 +707,140 @@ def coordinate_extraction_task(self, book_id: str) -> dict:
     return _coordinate_extraction(book_id)
 
 
+# ───────────────────────────────────────────────────────────────────
+# Tier 2 self-verifying dispatch — see watchdog.py header for context.
+#
+# After every stage dispatch (_dispatch_theory / _dispatch_questions /
+# _dispatch_figures), the orchestrator schedules a verify_dispatch task
+# to fire 60s later. It re-checks the book's stage status:
+#
+#   • If the stage advanced past `pending`  → worker picked it up, no-op.
+#   • If a fresh Job row exists for the stage → worker is about to start,
+#     no-op (avoid racing the worker's CAS).
+#   • Otherwise → the dispatch was lost. Re-dispatch the coordinator
+#     (which will atomically re-fire the stage). Bounded to 2 retries to
+#     avoid infinite loops; the watchdog catches anything beyond that.
+#
+# Idempotency: this is safe to call multiple times for the same dispatch
+# because workers use atomic CAS (UPDATE … WHERE stage_status='pending')
+# on entry — only the first arriving worker for a stage flips it to
+# `running` and proceeds. All subsequent dispatches see status!='pending'
+# at the CAS step and exit immediately, doing zero work.
+# ───────────────────────────────────────────────────────────────────
+
+_VERIFY_MAX_ATTEMPTS = 3            # initial + 2 re-verifies
+_VERIFY_DELAY_S = 60.0              # 60s after dispatch
+_FRESH_JOB_WINDOW_S = 90            # a Job created in the last 90s = "fresh"
+
+# Per-stage mapping: stage name → (status attribute, dispatched task name)
+_STAGE_TO_TASK = {
+    "theory": ("theory_status", "extract_book"),
+    "questions": ("questions_status", "extract_questions_v3"),
+    "figures": ("figures_status", "extract_figures_v2"),
+}
+
+
+def _verify_dispatch(book_id: str, stage: str, dispatched_at_iso: str,
+                     attempt: int = 1) -> dict:
+    """Verify that a stage dispatch was picked up by a worker.
+
+    Called 60s after `_dispatch_theory/_questions/_figures` fires its
+    Celery message. If the stage's status is still `pending` AND no
+    fresh Job row exists, the dispatch was lost — re-fire the coordinator
+    so the state machine can dispatch the stage again. Idempotent: see
+    the CAS guard at each worker's entry point — duplicate dispatches
+    are safe.
+
+    Returns a dict for logging; does not raise.
+    """
+    from datetime import datetime, timezone, timedelta
+    from sqlalchemy import select
+    from app.models.book import Book
+    from app.models.job import Job
+
+    if stage not in _STAGE_TO_TASK:
+        return {"ok": False, "error": f"unknown stage: {stage}"}
+    status_attr, task_type = _STAGE_TO_TASK[stage]
+
+    try:
+        dispatched_at = datetime.fromisoformat(dispatched_at_iso)
+    except (TypeError, ValueError):
+        return {"ok": False, "error": "bad dispatched_at"}
+    if dispatched_at.tzinfo is None:
+        dispatched_at = dispatched_at.replace(tzinfo=timezone.utc)
+
+    with SyncSession() as session:
+        book = session.get(Book, book_id)
+        if book is None:
+            return {"ok": False, "error": "book vanished"}
+
+        stage_status = getattr(book, status_attr, None)
+
+        # ─── Already advanced — worker picked it up ─────────────
+        if stage_status != _PENDING:
+            logger.info(
+                "verify_dispatch: book=%s stage=%s status=%s (advanced) — no-op",
+                book_id, stage, stage_status,
+            )
+            return {"ok": True, "no_op": True, "reason": f"status={stage_status}"}
+
+        # ─── Fresh Job exists — worker about to start ─────────────
+        now = datetime.now(timezone.utc)
+        fresh_cutoff = now - timedelta(seconds=_FRESH_JOB_WINDOW_S)
+        fresh_job = session.execute(
+            select(Job).where(
+                Job.book_id == book_id,
+                Job.type == task_type,
+                Job.created_at > fresh_cutoff,
+            ).order_by(Job.created_at.desc()).limit(1)
+        ).scalars().first()
+        if fresh_job is not None:
+            logger.info(
+                "verify_dispatch: book=%s stage=%s fresh_job=%s — no-op",
+                book_id, stage, fresh_job.id,
+            )
+            return {"ok": True, "no_op": True, "reason": "fresh_job"}
+
+        # ─── Bounded retries — give up after 3 attempts ─────────
+        if attempt >= _VERIFY_MAX_ATTEMPTS:
+            logger.warning(
+                "verify_dispatch: book=%s stage=%s attempt=%d — giving up "
+                "(watchdog will catch via zombie-job sweep)",
+                book_id, stage, attempt,
+            )
+            return {"ok": True, "gave_up": True}
+
+        # ─── Genuinely dropped — re-fire the coordinator ────────
+        logger.warning(
+            "verify_dispatch: book=%s stage=%s status=pending, no fresh job "
+            "after %ds → re-dispatching coordinator (attempt %d/%d)",
+            book_id, stage, _FRESH_JOB_WINDOW_S, attempt, _VERIFY_MAX_ATTEMPTS,
+        )
+
+    # Re-fire OUTSIDE the session block.
+    from app.workers.runner import dispatch, dispatch_after
+    dispatch("coordinate_extraction", book_id)
+    # Schedule the next verify pass; CAS at the worker entry keeps this safe.
+    dispatch_after(
+        "verify_dispatch", _VERIFY_DELAY_S,
+        book_id, stage,
+        datetime.now(timezone.utc).isoformat(),
+        attempt + 1,
+    )
+    return {"ok": True, "redispatched": True, "attempt": attempt}
+
+
+@celery_app.task(name="verify_dispatch", bind=True)
+def verify_dispatch_task(
+    self, book_id: str, stage: str, dispatched_at_iso: str, attempt: int = 1,
+) -> dict:
+    return _verify_dispatch(book_id, stage, dispatched_at_iso, attempt)
+
+
 # Inline-mode registration — runner.dispatch("coordinate_extraction", ...)
 # resolves to this. Without it, inline mode (default when Redis is a
 # stub) raises "Inline task not registered".
 from app.workers.runner import register as register_task  # noqa: E402
 
 register_task("coordinate_extraction", _coordinate_extraction)
+register_task("verify_dispatch", _verify_dispatch)

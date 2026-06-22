@@ -49,3 +49,38 @@ def dispatch(name: str, *args: Any, **kwargs: Any) -> None:
     from app.workers.celery_app import celery_app
 
     celery_app.send_task(name, args=list(args), kwargs=kwargs)
+
+
+def dispatch_after(name: str, delay_s: float, *args: Any, **kwargs: Any) -> None:
+    """Schedule a task to run after ``delay_s`` seconds.
+
+    Used for self-verifying dispatches: after firing a stage worker, we schedule
+    a verify task ``delay_s`` later to confirm the stage actually picked up. If
+    not, the verify re-dispatches. See ``verify_dispatch`` in orchestrator.py.
+
+    - Inline mode: ``threading.Timer`` fires the registered function on a daemon
+      thread after the delay.
+    - Celery mode: ``send_task(countdown=delay_s)`` — Celery natively supports
+      delayed delivery via its broker.
+    """
+    if settings.TASK_EXECUTOR == "inline":
+        fn = _REGISTRY.get(name)
+        if fn is None:
+            raise RuntimeError(f"Inline task not registered: {name}")
+
+        def target() -> None:
+            try:
+                fn(*args, **kwargs)
+            except Exception:
+                logger.exception("Inline scheduled task %s raised", name)
+
+        timer = threading.Timer(delay_s, target)
+        timer.daemon = True
+        timer.start()
+        return
+
+    from app.workers.celery_app import celery_app
+
+    celery_app.send_task(
+        name, args=list(args), kwargs=kwargs, countdown=delay_s,
+    )
