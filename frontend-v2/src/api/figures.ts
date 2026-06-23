@@ -22,6 +22,14 @@ export type Figure = {
   has_regen: boolean;
   context_hint: string | null;
   is_approved: boolean;
+  // Regen bookkeeping. `engine` ("table_embed" | "vector" | "image") records
+  // which engine produced the current regen variant; `source` is its provenance.
+  regen_meta: {
+    engine?: string;
+    source?: string;
+    graphics_embedded?: number;
+    [k: string]: unknown;
+  } | null;
 };
 
 export type SectionFigures = {
@@ -51,6 +59,14 @@ export const getBookFigures = (bookId: string) =>
 export const figureImageUrl = (figureId: string, regen = false) =>
   `${API_BASE}/api/figures/${figureId}/image${regen ? '?variant=regenerated' : ''}`;
 
+// Explicit ORIGINAL-variant URL — never auto-upgraded to the regen variant.
+// The compare modal's "Original" pane must use this: figureImageUrl(id, false)
+// omits the variant param, which the backend resolves as `auto` and serves the
+// regen bytes when an approved regen variant exists — making both panes show
+// the regenerated image.
+export const figureOriginalImageUrl = (figureId: string) =>
+  `${API_BASE}/api/figures/${figureId}/image?variant=original`;
+
 // Per-section figure regen — POSTs to backend with optional custom instructions.
 // Backend dispatches an async worker. Caller should refetch figures after.
 export const regenerateSectionFigures = (
@@ -70,17 +86,24 @@ export const regenerateSectionFigures = (
 export const regenerateFigureDiagram = (
   figureId: string,
   customInstructions?: string | null,
+  // Engine override. "auto" (default) routes by semantic_type, matching the
+  // automatic pipeline; pass an explicit engine to force one.
+  engine: 'auto' | 'vector' | 'table_embed' | 'image' = 'auto',
 ) =>
   req<{
     ok: boolean;
     fallback?: boolean;
     figure_id: string;
+    engine?: string;
     subject?: string;
     description?: string;
     message?: string;
   }>(`/api/figures/${figureId}/regenerate-diagram`, {
     method: 'POST',
-    body: JSON.stringify({ custom_instructions: customInstructions ?? null }),
+    body: JSON.stringify({
+      custom_instructions: customInstructions ?? null,
+      engine,
+    }),
   });
 
 // On-demand "Redraw cleanly" for ONE figure — the image-model raster redraw

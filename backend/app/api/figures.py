@@ -474,8 +474,14 @@ async def discard_figure_regen(
 
 
 class FigureDiagramRegenRequest(BaseModel):
-    """Body for the manual theory-figure LaTeX/SVG regeneration."""
+    """Body for the manual figure regeneration.
+
+    ``engine`` selects the regeneration engine; ``auto`` picks by the figure's
+    semantic_type (table → vector grid + embedded graphic; diagram/chart →
+    LaTeX/SVG vector; illustration/photo → image-model redraw).
+    """
     custom_instructions: str | None = Field(default=None, max_length=2000)
+    engine: str = Field(default="auto", pattern="^(auto|vector|table_embed|image)$")
 
 
 @figures_router.post("/{figure_id}/regenerate-diagram")
@@ -484,10 +490,10 @@ async def regenerate_figure_diagram(
     payload: FigureDiagramRegenRequest = Body(default_factory=FigureDiagramRegenRequest),
     session: AsyncSession = Depends(get_session),
 ) -> dict:
-    """Manually regenerate a THEORY figure as clean LaTeX/SVG aligned to the
-    regenerated theory (same engine as question diagrams). On-demand only — the
-    figure is never auto-updated. On success the rasterized PNG is stored as the
-    figure's approved regen variant, so Preview/Composer/Export reflect it.
+    """Manually regenerate a figure with engine routing. On-demand only — the
+    figure is never auto-updated here. On success the rasterized/regenerated PNG
+    is stored as the figure's approved regen variant, so Preview/Composer/Export
+    reflect it. ``engine=auto`` (default) mirrors the automatic pipeline routing.
     """
     fig = await session.get(Figure, figure_id)
     if fig is None:
@@ -497,11 +503,35 @@ async def regenerate_figure_diagram(
     if not fig.image_bytes:
         raise HTTPException(400, detail="Figure has no source image to regenerate")
 
-    from app.workers.question_regen_v3 import regenerate_theory_figure
-
-    result = await asyncio.to_thread(
-        regenerate_theory_figure, figure_id, payload.custom_instructions
+    from app.workers.question_regen_v3 import (
+        pick_regen_engine,
+        regenerate_table_figure,
+        regenerate_theory_figure,
     )
+
+    engine = payload.engine
+    if engine == "auto":
+        engine = pick_regen_engine(fig)
+
+    if engine == "table_embed":
+        result = await asyncio.to_thread(
+            regenerate_table_figure, figure_id, payload.custom_instructions
+        )
+    elif engine == "image":
+        from app.workers.figures_tasks import redraw_single_figure
+
+        result = await asyncio.to_thread(
+            redraw_single_figure,
+            figure_id,
+            style="enhanced",
+            custom_instructions=payload.custom_instructions,
+        )
+    else:  # vector
+        result = await asyncio.to_thread(
+            regenerate_theory_figure, figure_id, payload.custom_instructions
+        )
+    if isinstance(result, dict):
+        result.setdefault("engine", engine)
     err = result.get("_error") if isinstance(result, dict) else "failed"
     if err == "fallback":
         # The model judged the figure too complex to vectorize — original kept.

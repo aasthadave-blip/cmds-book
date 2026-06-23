@@ -6,6 +6,7 @@ import { useState } from 'react';
 import { Icon } from '../Icon';
 import {
   figureImageUrl,
+  figureOriginalImageUrl,
   regenerateFigureDiagram,
   redrawFigure,
   approveFigure,
@@ -340,6 +341,38 @@ function FigureCard({
             title="Last regen attempt failed — use Reseed Figures for this section to retry."
           >
             ⚠ regen failed
+          </span>
+        )}
+        {/* Engine badge — which engine produced the current regen variant
+            (table_embed = crisp vector grid + embedded graphic; vector =
+            LaTeX/SVG; image = image-model redraw). */}
+        {f.has_regen && f.regen_meta?.engine && (
+          <span
+            style={{
+              position: 'absolute',
+              bottom: 8,
+              right: 8,
+              fontSize: 10,
+              padding: '3px 8px',
+              border: '1px solid var(--line)',
+              borderRadius: 6,
+              background: 'var(--surface)',
+              color: 'var(--ink-600, #475569)',
+              fontWeight: 600,
+              letterSpacing: '0.03em',
+            }}
+            title={`Regen engine: ${f.regen_meta.engine}${
+              f.regen_meta.engine === 'table_embed' &&
+              typeof f.regen_meta.graphics_embedded === 'number'
+                ? ` · ${f.regen_meta.graphics_embedded} graphic(s) embedded`
+                : ''
+            }`}
+          >
+            {f.regen_meta.engine === 'table_embed'
+              ? 'table'
+              : f.regen_meta.engine === 'vector'
+              ? 'vector'
+              : 'image'}
           </span>
         )}
         {/* ↔ Compare button — only useful when both variants exist */}
@@ -682,7 +715,7 @@ function FigureCard({
                   Original
                 </div>
                 <img
-                  src={figureImageUrl(f.id, false)}
+                  src={figureOriginalImageUrl(f.id)}
                   alt="original"
                   style={{
                     width: '100%',

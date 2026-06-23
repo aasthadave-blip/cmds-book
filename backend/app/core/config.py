@@ -150,6 +150,15 @@ class Settings(BaseSettings):
     EMBED_REGEN_DIAGRAM_IN_DOCX: bool = True
     RESVG_BINARY_PATH: str = ""
 
+    # Engine-aware figure regeneration. When True, figure regen picks an engine
+    # by semantic_type instead of always using the Gemini image model (which
+    # garbles dense text): composite "table" figures get a crisp vector table
+    # with the graphic embedded; diagrams/charts (schematics, flowcharts,
+    # graphic organizers) get the LaTeX/SVG vector engine; illustrations/photos
+    # keep the image-model redraw. Set False to restore the old behavior where
+    # every figure goes through the image model (one-switch rollback).
+    FIGURE_ENGINE_ROUTING_ENABLED: bool = True
+
     # Multi-OCR (Sprint 4; empty by default)
     MATHPIX_APP_ID: str = ""
     MATHPIX_APP_KEY: str = ""

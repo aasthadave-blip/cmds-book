@@ -484,7 +484,25 @@ def _build_diagram_user_prompt(
     highest priority. When the original figure's pixel size is known, we pass it
     so the SVG/LaTeX mirror the source figure's aspect ratio.
     """
-    if mode == "theory":
+    if mode == "table":
+        parts = [
+            "Here is a composite TABLE figure (text + one or more embedded "
+            "graphics) from a textbook, attached as an image. Rebuild ONLY its "
+            "grid structure and text as a crisp vector SVG, transcribing all text "
+            "VERBATIM, and leave each embedded graphic as a {{GRAPHIC_N}} <image> "
+            "placeholder with a reported normalized bbox — exactly per your system "
+            "instructions. Do NOT redraw the graphics yourself.",
+            "",
+            f"TABLE CAPTION / TITLE:\n{sol_text or '(none)'}",
+        ]
+        ctx = (q_text or "").strip()
+        if ctx:
+            parts += [
+                "",
+                "SURROUNDING CONTEXT (for disambiguating labels only — do not add "
+                "any text that is not visible in the table image):\n" + ctx,
+            ]
+    elif mode == "theory":
         parts = [
             "Here is the newly regenerated THEORY content that the attached "
             "figure illustrates. Regenerate the figure as clean LaTeX + a "
@@ -508,21 +526,36 @@ def _build_diagram_user_prompt(
     if source_size:
         w, h = source_size
         aspect = (w / h) if h else 1.0
-        # Suggest a viewBox that keeps the SAME aspect ratio, normalized to a
-        # ~360px-wide canvas (legible when rasterized + embedded in Word).
-        vw = 360
-        vh = max(1, round(360 / aspect)) if aspect else 360
-        parts += [
-            "",
-            "SOURCE FIGURE SIZE — match the book's format: the original diagram "
-            f"is {w}×{h} px (width:height aspect ≈ {aspect:.2f}). Reproduce the "
-            f"SAME shape and proportions: set the SVG to "
-            f'viewBox="0 0 {vw} {vh}" with width="{vw}" height="{vh}", and lay '
-            "out the LaTeX standalone with matching proportions and a small, "
-            "even border — so the regenerated figure occupies the same size "
-            "format as the source. Do NOT stretch or distort to a different "
-            "aspect ratio.",
-        ]
+        if mode == "table":
+            # Tables are text-dense — a narrow canvas clips the prose column. Use
+            # the source's actual pixel dimensions as the viewBox (1 unit = 1 px)
+            # so there is ample room, and demand hard wrapping inside each column.
+            parts += [
+                "",
+                f"CANVAS SIZE — the source table is {w}×{h} px. Set the SVG to "
+                f'viewBox="0 0 {w} {h}" with width="{w}" height="{h}" so 1 unit = 1 '
+                "source pixel. Lay out the grid and cells in these pixel coordinates. "
+                "CRITICAL: keep every text line WELL INSIDE its column — wrap to a new "
+                "<text> line (or <tspan x=… dy=…>) BEFORE the text reaches the column's "
+                "right border, and never let any glyph cross a column divider or the "
+                "outer table border. Leave a small even margin inside each cell.",
+            ]
+        else:
+            # Suggest a viewBox that keeps the SAME aspect ratio, normalized to a
+            # ~360px-wide canvas (legible when rasterized + embedded in Word).
+            vw = 360
+            vh = max(1, round(360 / aspect)) if aspect else 360
+            parts += [
+                "",
+                "SOURCE FIGURE SIZE — match the book's format: the original diagram "
+                f"is {w}×{h} px (width:height aspect ≈ {aspect:.2f}). Reproduce the "
+                f"SAME shape and proportions: set the SVG to "
+                f'viewBox="0 0 {vw} {vh}" with width="{vw}" height="{vh}", and lay '
+                "out the LaTeX standalone with matching proportions and a small, "
+                "even border — so the regenerated figure occupies the same size "
+                "format as the source. Do NOT stretch or distort to a different "
+                "aspect ratio.",
+            ]
     if previous_diagram and (
         previous_diagram.get("latex_code") or previous_diagram.get("svg_preview")
     ):
@@ -551,15 +584,18 @@ def _generate_diagram_blocking(
     custom_instructions: str | None = None,
     previous_diagram: dict[str, Any] | None = None,
     mode: str = "question",
+    system_prompt_name: str = "latex_diagram_generator",
 ) -> dict[str, Any] | None:
     """Synchronous diagram generation (one blocking Gemini call). Shared by the
-    question diagram path and the theory-figure regen (mode="theory")."""
+    question diagram path, the theory-figure regen (mode="theory"), and the
+    composite-table vector rebuild (mode="table", system_prompt_name=
+    "figures/table_structuring_svg")."""
     if not original_image_bytes_list:
         return None
     try:
-        system_prompt = load_raw("latex_diagram_generator")
+        system_prompt = load_raw(system_prompt_name)
     except Exception as e:  # prompt file missing — degrade gracefully
-        logger.warning("latex_diagram_generator prompt unavailable: %s", e)
+        logger.warning("diagram prompt %r unavailable: %s", system_prompt_name, e)
         return None
 
     user_prompt = _build_diagram_user_prompt(
@@ -583,12 +619,16 @@ def _generate_diagram_blocking(
         )
         data = parse_json(raw)
         if isinstance(data, dict):
+            graphics = data.get("graphics")
             return {
                 "fallback_to_original": bool(data.get("fallback_to_original", False)),
                 "subject": str(data.get("subject") or "").strip(),
                 "latex_code": str(data.get("latex_code") or "").strip(),
                 "svg_preview": str(data.get("svg_preview") or "").strip(),
                 "description": str(data.get("description") or "").strip(),
+                # Table path only: list of {"id", "bbox"} graphic regions to crop,
+                # redraw, and embed into the SVG. Empty/absent for diagram paths.
+                "graphics": graphics if isinstance(graphics, list) else [],
             }
     except Exception as e:
         logger.warning("LaTeX diagram generation call failed: %s", e)
@@ -820,6 +860,34 @@ def _theory_context_for_figure(session: Session, fig: Any) -> str:
     return "\n\n".join(parts)[:4500]
 
 
+# ── Engine routing ─────────────────────────────────────────────────────────
+
+# semantic_type → regen engine. Composite "table" figures become a crisp vector
+# grid with the graphic embedded; diagrams/charts (schematics, flowcharts,
+# graphic organizers) go through the LaTeX/SVG vector engine; everything else
+# (realistic illustrations, photos) keeps the image-model redraw — the image
+# model reproduces organic graphics well but garbles dense text.
+_ENGINE_BY_SEMANTIC_TYPE = {
+    "table": "table_embed",
+    "diagram": "vector",
+    "chart": "vector",
+    "illustration": "image",
+    "figure": "image",
+}
+
+
+def pick_regen_engine(fig: Any) -> str:
+    """Choose the regeneration engine for a figure by ``semantic_type``.
+
+    Returns one of ``"table_embed" | "vector" | "image"``. Unknown types fall
+    back to ``"image"`` (the historical default). Callers must still honor
+    ``settings.FIGURE_ENGINE_ROUTING_ENABLED`` — when that flag is off, route
+    everything through the image model regardless of this result.
+    """
+    stype = (getattr(fig, "semantic_type", None) or "").strip().lower()
+    return _ENGINE_BY_SEMANTIC_TYPE.get(stype, "image")
+
+
 def regenerate_theory_figure(
     figure_id: UUID,
     custom_instructions: str | None = None,
@@ -879,6 +947,7 @@ def regenerate_theory_figure(
         meta = dict(fig.regen_meta) if isinstance(fig.regen_meta, dict) else {}
         meta["diagram"] = diagram
         meta["source"] = "theory_latex_diagram"
+        meta["engine"] = "vector"
         meta.pop("discarded", None)
         fig.regen_meta = meta
         flag_modified(fig, "regen_meta")
@@ -886,9 +955,273 @@ def regenerate_theory_figure(
         return {
             "ok": True,
             "figure_id": str(figure_id),
+            "engine": "vector",
             "subject": diagram.get("subject") or "",
             "description": diagram.get("description") or "",
         }
+
+
+def _embed_table_graphics(
+    source_image_bytes: bytes,
+    svg: str,
+    graphics: list[dict[str, Any]],
+    *,
+    redraw: bool = True,
+) -> tuple[str, int]:
+    """Fill each ``{{GRAPHIC_N}}`` placeholder in ``svg`` with an inline base64
+    data URI.
+
+    For every reported graphic region we crop it from the source table image
+    (normalized bbox → pixels), optionally redraw the crop via the image model
+    (``redraw=True``; on failure we keep the faithful crop), and substitute it for
+    its ``{{GRAPHIC_<id>}}`` token. Any placeholder we cannot fill is replaced with
+    a 1×1 transparent pixel so a leftover token never breaks rasterization.
+
+    Returns ``(svg, n_embedded)``.
+    """
+    import base64 as _b64
+    import io as _io
+    import re as _re
+
+    from PIL import Image
+
+    from app.services.figures import regenerator as fig_regen
+
+    def _data_uri(png_bytes: bytes) -> str:
+        return "data:image/png;base64," + _b64.b64encode(png_bytes).decode("ascii")
+
+    n_embedded = 0
+    try:
+        src = Image.open(_io.BytesIO(source_image_bytes)).convert("RGB")
+    except Exception as e:
+        logger.warning("table embed: cannot open source image: %s", e)
+        src = None
+
+    if src is not None:
+        W, H = src.size
+        for g in graphics:
+            if not isinstance(g, dict):
+                continue
+            gid = g.get("id")
+            bbox = g.get("bbox") or {}
+            try:
+                bx0 = float(bbox.get("x0", 0))
+                by0 = float(bbox.get("y0", 0))
+                bx1 = float(bbox.get("x1", 0))
+                by1 = float(bbox.get("y1", 0))
+            except (TypeError, ValueError):
+                continue
+            # The model may report the bbox as fractions (0–1) or as source-image
+            # pixels (it tends to mirror the SOURCE FIGURE SIZE hint). Detect and
+            # normalize to pixels either way.
+            if max(bx0, by0, bx1, by1) <= 1.5:
+                bx0, by0, bx1, by1 = bx0 * W, by0 * H, bx1 * W, by1 * H
+            px0, px1 = sorted((bx0, bx1))
+            py0, py1 = sorted((by0, by1))
+            px0 = max(0, min(W, round(px0)))
+            px1 = max(0, min(W, round(px1)))
+            py0 = max(0, min(H, round(py0)))
+            py1 = max(0, min(H, round(py1)))
+            if px1 - px0 < 4 or py1 - py0 < 4:
+                continue
+            buf = _io.BytesIO()
+            src.crop((px0, py0, px1, py1)).save(buf, "PNG")
+            crop_png = buf.getvalue()
+            graphic_png = crop_png
+            if redraw:
+                try:
+                    graphic_png = fig_regen.regenerate(
+                        crop_png,
+                        style="enhanced",
+                        figure_meta={"context": "embedded table graphic"},
+                        mime_type="image/png",
+                    )
+                except Exception as e:
+                    logger.warning(
+                        "table embed: redraw failed for graphic %s — keeping "
+                        "original crop (%s: %s)",
+                        gid, type(e).__name__, e,
+                    )
+                    graphic_png = crop_png
+            # Normalize to real PNG bytes — Gemini's image-out returns JPEG, and a
+            # JPEG body under a data:image/png URI fails to decode in resvg (the
+            # graphic silently renders blank). Re-encoding guarantees the mime
+            # matches the bytes.
+            try:
+                _norm = _io.BytesIO()
+                Image.open(_io.BytesIO(graphic_png)).convert("RGB").save(_norm, "PNG")
+                graphic_png = _norm.getvalue()
+            except Exception as e:
+                logger.warning("table embed: graphic %s re-encode failed: %s", gid, e)
+            token = "{{GRAPHIC_%s}}" % gid
+            if token in svg:
+                svg = svg.replace(token, _data_uri(graphic_png))
+                n_embedded += 1
+
+    # Sweep any unfilled placeholders → 1×1 transparent pixel (never leave a token).
+    tbuf = _io.BytesIO()
+    Image.new("RGBA", (1, 1), (0, 0, 0, 0)).save(tbuf, "PNG")
+    svg = _re.sub(r"\{\{GRAPHIC_[^}]*\}\}", _data_uri(tbuf.getvalue()), svg)
+    return svg, n_embedded
+
+
+def regenerate_table_figure(
+    figure_id: UUID,
+    custom_instructions: str | None = None,
+    *,
+    redraw_graphics: bool = True,
+) -> dict[str, Any]:
+    """Regenerate a composite TABLE figure (text + embedded graphics) as a crisp
+    vector SVG: verbatim text + grid rebuilt by the model, each embedded graphic
+    cropped from the source, AI-redrawn, and embedded back into its cell. The
+    rasterized PNG is stored as the figure's APPROVED regen variant.
+
+    On a fallback verdict or a render failure the ORIGINAL figure is kept and an
+    ``_error`` is returned — the caller must NOT re-route a table to the image
+    model (that reintroduces the garbled-text problem). Pure data tables (no
+    embedded graphic) just get the crisp grid.
+    """
+    from datetime import datetime, timezone
+
+    from sqlalchemy.orm.attributes import flag_modified
+
+    from app.models.figure import Figure
+    from app.services.svg_raster import rasterize_svg_to_png
+
+    with SyncSession() as session:
+        fig = session.get(Figure, figure_id)
+        if fig is None:
+            return {"_error": "not_found"}
+        if not fig.image_bytes:
+            return {"_error": "no_image"}
+        image_bytes_list = [(fig.image_bytes, fig.mime_type or "image/png")]
+        caption = (getattr(fig, "caption", None) or "").strip()
+        context = _theory_context_for_figure(session, fig)
+
+        diagram = _generate_diagram_blocking(
+            original_image_bytes_list=image_bytes_list,
+            regenerated_question_text=context,
+            regenerated_solution_text=caption,
+            custom_instructions=custom_instructions,
+            previous_diagram=None,
+            mode="table",
+            system_prompt_name="figures/table_structuring_svg",
+        )
+        if not diagram:
+            return {"_error": "generation_failed"}
+        if diagram.get("fallback_to_original") or not diagram.get("svg_preview"):
+            return {"_error": "fallback", "description": diagram.get("description") or ""}
+
+        # Crop + redraw + embed the graphics; rasterize the SUBSTITUTED svg. We
+        # keep the placeholder svg (small) in regen_meta — never the base64-laden
+        # final svg, which would bloat the JSON and duplicate regen_image_bytes.
+        final_svg, n_embedded = _embed_table_graphics(
+            fig.image_bytes,
+            diagram["svg_preview"],
+            diagram.get("graphics") or [],
+            redraw=redraw_graphics,
+        )
+        png = rasterize_svg_to_png(final_svg)
+        if not png:
+            return {"_error": "rasterize_failed"}
+
+        fig.regen_image_bytes = png
+        fig.approved_at = datetime.now(timezone.utc)
+        meta = dict(fig.regen_meta) if isinstance(fig.regen_meta, dict) else {}
+        meta["diagram"] = diagram  # placeholder svg + graphics bboxes (small)
+        meta["source"] = "table_structuring"
+        meta["engine"] = "table_embed"
+        meta["graphics_embedded"] = n_embedded
+        meta.pop("discarded", None)
+        fig.regen_meta = meta
+        flag_modified(fig, "regen_meta")
+        session.commit()
+        return {
+            "ok": True,
+            "figure_id": str(figure_id),
+            "engine": "table_embed",
+            "graphics_embedded": n_embedded,
+            "subject": diagram.get("subject") or "",
+            "description": diagram.get("description") or "",
+        }
+
+
+def compute_vector_png(
+    session: Session,
+    fig: Any,
+    custom_instructions: str | None = None,
+) -> tuple[bytes | None, dict[str, Any] | None]:
+    """Compute a vector (LaTeX/SVG) regen PNG for ``fig`` WITHOUT persisting.
+
+    Read-only against ``session``. Returns ``(png_bytes, diagram_meta)``;
+    ``png_bytes`` is None on fallback/failure (caller keeps original or routes
+    to the image model). Used by the batch worker so persistence stays in the
+    batch's own session/bookkeeping.
+    """
+    from app.services.svg_raster import rasterize_svg_to_png
+
+    if not getattr(fig, "image_bytes", None):
+        return None, None
+    image_bytes_list = [(fig.image_bytes, fig.mime_type or "image/png")]
+    context = _theory_context_for_figure(session, fig)
+    caption = (getattr(fig, "caption", None) or "").strip()
+    diagram = _generate_diagram_blocking(
+        original_image_bytes_list=image_bytes_list,
+        regenerated_question_text=context,
+        regenerated_solution_text=caption,
+        custom_instructions=custom_instructions,
+        mode="theory",
+    )
+    if not diagram:
+        return None, None
+    _validate_diagram_renderable(diagram)
+    if diagram.get("fallback_to_original") or not diagram.get("svg_preview"):
+        return None, diagram
+    png = rasterize_svg_to_png(diagram["svg_preview"])
+    return (png or None), diagram
+
+
+def compute_table_png(
+    session: Session,
+    fig: Any,
+    custom_instructions: str | None = None,
+    *,
+    redraw_graphics: bool = True,
+) -> tuple[bytes | None, dict[str, Any] | None, int]:
+    """Compute a composite-table regen PNG for ``fig`` WITHOUT persisting.
+
+    Read-only against ``session`` (the graphic redraw makes its own Gemini
+    calls). Returns ``(png_bytes, diagram_meta, n_embedded)``; ``png_bytes`` is
+    None on fallback/failure. The caller MUST keep the original on None — a table
+    must never be routed to the whole-image model.
+    """
+    from app.services.svg_raster import rasterize_svg_to_png
+
+    if not getattr(fig, "image_bytes", None):
+        return None, None, 0
+    image_bytes_list = [(fig.image_bytes, fig.mime_type or "image/png")]
+    caption = (getattr(fig, "caption", None) or "").strip()
+    context = _theory_context_for_figure(session, fig)
+    diagram = _generate_diagram_blocking(
+        original_image_bytes_list=image_bytes_list,
+        regenerated_question_text=context,
+        regenerated_solution_text=caption,
+        custom_instructions=custom_instructions,
+        mode="table",
+        system_prompt_name="figures/table_structuring_svg",
+    )
+    if not diagram:
+        return None, None, 0
+    if diagram.get("fallback_to_original") or not diagram.get("svg_preview"):
+        return None, diagram, 0
+    final_svg, n_embedded = _embed_table_graphics(
+        fig.image_bytes,
+        diagram["svg_preview"],
+        diagram.get("graphics") or [],
+        redraw=redraw_graphics,
+    )
+    png = rasterize_svg_to_png(final_svg)
+    return (png or None), diagram, n_embedded
 
 
 def _persist_regen_items(

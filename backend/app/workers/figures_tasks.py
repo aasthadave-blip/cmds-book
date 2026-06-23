@@ -767,34 +767,99 @@ def _regenerate_figures_v2_section(
                 # Per-figure timeout — if Gemini hangs on one figure we
                 # mark it failed and continue with the next. Without this,
                 # a single stuck call would freeze the entire section reseed.
-                new_bytes = _run_with_timeout(
-                    lambda: fig_regen.regenerate(
-                        fig_row.image_bytes,
-                        style=style,
-                        custom_instructions=custom,
-                        figure_meta=figure_meta,
-                        model=image_model,
-                    ),
-                    timeout_s=PER_FIGURE_REGEN_TIMEOUT_S,
-                )
-                if watermark_clean:
-                    try:
-                        new_bytes = fig_wm.clean(new_bytes, model=image_model)
-                    except Exception as e_wm:
-                        # Non-fatal: skip the watermark stage and keep the
-                        # regenerated image as-is. The v2 pipeline produces
-                        # a fresh image that typically has no watermarks
-                        # anyway, and Gemini's safety filter sometimes
-                        # silently rejects this prompt with an empty
-                        # response — we don't want that to fail the run.
-                        logger.warning(
-                            "regen: watermark cleanup failed for %s, using uncleaned regen (%s: %s)",
-                            fig_row.id, type(e_wm).__name__, e_wm,
-                        )
-                if overlay:
-                    new_bytes, _ = fig_overlay.overlay(
-                        fig_row.image_bytes, new_bytes, ocr_model=ocr_model,
+                #
+                # Engine routing (FIGURE_ENGINE_ROUTING_ENABLED): composite tables
+                # get a crisp vector grid with the graphic embedded; diagrams/charts
+                # (schematics) get the LaTeX/SVG vector engine; only illustrations/
+                # photos use the image model — which reproduces graphics but garbles
+                # dense text. Disable the flag to send everything to the image model.
+                from app.workers import question_regen_v3 as qr3
+
+                engine = "image"
+                if settings.FIGURE_ENGINE_ROUTING_ENABLED:
+                    engine = qr3.pick_regen_engine(fig_row)
+
+                new_bytes: bytes | None = None
+                diagram_meta: dict[str, Any] | None = None
+                n_embedded = 0
+
+                if engine == "table_embed":
+                    new_bytes, diagram_meta, n_embedded = _run_with_timeout(
+                        lambda: qr3.compute_table_png(
+                            session, fig_row, custom_instructions=custom,
+                        ),
+                        timeout_s=PER_FIGURE_REGEN_TIMEOUT_S,
                     )
+                    if not new_bytes:
+                        # Table fallback/failure → KEEP ORIGINAL. Never route a
+                        # table to the image model (it garbles the text column).
+                        fig_row.regen_status = "failed"
+                        fig_row.regen_meta = {
+                            **(fig_row.regen_meta or {}),
+                            "engine": "table_embed",
+                            "last_error": "table vector fallback — kept original",
+                        }
+                        session.add(FigureRegeneration(
+                            book_id=book_uuid, figure_id=fig_row.id,
+                            section_id=section_ref, image_url=None,
+                            style_params={"engine": "table_embed", "reason": "fallback"},
+                            model_used="table_structuring", status="failed",
+                        ))
+                        session.commit()
+                        failed += 1
+                        failures.append({
+                            "figure_id": str(fig_row.id),
+                            "reason": "table vector fallback — kept original",
+                        })
+                        _update_job(
+                            session, job_uuid,
+                            progress=5 + int(90 * idx / total),
+                            message=f"[{idx}/{total}] kept original {fig_row.figure_id_text}",
+                        )
+                        continue
+                elif engine == "vector":
+                    new_bytes, diagram_meta = _run_with_timeout(
+                        lambda: qr3.compute_vector_png(
+                            session, fig_row, custom_instructions=custom,
+                        ),
+                        timeout_s=PER_FIGURE_REGEN_TIMEOUT_S,
+                    )
+                    if not new_bytes:
+                        # Vector fallback (organic diagram) → the image model is the
+                        # right tool. Record the engine actually used.
+                        engine = "image"
+                        diagram_meta = None
+
+                if new_bytes is None:  # image engine, or vector→image fallback
+                    new_bytes = _run_with_timeout(
+                        lambda: fig_regen.regenerate(
+                            fig_row.image_bytes,
+                            style=style,
+                            custom_instructions=custom,
+                            figure_meta=figure_meta,
+                            model=image_model,
+                        ),
+                        timeout_s=PER_FIGURE_REGEN_TIMEOUT_S,
+                    )
+                    if watermark_clean:
+                        try:
+                            new_bytes = fig_wm.clean(new_bytes, model=image_model)
+                        except Exception as e_wm:
+                            # Non-fatal: skip the watermark stage and keep the
+                            # regenerated image as-is. The v2 pipeline produces
+                            # a fresh image that typically has no watermarks
+                            # anyway, and Gemini's safety filter sometimes
+                            # silently rejects this prompt with an empty
+                            # response — we don't want that to fail the run.
+                            logger.warning(
+                                "regen: watermark cleanup failed for %s, using uncleaned regen (%s: %s)",
+                                fig_row.id, type(e_wm).__name__, e_wm,
+                            )
+                    if overlay:
+                        new_bytes, _ = fig_overlay.overlay(
+                            fig_row.image_bytes, new_bytes, ocr_model=ocr_model,
+                        )
+
                 fig_row.regen_image_bytes = new_bytes
                 fig_row.regen_status = "ready"
                 fig_row.regen_version = (fig_row.regen_version or 0) + 1
@@ -807,7 +872,15 @@ def _regenerate_figures_v2_section(
                     "image_model": effective_image_model,
                     "ocr_model": ocr_model,
                     "regenerated_at": datetime.utcnow().isoformat(),
+                    "engine": engine,
                 }
+                if engine == "table_embed":
+                    regen_meta_snapshot["source"] = "table_structuring"
+                    regen_meta_snapshot["graphics_embedded"] = n_embedded
+                elif engine == "vector":
+                    regen_meta_snapshot["source"] = "theory_latex_diagram"
+                if diagram_meta:
+                    regen_meta_snapshot["diagram"] = diagram_meta
                 fig_row.regen_meta = regen_meta_snapshot
                 # Q-style regen folder: persist one FigureRegeneration row per
                 # successful regen attempt so the UI can show a history of

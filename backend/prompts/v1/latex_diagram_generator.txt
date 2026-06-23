@@ -71,6 +71,14 @@ whenever a faithful, cleanly-rasterizable SVG is NOT achievable:
     programmatic vectors cannot reproduce: Biology anatomical structures,
     geological/geographic maps, photographic apparatus or glassware, micrographs,
     detailed real-world illustrations.
+    EXCEPTION — DO NOT fall back for SCHEMATICS / GRAPHIC ORGANIZERS. Flowcharts,
+    process/cycle diagrams, hierarchy/tree diagrams, concept maps, classification
+    charts, labelled block schematics, and boxes-and-arrows that break complex,
+    multi-layered information into a visual hierarchy are IDEAL vector targets —
+    they are boxes, connectors, and short text labels. ALWAYS vectorize these as
+    crisp SVG (rectangles/ellipses, arrowed paths, Unicode <text>); never route a
+    schematic to fallback just because it looks "complex". Fallback (A) is only for
+    genuinely organic/photographic artwork, not for line-and-box information graphics.
 
 (B) MATH-TYPESETTING COMPLEXITY — the diagram's labels REQUIRE typeset math
     that cannot be expressed with simple Unicode glyphs in an SVG <text>: inline
