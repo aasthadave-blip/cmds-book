@@ -254,6 +254,45 @@ def _has_stale_running_job(session: Session, book_id: UUID) -> bool:
     )
 
 
+# ─── Cancellation helpers (Phase 4) ─────────────────────────────────────
+
+
+def _book_is_cancelled(book_id: UUID) -> bool:
+    """Quick check: has the book been cancelled?
+
+    v3 cancellation flow:
+      1. /api/jobs/cancel-all (or /books/<id>/cancel) sets book.status='cancelled'
+         + flips any RUNNING stage to 'cancelled'.
+      2. This worker checks book.status at the start of every queued stage
+         (after claim, before execution) — skips the stage if cancelled, so a
+         queued-then-cancelled book doesn't waste a Gemini call.
+      3. After the cancel, the coordinator sees book.status in BOOK_TERMINAL
+         and returns NOTHING — no more dispatches.
+    """
+    with WorkerSession() as session:
+        book = session.get(Book, book_id)
+        return book is not None and book.status == "cancelled"
+
+
+def _mark_stage_cancelled(
+    book_id: UUID, stage_attr: str, job_id: UUID,
+) -> None:
+    """Move a freshly-claimed stage from RUNNING -> 'cancelled' (no actual
+    extraction done). Also marks the corresponding Job as cancelled with a
+    diagnostic so the audit trail shows what happened.
+    """
+    with WorkerSession() as session:
+        book = session.get(Book, book_id)
+        if book is not None and getattr(book, stage_attr) == RUNNING:
+            setattr(book, stage_attr, "cancelled")
+        job = session.get(Job, job_id)
+        if job is not None and job.status == "running":
+            job.status = "cancelled"
+            job.error = "Cancelled before execution (book cancellation)"
+            job.finished_at = datetime.now(timezone.utc)
+        session.commit()
+
+
 # ─── Action dispatcher ─────────────────────────────────────────────────
 
 
@@ -349,6 +388,24 @@ def _schedule_stage(
         _in_flight_books.add(book_id)
 
     def _wrapped() -> None:
+        # Pre-execution cancellation check: between the claim above and this
+        # function actually starting on a worker thread, the user may have
+        # cancelled the book. Honor that intent before burning a (potentially
+        # 30-second) Gemini call on work the user no longer wants.
+        # (Cancellation during the actual stage run isn't interruptible in
+        # Python — no thread.kill() — but the book remains 'cancelled' at the
+        # book-status level, so the coordinator stops driving it on the next
+        # tick and the partial stage result is harmless.)
+        if _book_is_cancelled(book_id):
+            logger.info(
+                "db_worker: skipping stage — book cancelled mid-claim "
+                "book=%s stage=%s job=%s", book_id, stage_attr, job_id,
+            )
+            _mark_stage_cancelled(book_id, stage_attr, job_id)
+            with _in_flight_lock:
+                _in_flight_books.discard(book_id)
+            return
+
         try:
             runner(book_id, job_id)
         except Exception:

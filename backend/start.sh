@@ -33,27 +33,37 @@ LOG_LEVEL="${LOG_LEVEL:-info}"
 # multi-worker-safe.
 UVICORN_WORKERS="${UVICORN_WORKERS:-1}"
 
-# ── Supervised Celery worker ────────────────────────────────────────────────
-supervise_worker() {
-  while true; do
-    echo "[start.sh] starting celery worker (concurrency=$CELERY_CONCURRENCY, log=$LOG_LEVEL)"
-    celery -A app.workers.celery_app worker \
-      --loglevel="$LOG_LEVEL" \
-      --concurrency="$CELERY_CONCURRENCY" \
-      --without-gossip \
-      --without-mingle \
-      --without-heartbeat
-    code=$?
-    echo "[start.sh] celery worker EXITED (code=$code) — relaunching in 3s"
-    sleep 3
-  done
-}
-supervise_worker &
-SUP_PID=$!
+# ── v3 cutover: skip Celery when USE_DB_WORKER=true ────────────────────────
+# v3 (architecture-v3) replaces the Celery worker with an in-process polling
+# worker (app.services.db_worker) that lives inside uvicorn. When this env
+# var is set, we don't launch Celery at all — the API process drives all
+# extraction directly off Postgres state. Default OFF so prod stays on v2.
+if [ "${USE_DB_WORKER:-false}" = "true" ]; then
+  echo "[start.sh] USE_DB_WORKER=true — running v3 in-process worker (no Celery)"
+  trap 'echo "[start.sh] SIGTERM"; exit 0' TERM INT
+else
+  # ── Supervised Celery worker (v2 path) ────────────────────────────────────
+  supervise_worker() {
+    while true; do
+      echo "[start.sh] starting celery worker (concurrency=$CELERY_CONCURRENCY, log=$LOG_LEVEL)"
+      celery -A app.workers.celery_app worker \
+        --loglevel="$LOG_LEVEL" \
+        --concurrency="$CELERY_CONCURRENCY" \
+        --without-gossip \
+        --without-mingle \
+        --without-heartbeat
+      code=$?
+      echo "[start.sh] celery worker EXITED (code=$code) — relaunching in 3s"
+      sleep 3
+    done
+  }
+  supervise_worker &
+  SUP_PID=$!
 
-# Forward shutdown signals so the supervisor (and its current worker) stop
-# cleanly instead of being relaunched during a deploy.
-trap 'echo "[start.sh] SIGTERM → stopping worker supervisor (pid=$SUP_PID)"; kill -TERM "$SUP_PID" 2>/dev/null; exit 0' TERM INT
+  # Forward shutdown signals so the supervisor (and its current worker) stop
+  # cleanly instead of being relaunched during a deploy.
+  trap 'echo "[start.sh] SIGTERM → stopping worker supervisor (pid=$SUP_PID)"; kill -TERM "$SUP_PID" 2>/dev/null; exit 0' TERM INT
+fi
 
 echo "[start.sh] launching uvicorn on port ${PORT:-8000} (workers=$UVICORN_WORKERS)"
 exec uvicorn app.main:app --host 0.0.0.0 --port "${PORT:-8000}" --workers "$UVICORN_WORKERS"

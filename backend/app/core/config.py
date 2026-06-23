@@ -101,6 +101,13 @@ class Settings(BaseSettings):
     # "celery" dispatches to a worker over Redis.
     TASK_EXECUTOR: Literal["inline", "celery"] = "inline"
 
+    # v3 db-polled worker (architecture-v3). Default OFF so prod keeps using
+    # v2's Celery + orchestrator path until v3 is explicitly enabled per env.
+    # When True, app.main starts app.services.db_worker.db_worker_loop in
+    # the FastAPI lifespan instead of relying on Celery/orchestrator. Phase 5
+    # cutover toggles this with no code change required.
+    USE_DB_WORKER: bool = False
+
     # Redis / Celery (only used when TASK_EXECUTOR=celery)
     REDIS_URL: str = "redis://localhost:6379/0"
     CELERY_BROKER_URL: str = "redis://localhost:6379/1"

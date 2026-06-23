@@ -117,22 +117,60 @@ from app.workers import question_regen_v3 as _question_regen_v3_tasks  # noqa: E
 
 
 _watchdog_task: "asyncio.Task[None] | None" = None
+_db_worker_task: "asyncio.Task[None] | None" = None
+_db_worker_stop: "asyncio.Event | None" = None
 
 
 @app.on_event("startup")
 async def start_watchdog() -> None:
-    """Launch the stale-job watchdog. See app.core.watchdog for behaviour."""
+    """Launch the stale-job watchdog (v2) OR the db_worker poll loop (v3).
+
+    Toggled by the ``USE_DB_WORKER`` env var (default False). When True:
+    skip the v2 watchdog (its driver/reaper logic is taken over by the
+    db_worker itself) and run the polling worker that drives extraction
+    from Postgres state directly — no Celery, no Redis broker.
+
+    Phase 5 of the v3 migration. After v3 proves itself in prod, Phase 6
+    deletes the v2 watchdog + orchestrator entirely.
+    """
     import asyncio
 
-    from app.core.watchdog import watchdog_loop
+    from app.core.config import settings
 
-    global _watchdog_task
-    _watchdog_task = asyncio.create_task(watchdog_loop(), name="watchdog")
+    global _watchdog_task, _db_worker_task, _db_worker_stop
+
+    if settings.USE_DB_WORKER:
+        # v3 path: single polling worker replaces watchdog + orchestrator.
+        from app.services.db_worker import db_worker_loop
+
+        _db_worker_stop = asyncio.Event()
+        _db_worker_task = asyncio.create_task(
+            db_worker_loop(_db_worker_stop), name="db_worker",
+        )
+    else:
+        # v2 path: legacy watchdog + Celery dispatch.
+        from app.core.watchdog import watchdog_loop
+
+        _watchdog_task = asyncio.create_task(watchdog_loop(), name="watchdog")
 
 
 @app.on_event("shutdown")
 async def stop_watchdog() -> None:
-    global _watchdog_task
+    """Stop whichever worker we started (v2 watchdog or v3 db_worker)."""
+    global _watchdog_task, _db_worker_task, _db_worker_stop
+
+    # v3 path — signal the loop to stop, then wait for it to drain.
+    if _db_worker_task is not None:
+        if _db_worker_stop is not None:
+            _db_worker_stop.set()
+        try:
+            await _db_worker_task
+        except BaseException:
+            pass
+        _db_worker_task = None
+        _db_worker_stop = None
+
+    # v2 path — cancel the watchdog task.
     if _watchdog_task is not None:
         _watchdog_task.cancel()
         try:

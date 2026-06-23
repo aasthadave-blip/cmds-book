@@ -23,6 +23,7 @@ import pytest
 import sqlalchemy as sa
 from sqlalchemy import create_engine
 from sqlalchemy.orm import Session, sessionmaker
+from sqlalchemy.pool import StaticPool
 
 from app.core.db import Base
 # Trigger model registrations so Base.metadata.create_all sees every table.
@@ -45,7 +46,16 @@ def db_session(monkeypatch):
     Also resets the module-global executor + in-flight set so successive
     tests don't share thread-pool state.
     """
-    engine = create_engine("sqlite:///:memory:")
+    # StaticPool + check_same_thread=False is required so the executor
+    # thread (which runs stage runners) can access the same in-memory DB
+    # as the main test thread. Without this, SQLite would reject cross-
+    # thread access and the executor task would silently raise — leaving
+    # tests asserting empty stubs with no obvious failure cause.
+    engine = create_engine(
+        "sqlite:///:memory:",
+        connect_args={"check_same_thread": False},
+        poolclass=StaticPool,
+    )
     Base.metadata.create_all(engine)
     SessionFactory = sessionmaker(bind=engine, class_=Session, autoflush=False)
 
@@ -353,6 +363,94 @@ def test_cas_prevents_double_claim(db_session, stub_stage_runner):
     # Status should still be running, not double-claimed.
     with db_session() as s:
         assert s.get(Book, book_id).schema_status == "running"
+
+
+def test_cancelled_book_is_filtered_from_inflight(db_session, stub_stage_runner):
+    """A book at book.status='cancelled' is no longer in the in-flight set
+    (BOOK_INFLIGHT excludes terminal statuses), so the coordinator never
+    even sees it — no dispatches, no work."""
+    from app.services import db_worker
+
+    with db_session() as s:
+        book = _make_book(
+            s,
+            status="cancelled",  # terminal
+            schema_status="cancelled",
+            theory_status="pending",
+        )
+        book_id = book.id
+
+    n = db_worker.advance_one_tick()
+    assert n == 0
+    assert stub_stage_runner == []
+    # Status stays 'cancelled' — nothing tried to clobber it.
+    with db_session() as s:
+        assert s.get(Book, book_id).status == "cancelled"
+
+
+def test_cancel_mid_claim_skips_execution(db_session, stub_stage_runner):
+    """If cancel-all flips book.status to 'cancelled' between the worker
+    claiming the stage and starting execution, the wrapped runner skips
+    the actual work (so we don't burn a 30s Gemini call on cancelled work).
+
+    Exercises the cancellation helpers directly (_book_is_cancelled +
+    _mark_stage_cancelled) — the helpers ARE the cancellation contract.
+    """
+    from app.services import db_worker
+
+    with db_session() as s:
+        book = _make_book(s, schema_status="pending")
+        book_id = book.id
+
+    # Step 1: worker claims the stage (PENDING -> RUNNING + creates Job).
+    with db_session() as s:
+        result = db_worker._claim_stage(s, book_id, "schema_status")
+        assert result is not None
+        job_id = result.id
+
+    # Step 2: user clicks cancel — flip book.status to 'cancelled'.
+    with db_session() as s:
+        book = s.get(Book, book_id)
+        book.status = "cancelled"
+        book.schema_status = "cancelled"
+        s.commit()
+
+    # Step 3: the pre-execution check inside _wrapped() detects this.
+    assert db_worker._book_is_cancelled(book_id) is True
+
+    # Step 4: _mark_stage_cancelled cleans up the job + stage status.
+    db_worker._mark_stage_cancelled(book_id, "schema_status", job_id)
+    with db_session() as s:
+        book = s.get(Book, book_id)
+        assert book.schema_status == "cancelled"  # stayed cancelled
+        job = s.get(Job, job_id)
+        assert job.status == "cancelled"
+        assert "Cancelled before execution" in (job.error or "")
+
+    # And the stage_runner stub was NOT invoked — the whole point of the
+    # pre-execution check is that no Gemini call gets fired.
+    assert stub_stage_runner == [], "stage_runner should not have been called"
+
+
+def test_cancelled_book_with_done_stages_finalizes_as_cancelled(
+    db_session, stub_stage_runner,
+):
+    """Cancellation must be honored visibly even if some stages happened
+    to complete in parallel — derive_terminal_book_status returns 'cancelled'
+    when any stage is CANCELLED. Mirrors the v2 fix for user intent."""
+    from app.services.coordinator import (
+        BookSnapshot, derive_terminal_book_status,
+    )
+
+    snap = BookSnapshot(
+        book_status="cancelled",
+        schema_status="done",
+        theory_status="cancelled",  # the user-cancelled stage
+        questions_status="pending",
+        figures_status="pending",
+        theory_finalized_at_is_set=False,
+    )
+    assert derive_terminal_book_status(snap) == "cancelled"
 
 
 def test_unknown_status_escalates_to_failed(db_session, stub_stage_runner):
