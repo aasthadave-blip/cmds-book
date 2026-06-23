@@ -1165,7 +1165,17 @@ function EmbeddedFigureRender({
   };
 }) {
   const label = ef.figure_number || ef.label || '';
-  const hasImage = Boolean(ef.image_url);
+  // Normalize image URL the same way BlockRender does above — relative paths
+  // like "/storage/figures/abc.png" must be prefixed with the BACKEND host,
+  // otherwise the browser resolves them against the FRONTEND domain → 404 →
+  // broken-img icon + "Figure not available inline" placeholder. This is the
+  // "same book, some figs perfect, some broken" bug: labeled figs hit
+  // BlockRender (which already prefixes API_BASE), label-less / placement-
+  // only figs hit this renderer (which didn't), so they 404'd.
+  const efSrc = ef.image_url
+    ? (ef.image_url.startsWith('http') ? ef.image_url : `${API_BASE}${ef.image_url}`)
+    : null;
+  const hasImage = Boolean(efSrc);
   return (
     <figure
       style={{
@@ -1188,7 +1198,7 @@ function EmbeddedFigureRender({
           }}
         >
           <img
-            src={ef.image_url}
+            src={efSrc ?? undefined}
             alt={label || ef.caption || 'Figure'}
             style={{
               maxWidth: '100%',
