@@ -52,6 +52,11 @@ dependencies = [
     # Primary backend (needs system libcairo2 on Linux/prod). The resvg
     # standalone binary is the dependency-free fallback (see svg_raster.py).
     "cairosvg>=2.7.0",
+    # Image crop / re-encode for composite-table figure regen (table_embed
+    # engine in question_regen_v3.py crops each embedded graphic from the source
+    # and normalizes the redrawn bytes to PNG). Present transitively via
+    # cairosvg/pdfplumber, but declared explicitly since we import it directly.
+    "pillow>=10.0.0",
 ]
 
 [project.optional-dependencies]
