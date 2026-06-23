@@ -346,6 +346,8 @@ type QuestionBankOut = {
   status: string;
   last_error: string | null;
   job_id?: string | null;
+  /** Backend exposes this for live progress; absent on older builds → treat as 0. */
+  question_count?: number | null;
 };
 const listBanks = (bookId: string) =>
   req<QuestionBankOut[]>(`/api/books/${bookId}/question-banks`);
@@ -1021,6 +1023,44 @@ export function useExtractionPipeline(): UseExtractionPipeline {
           }
         } catch (e) {
           dbg('per-section poll failed', e);
+        }
+      }
+
+      // ─── Per-question real progress for QUESTIONS ────────────────────
+      //
+      // Same problem the figures row had: backend job.progress is a coarse
+      // heartbeat, so Questions sat at "Running 0%" the whole time. Use the
+      // /question-banks endpoint's question_count to show real ground truth
+      // ("12 questions extracted") and a bounded heuristic for the bar (no
+      // known total up front, so we cap at 90% while running and only flip
+      // to 100% on the worker's done signal).
+      const questionsActive = s.questions.status === 'running' || s.questions.status === 'queued';
+      if (questionsActive && s.bookId) {
+        try {
+          const banks = await listBanks(s.bookId);
+          const latest = banks[banks.length - 1] ?? null;
+          const n = Number(latest?.question_count ?? 0) || 0;
+          // Cap at 90% while running — worker's done signal flips to 100%.
+          const realPct = n === 0 ? 5 : Math.min(90, 10 + n * 2);
+          apply((prev) => {
+            if (prev.questions.status === 'done' || prev.questions.status === 'failed') {
+              return {};
+            }
+            if (realPct < prev.questions.progress) return {};
+            return {
+              questions: {
+                ...prev.questions,
+                status: 'running',
+                progress: realPct,
+                message: n === 0
+                  ? 'Extracting questions…'
+                  : `${n} question${n === 1 ? '' : 's'} extracted`,
+                lastProgressAt: Date.now(),
+              },
+            };
+          });
+        } catch (e) {
+          dbg('per-question poll failed', e);
         }
       }
 
