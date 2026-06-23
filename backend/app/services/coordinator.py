@@ -289,50 +289,57 @@ def derive_terminal_book_status(book: BookSnapshot) -> Optional[str]:
     Returns None if the book isn't in a finalizable state. Otherwise returns
     one of: 'ready', 'partial', 'failed', 'cancelled'.
 
-    Rules (mirrors v2's derive_book_status but expressed in one place):
-      • ALL stages DONE-equivalent (DONE/NEEDS_REVIEW/PARTIAL) -> 'ready'
-        if all DONE, else 'partial' if any of them was NEEDS_REVIEW/PARTIAL.
-      • Any stage CANCELLED -> 'cancelled' (loud user action; preserve signal).
-      • Any stage FAILED and theory+questions DONE -> 'partial' (the v2
-        figures-only-fail case we shipped a fix for: don't wipe usable data
-        behind a 'failed' screen).
-      • Any other FAILED -> 'failed' (loud).
+    Rules (called only when coordinator returns FINALIZE — two valid
+    finalization paths the coordinator distinguishes):
+
+      Path A (all-terminal — happy): every stage reached TERMINAL_OK or
+          TERMINAL_FAIL. Derive 'ready'/'partial'/'failed'/'cancelled' from
+          the mix.
+      Path B (upstream-fail — abort): an upstream stage failed and downstream
+          stayed PENDING (the worker correctly didn't dispatch downstream
+          because its prereq wasn't met). Those PENDING stages are
+          unreachable — the book IS finalizable as 'failed'/'cancelled'.
+
+    Precedence (first match wins):
+      1. Any RUNNING        -> None (book is still actively progressing).
+      2. Any CANCELLED      -> 'cancelled' (preserve user intent visibly).
+      3. Figures-only fail  -> 'partial' (the v2 fix 177642b — don't wipe
+         theory + questions data behind a generic 'failed' screen).
+      4. Any FAILED         -> 'failed' (loud; covers Path B blocked stages).
+      5. All TERMINAL_OK    -> 'ready' (a stage in NEEDS_REVIEW/PARTIAL still
+         lets the book be 'ready' from the user's perspective — they have
+         usable data; the per-stage flag is informational).
+      6. Anything else      -> None (defensive; we exhausted the cases above
+         so this should be unreachable).
     """
-    if not all(s in TERMINAL_ALL for s in book.stages):
+    # Rule 1: still progressing -> not finalizable.
+    if any(s == RUNNING for s in book.stages):
         return None
 
-    schema, theory, questions, figures = book.stages
+    schema_status, theory, questions, figures = book.stages
 
-    # Cancelled wins — user intent must be honored visibly.
+    # Rule 2: cancellation wins — user intent must be honored visibly.
     if any(s == CANCELLED for s in book.stages):
         return "cancelled"
 
-    # Figures-only failure on an otherwise-extracted book -> partial (the
-    # bug we fixed in v2 commit 177642b — don't lose theory + questions
-    # behind a generic 'failed').
+    # Rule 3: figures-only failure on an otherwise-extracted book.
     if (
         figures == FAILED
         and theory in TERMINAL_OK
         and questions in TERMINAL_OK
-        and schema in TERMINAL_OK
+        and schema_status in TERMINAL_OK
     ):
         return "partial"
 
-    # Any other failure short-circuits to failed.
+    # Rule 4: any failure -> 'failed'. Catches both:
+    #   - all-terminal-with-failure (e.g. theory failed, no usable book)
+    #   - upstream-fail with downstream-pending (Path B in the docstring)
     if any(s == FAILED for s in book.stages):
         return "failed"
 
-    # All terminal-OK. Distinguish strict-done from partial-done.
-    if all(s == DONE for s in book.stages):
-        return "ready"
-
-    # At least one stage was NEEDS_REVIEW or PARTIAL (but none failed) ->
-    # ready. NEEDS_REVIEW schema is auto-healed to DONE elsewhere in v2;
-    # treat it as ready here so the book reaches a usable state.
+    # Rule 5: every stage finished OK (DONE / NEEDS_REVIEW / PARTIAL).
     if all(s in TERMINAL_OK for s in book.stages):
-        # Strictly speaking some of these are NEEDS_REVIEW/PARTIAL — but the
-        # USER outcome is that the book is fully extracted and usable.
         return "ready"
 
-    # Shouldn't reach here given the all-terminal guard, but be honest:
-    return "failed"
+    # Rule 6: defensive. With Rules 1-5 above we should never reach here.
+    return None
