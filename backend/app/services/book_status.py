@@ -76,10 +76,25 @@ def derive_book_status(book: Book) -> str:
     if all(s == "pending" for s in stages):
         return book.status
 
-    if "failed" in stages:
-        return "failed"
     if "running" in stages:
         return "processing"
+    # If FIGURES is the only failed stage AND theory+questions are done, the
+    # book is partial-but-usable (theory text + questions are extracted and
+    # viewable; only the figure detection step failed). Treat as 'partial' so
+    # the UI keeps the View / Regenerate CTAs and a "Retry figures" button —
+    # don't wipe the rest of the work behind a generic 'failed' screen and a
+    # "Retry schema" prompt. Other failure combinations stay 'failed' (loud)
+    # because they break downstream rendering.
+    figures_only_failed = (
+        book.figures_status == "failed"
+        and book.theory_status == "done"
+        and book.questions_status == "done"
+        and "failed" not in (schema_status, book.theory_status, book.questions_status)
+    )
+    if figures_only_failed:
+        return "partial"
+    if "failed" in stages:
+        return "failed"
     if book.schema_status == "pending":
         return "queued"
     if "partial" in stages:

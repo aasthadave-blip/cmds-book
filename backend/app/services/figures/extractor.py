@@ -143,11 +143,54 @@ def call_gemini_extract(pdf_bytes: bytes) -> dict[str, Any]:
     raw = response.text
     if raw is None:
         raise RuntimeError(f"Gemini returned no text. Full response: {response}")
+    return _parse_figure_json(raw)
+
+
+def _parse_figure_json(raw: str) -> dict[str, Any]:
+    """Parse the figure-extractor response — tolerant of trailing junk.
+
+    Gemini's response_mime_type=application/json mostly returns clean JSON, but
+    on long figure lists it occasionally appends commentary or a second JSON
+    block AFTER the closing brace of the first object. Strict json.loads() then
+    raises "Extra data: line N column 1 (char M)" and the whole figures task
+    crashes — even though the FIRST JSON object is valid and contains the
+    figures. Observed in prod: deterministic failure on a Class 9 maths PDF, 3
+    retries all hit the same parse error.
+
+    Strategy (cheap to expensive):
+      1. Strip a leading ```json fence if present (defense in depth — never
+         seen with mime=json, but a no-op when absent).
+      2. Try strict json.loads(stripped) — handles the common clean case.
+      3. On JSONDecodeError, use JSONDecoder().raw_decode() which returns the
+         first valid JSON object plus where it stopped — silently drops the
+         trailing junk. This is the actual fix for the observed failure.
+    """
+    text = raw.strip()
+    if text.startswith("```"):
+        # Strip ```json …``` fence if Gemini wrapped the response (rare with
+        # response_mime_type=json, but harmless to handle).
+        text = text.removeprefix("```json").removeprefix("```").strip()
+        if text.endswith("```"):
+            text = text[: -3].rstrip()
     try:
-        return json.loads(raw)
-    except json.JSONDecodeError as e:
-        logger.error("Figure extractor returned invalid JSON: %s\n%s", e, raw[:500])
-        raise RuntimeError(f"Figure extractor returned invalid JSON: {e}") from e
+        return json.loads(text)
+    except json.JSONDecodeError:
+        try:
+            data, end = json.JSONDecoder().raw_decode(text)
+            trailing = len(text) - end
+            logger.warning(
+                "Figure extractor: tolerated %d bytes of trailing junk after JSON",
+                trailing,
+            )
+            return data
+        except json.JSONDecodeError as e:
+            logger.error(
+                "Figure extractor returned invalid JSON: %s\n%s",
+                e, raw[:500],
+            )
+            raise RuntimeError(
+                f"Figure extractor returned invalid JSON: {e}"
+            ) from e
 
 
 def crop_figures(pdf_bytes: bytes, metadata: dict[str, Any]) -> dict[str, bytes]:
