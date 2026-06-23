@@ -1024,6 +1024,46 @@ export function useExtractionPipeline(): UseExtractionPipeline {
         }
       }
 
+      // ─── Per-figure real progress for FIGURES ─────────────────────────
+      //
+      // Mirrors the theory per-section pass: backend's figures job.progress is
+      // a coarse heartbeat (10% at start → 100% at end), so without this the
+      // Figures row sat at "Running 0%" the entire time and only snapped to
+      // 100% at the very end — looked frozen / hung even when the worker was
+      // actively extracting. We don't know the total figure count up front
+      // (Gemini's vision pass detects it mid-run), so we poll the figures
+      // list, show "N figures extracted" as ground truth, and use a bounded
+      // heuristic for the % so the bar moves but never lies about completion.
+      const figuresActive = s.figures.status === 'running' || s.figures.status === 'queued';
+      if (figuresActive && s.bookId) {
+        try {
+          const figures = await listFigures(s.bookId);
+          const n = figures.length;
+          // Cap at 90% while running — only the worker's done signal flips us
+          // to 100%. With no known total, log-scaling avoids a runaway bar.
+          const realPct = n === 0 ? 5 : Math.min(90, 10 + n * 5);
+          apply((prev) => {
+            if (prev.figures.status === 'done' || prev.figures.status === 'failed') {
+              return {};
+            }
+            if (realPct < prev.figures.progress) return {};
+            return {
+              figures: {
+                ...prev.figures,
+                status: 'running',
+                progress: realPct,
+                message: n === 0
+                  ? 'Detecting figures…'
+                  : `${n} figure${n === 1 ? '' : 's'} extracted`,
+                lastProgressAt: Date.now(),
+              },
+            };
+          });
+        } catch (e) {
+          dbg('per-figure poll failed', e);
+        }
+      }
+
       // ─── Phase transitions (read latest state via setState callback) ───
       //
       // ORCH Day 12 — the "kick Q+figures" branch is gone; the backend
