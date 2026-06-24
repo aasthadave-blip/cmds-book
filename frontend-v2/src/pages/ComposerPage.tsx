@@ -22,7 +22,7 @@
 // v1: up/down reorder buttons (drag-drop deferred). Edit/remove/insert
 // all wired. Preview reflects changes immediately (via final-merge endpoint).
 
-import { useCallback, useEffect, useMemo, useState } from 'react';
+import { useCallback, useEffect, useMemo, useRef, useState } from 'react';
 import { useNavigate, useParams } from 'react-router-dom';
 import {
   DndContext,
@@ -45,6 +45,7 @@ import { useBook } from '../api/books';
 import { Icon } from '../components/Icon';
 import { MathMarkdown } from '../components/MathMarkdown';
 import { DiagramPreview } from '../components/DiagramPreview';
+import { sortQuestionRuns } from '../lib/question-sort';
 import type { RegeneratedDiagram } from '../api/questions';
 import { stripFigPlaceholders } from '../lib/questionText';
 
@@ -127,6 +128,12 @@ export default function ComposerPage() {
   const [loading, setLoading] = useState(true);
   const [error, setError] = useState<string | null>(null);
   const [saving, setSaving] = useState(false);
+  // Sort questions into textbook-original numeric order ONLY on the FIRST
+  // API load for this book. After that we trust whatever order the backend
+  // returns (which reflects any manual drag-reorder the user did + saved).
+  // Without this guard, every save+reload would wipe the user's manual order
+  // back to numeric.
+  const hasInitiallyLoaded = useRef(false);
 
   const load = useCallback(async () => {
     if (!bookId) return;
@@ -136,7 +143,13 @@ export default function ComposerPage() {
       const d = await req<FinalDraftResponse>(
         `/api/books/${bookId}/final-draft?regen=true`,
       );
-      setItems(d.items ?? []);
+      const fetched = d.items ?? [];
+      if (!hasInitiallyLoaded.current) {
+        hasInitiallyLoaded.current = true;
+        setItems(sortQuestionRuns(fetched));
+      } else {
+        setItems(fetched);
+      }
     } catch (e) {
       setError(
         e instanceof ApiError ? `Backend ${e.status}: ${e.message}` :

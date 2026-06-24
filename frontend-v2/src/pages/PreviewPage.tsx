@@ -16,6 +16,7 @@ import { MathMarkdown } from '../components/MathMarkdown';
 import { DiagramPreview } from '../components/DiagramPreview';
 import type { RegeneratedDiagram } from '../api/questions';
 import { stripFigPlaceholders } from '../lib/questionText';
+import { sortQuestionRuns } from '../lib/question-sort';
 
 type Block = { t: string; [k: string]: unknown };
 
@@ -258,6 +259,12 @@ export default function PreviewPage() {
             ) {
               displayItems = items.slice(1);
             }
+            // Sort consecutive question items by question_number so the
+            // preview shows textbook-original numeric order (1, 2, 3, ...,
+            // 5(a), 5(b), 5(i), ...) — same logic the backend DOCX export
+            // applies. Mirrors backend/app/services/docx_export.py:
+            // _sort_question_runs.
+            displayItems = sortQuestionRuns(displayItems);
             return displayItems.map((item) => renderItem(item));
           })()}
         </div>

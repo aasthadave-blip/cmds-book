@@ -1187,6 +1187,65 @@ def _render_custom_text(b: _DocBuilder, content: str) -> None:
         b.paragraph(chunk, space_after_pt=6)
 
 
+def _question_sort_key(question_number: Any) -> tuple:
+    """Sort key for `question_number`. Returns (numeric_prefix, full_string).
+
+    Handles all the formats the extractor produces:
+      "1"     -> (1, "1")
+      "5"     -> (5, "5")
+      "5(a)"  -> (5, "5(a)")
+      "5(b)"  -> (5, "5(b)")
+      "5(i)"  -> (5, "5(i)")
+      "10"    -> (10, "10")
+      "Q5"    -> (5, "Q5")
+      ""/None -> (10**9, "")   missing — sort to end
+
+    Secondary string comparison groups variants of the same parent together
+    in alpha/roman order: 5 < 5(a) < 5(b) < 5(i) < 6.
+    """
+    s = str(question_number or "").strip()
+    if not s:
+        return (10**9, "")
+    m = re.search(r"\d+", s)
+    num = int(m.group()) if m else 10**9
+    return (num, s)
+
+
+def _sort_question_runs(items: list[dict[str, Any]]) -> list[dict[str, Any]]:
+    """Return a copy of `items` with consecutive `question` items sorted by
+    their `question_number`. Non-question items (section_heading, block,
+    figure, custom_text) keep their original positions — only the order
+    within a contiguous question run is changed.
+
+    The upstream order (from the composer / API) is by `created_at`, which
+    is extractor-time and effectively random within a page. This sort
+    presents questions in textbook-original numeric order on every
+    rendering surface that calls this helper.
+
+    Render-layer only — the underlying API / DB / composer queries are
+    untouched (per user constraint: "i don't want to touch any api it
+    might break few things"). Same logic will be mirrored in the frontend
+    Preview / Composer pages.
+    """
+    out: list[dict[str, Any]] = []
+    i = 0
+    while i < len(items):
+        if items[i].get("type") == "question":
+            j = i
+            while j < len(items) and items[j].get("type") == "question":
+                j += 1
+            run = list(items[i:j])
+            run.sort(key=lambda it: _question_sort_key(
+                (it.get("question") or {}).get("question_number")
+            ))
+            out.extend(run)
+            i = j
+        else:
+            out.append(items[i])
+            i += 1
+    return out
+
+
 def build_final_draft_docx(
     book_title: str,
     items: list[dict[str, Any]],
@@ -1199,6 +1258,12 @@ def build_final_draft_docx(
     approved, else original) before invoking this function so this
     module stays sync-only.
     """
+    # Sort questions within each contiguous run by question_number so the
+    # textbook's original numeric order is preserved on export. The upstream
+    # items list is in extractor-creation order (effectively random within a
+    # page), which causes the "Q1, Q3, Q2, Q6, Q5, Q4..." jumble.
+    items = _sort_question_runs(items)
+
     b = _DocBuilder()
     b.title(book_title or "Final Draft")
 

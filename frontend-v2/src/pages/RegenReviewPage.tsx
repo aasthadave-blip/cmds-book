@@ -46,6 +46,7 @@ import {
 import { useLatestRegeneration } from '../api/regenerations';
 
 import { Icon } from '../components/Icon';
+import { sortByQuestionNumber } from '../lib/question-sort';
 import { TheoryView } from '../components/review/TheoryView';
 import { QuestionsView, FigureCard } from '../components/review/QuestionsView';
 import { stripFigPlaceholders } from '../lib/questionText';
@@ -1442,8 +1443,12 @@ function QuestionsBody({
   // clear visibility. Much better than the section-level "all-orig on
   // left, all-regen on right" stacking.
   if (subTab === 'compare') {
-    const origList = originalQs?.questions ?? [];
-    const regenList = regenQs?.questions ?? [];
+    // Sort by textbook-original question_number so the Compare tab's
+    // side-by-side pairs render in proper sequential order (1, 2, 3, ...,
+    // 5(a), 5(b), 5(i), ...) — matches the DOCX export + Preview ordering.
+    // Render-layer sort only; the underlying API queries are untouched.
+    const origList = sortByQuestionNumber(originalQs?.questions ?? []);
+    const regenList = sortByQuestionNumber(regenQs?.questions ?? []);
     // Build {original_id → [regen variants]} map.
     const variantsByOriginal = new Map<string, typeof regenList>();
     for (const rq of regenList) {
