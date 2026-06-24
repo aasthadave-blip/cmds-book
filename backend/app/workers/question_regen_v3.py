@@ -1320,7 +1320,13 @@ def _persist_regen_items(
             qc_local=qc_local,
             attempts=1,
             status="passed",
-            question_number=None,
+            # Inherit the textbook-original question number from the source.
+            # Previously hardcoded None — that's what broke ordering in
+            # Preview/Composer/DOCX: when a book has regen variants the merge
+            # prefers variants (prefer_regen=true), so variants drove the
+            # items list with no number → couldn't sort → jumbled UI.
+            # Variants of Q5 still cluster + share label "Question 5".
+            question_number=source.question_number,
             exercise_ref=source.exercise_ref,
             chapter_ref=source.chapter_ref,
             kind=kind,
@@ -1400,7 +1406,9 @@ def _persist_regen_fallback(
         # 'passed' so it renders alongside generated variants in the regen
         # output (the failure is signalled via qc_local, not by hiding it).
         status="passed",
-        question_number=None,
+        # Inherit textbook-original question number from source — see the
+        # other regen-variant creation site above for the full rationale.
+        question_number=source.question_number,
         exercise_ref=source.exercise_ref,
         chapter_ref=source.chapter_ref,
         kind=source.kind,

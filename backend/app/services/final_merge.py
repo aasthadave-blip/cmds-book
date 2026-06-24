@@ -882,6 +882,18 @@ async def build_final_merge(
             if q.section_ref:
                 questions_by_section.setdefault(q.section_ref, []).append(q)
 
+    # Source-question lookup for variants. Regen variants are saved with
+    # question_number=None (worker bug — see question_regen_v3.py history);
+    # when a variant lacks a number, fall back to its source's. Without this
+    # fallback, Preview/Composer/DOCX can't sort the regen-prefer items list
+    # (everything has the same "missing" sort key → no reorder). Built from
+    # the originals we just loaded — they're guaranteed present here even on
+    # books whose variants now drive the merge.
+    _source_qnum_by_id: dict[str, Any] = {}
+    for _sec_qs in questions_by_section.values():
+        for _orig in _sec_qs:
+            _source_qnum_by_id[str(_orig.id)] = _orig.question_number
+
     # Now overlay saved regen questions per section (replacing originals
     # for that section).
     if saved_qregen is not None:
@@ -986,9 +998,16 @@ async def build_final_merge(
             siblings_by_prefix.setdefault(m.group(1), []).append(ss_other.id)
 
     def _question_to_dict(q, *, origin_section_id: str | None = None) -> dict[str, Any]:
+        # Variant fallback: regen variants in the DB have question_number=None
+        # (legacy worker behaviour); pull the textbook number from the source
+        # original so Preview/Composer/DOCX can sort + label correctly.
+        # Originals (no source_question_id) just keep their own q.question_number.
+        _qnum = q.question_number or _source_qnum_by_id.get(
+            str(getattr(q, "source_question_id", None) or "")
+        )
         qd: dict[str, Any] = {
             "id": str(q.id),
-            "question_number": q.question_number,
+            "question_number": _qnum,
             "exercise_ref": q.exercise_ref,
             "section_ref": q.section_ref,
             "page_start": q.page_start,
@@ -1135,10 +1154,15 @@ async def build_final_merge(
     def _excluded_q_dict(q) -> dict[str, Any]:
         # Same shape as the regular-section question dict so excluded-bank
         # questions carry figures + regen hints identically. Regen variants
-        # fall back to the SOURCE question's figures (own-then-source).
+        # fall back to the SOURCE question's figures (own-then-source) and
+        # to the source's question_number (variants are stored with
+        # question_number=None; see _question_to_dict above for context).
+        _qnum = q.question_number or _source_qnum_by_id.get(
+            str(getattr(q, "source_question_id", None) or "")
+        )
         return {
             "id": str(q.id),
-            "question_number": q.question_number,
+            "question_number": _qnum,
             "exercise_ref": q.exercise_ref,
             "section_ref": q.section_ref,
             "page_start": q.page_start,
