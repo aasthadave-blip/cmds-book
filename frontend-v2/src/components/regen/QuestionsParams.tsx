@@ -18,6 +18,7 @@ type Props = {
 };
 
 const SIMILARITY_OPTS: readonly QuestionsSimilarity[] = [
+  'numbers_only',
   'numbers_and_rephrase',
   'numbers_rephrase_add_concept',
   'new_question_same_topic',
@@ -26,6 +27,7 @@ const SIMILARITY_OPTS: readonly QuestionsSimilarity[] = [
 ] as const;
 
 const SIMILARITY_LABEL: Record<QuestionsSimilarity, string> = {
+  numbers_only: 'Numbers only',
   numbers_and_rephrase: 'Numbers + rephrase',
   numbers_rephrase_add_concept: 'Numbers + rephrase + concept',
   new_question_same_topic: 'New Q, same topic',

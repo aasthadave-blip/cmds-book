@@ -51,6 +51,7 @@ class RegenerateRequest(BaseModel):
 
     # R4 — v3 regen params. All optional with worker-side defaults.
     similarity_level: Literal[
+        "numbers_only",
         "numbers_and_rephrase",
         "numbers_rephrase_add_concept",
         "new_question_same_topic",

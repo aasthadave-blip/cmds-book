@@ -69,6 +69,7 @@ _VALID_PRIORITY_MODES = {"override"}
 
 # Valid similarity levels.
 _VALID_SIMILARITY_LEVELS = {
+    "numbers_only",
     "numbers_and_rephrase",
     "numbers_rephrase_add_concept",
     "new_question_same_topic",
@@ -1440,7 +1441,7 @@ async def _run_regen_v3(regen_id: UUID, job_id: UUID) -> dict[str, Any]:
             (getattr(regen, "similarity_level", None) or "").strip()
             or DEFAULT_SIMILARITY
         )
-        if similarity_level == "numbers_only" or similarity_level not in _VALID_SIMILARITY_LEVELS:
+        if similarity_level not in _VALID_SIMILARITY_LEVELS:
             similarity_level = DEFAULT_SIMILARITY
         count = DEFAULT_COUNT  # always 1, locked
         question_type = (
@@ -1783,7 +1784,7 @@ async def _run_regen_one_section_v3(
             (getattr(regen, "similarity_level", None) or "").strip()
             or DEFAULT_SIMILARITY
         )
-        if similarity_level == "numbers_only" or similarity_level not in _VALID_SIMILARITY_LEVELS:
+        if similarity_level not in _VALID_SIMILARITY_LEVELS:
             similarity_level = DEFAULT_SIMILARITY
         count = DEFAULT_COUNT  # always 1, locked
         question_type = (

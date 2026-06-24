@@ -117,6 +117,7 @@ export const postRegenTheory = (
 //   label:           string | null
 
 export type QuestionsSimilarity =
+  | 'numbers_only'
   | 'numbers_and_rephrase'
   | 'numbers_rephrase_add_concept'
   | 'new_question_same_topic'

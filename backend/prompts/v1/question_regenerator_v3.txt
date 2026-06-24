@@ -30,7 +30,27 @@ SIMILARITY LEVELS — the active regeneration modes
 Each similarity level defines what is LOCKED (must stay the same) and what CHANGES. The question_type tells you the output format.
 
 ───────────────────────────────────────────
-1. NUMBERS AND REPHRASE (First Choice / Default)
+1. NUMBERS ONLY (Most Conservative — exact clone with new values)
+───────────────────────────────────────────
+   LOCKED  : chapter, topic, concept, solution method, answer logic, AND the
+             exact wording, sentence structure, scenario, objects, names, and
+             context of the source — everything except the numbers
+   CHANGES : ONLY the numeric values in the stem (and the recomputed answer)
+
+   What to do:
+   - Change every numeric value in the stem to new, clean, curriculum-appropriate numbers.
+   - Keep the wording VERBATIM otherwise — do NOT rephrase, restructure, or swap
+     scenarios/objects/names. The ONLY difference from the source is the numbers.
+   - Recompute the answer and solution for the new numbers using the SAME method.
+   - Pick numbers that yield clean, exam-appropriate answers (no ugly arithmetic).
+   - Because the numbers changed, any figure/diagram tied to those numbers may need
+     updating to match (handled separately by the figure-regen step).
+
+   Question type: ALWAYS keep the SAME type as the source for this mode, unless
+   question_type is explicitly specified.
+
+───────────────────────────────────────────
+2. NUMBERS AND REPHRASE (First Choice / Default)
 ───────────────────────────────────────────
    LOCKED  : chapter, topic, concept, solution method, answer logic
    CHANGES : all numeric values AND the wording/phrasing
@@ -49,7 +69,7 @@ Each similarity level defines what is LOCKED (must stay the same) and what CHANG
    Question type: Keep same as source UNLESS question_type is explicitly specified.
 
 ───────────────────────────────────────────
-2. NUMBERS, REPHRASE AND ADD CONCEPT (Second Choice)
+3. NUMBERS, REPHRASE AND ADD CONCEPT (Second Choice)
 ───────────────────────────────────────────
    LOCKED  : chapter, topic, original concept
    CHANGES : wording, phrasing, all numbers, AND layers exactly ONE additional concept from the same topic on top
@@ -63,7 +83,7 @@ Each similarity level defines what is LOCKED (must stay the same) and what CHANG
    Question type: Use source type UNLESS question_type is explicitly specified.
 
 ───────────────────────────────────────────
-3. NEW QUESTION SAME TOPIC (Optional 1)
+4. NEW QUESTION SAME TOPIC (Optional 1)
 ───────────────────────────────────────────
    LOCKED  : chapter, topic
    CHANGES : everything else — new scenario, new setup, new numbers, new twist, new angle
@@ -78,7 +98,7 @@ Each similarity level defines what is LOCKED (must stay the same) and what CHANG
    Question type: Use source type UNLESS question_type is explicitly specified.
 
 ───────────────────────────────────────────
-4. SAME TOPIC + ADD ONE CONCEPT (Optional 2)
+5. SAME TOPIC + ADD ONE CONCEPT (Optional 2)
 ───────────────────────────────────────────
    LOCKED  : chapter, topic, original concept
    CHANGES : layers ONE additional concept from the same topic on top
@@ -93,7 +113,7 @@ Each similarity level defines what is LOCKED (must stay the same) and what CHANG
    Question type: Use source type UNLESS question_type is explicitly specified.
 
 ───────────────────────────────────────────
-5. SAME CHAPTER ANY TOPIC (Optional 3)
+6. SAME CHAPTER ANY TOPIC (Optional 3)
 ───────────────────────────────────────────
    LOCKED  : only the chapter
    CHANGES : topic, sub-topic, concept — all free for you to choose
@@ -158,7 +178,7 @@ RULE 4 — NUMERICAL HYGIENE
 RULE 5 — COUNT FIDELITY
 Generate EXACTLY one question. The list inside the JSON output under the "regenerated" key must contain exactly 1 item.
 
-RULE 6 — RIGOROUS REPHRASING (for levels 1 and 2)
+RULE 6 — RIGOROUS REPHRASING (for levels 2 and 3 — NOT for level 1 "Numbers only", which keeps the wording verbatim)
 - Do NOT just swap synonyms — restructure the sentence entirely.
 - Change the physical scenario (different object, setup, real-world context).
 - The rephrased version must feel like a different author wrote it.
