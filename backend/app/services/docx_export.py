@@ -51,7 +51,13 @@ MATH_RE = re.compile(r"\$\$?(.+?)\$\$?", re.DOTALL)
 # MCQ option marker inside raw_text (case-insensitive, A-D or 1-4 inside
 # parens). Used to (a) strip options off the stem so the Question line
 # doesn't repeat them, and (b) lay them out cleanly under Options:.
-OPTION_RE = re.compile(r"\(([A-Da-d1-4])\)")
+OPTION_RE = re.compile(r"\(([A-D1-4])\)")
+# Strict-MCQ pattern: only UPPERCASE A-D or digits 1-4. Lowercase (a)(b)(c)(d),
+# roman numerals (i)(ii)(iii)(iv), and any other format are deliberately NOT
+# matched — for those formats the raw_text stays intact (stem keeps everything,
+# no separate Options block). This avoids the "we partially recognized the
+# format and stripped content we shouldn't have" failure mode: when in doubt
+# about the option format, render the whole thing as the question body.
 
 # Figure placeholders embedded by the extractor: {{fig: <label> — <caption>}}
 FIG_RE = re.compile(r"\{\{\s*fig\s*:\s*([^}]+?)\s*\}\}", re.IGNORECASE)
@@ -821,16 +827,18 @@ def _render_question_head(
     diagram sits between the problem statement and the worked-out
     steps).
     """
-    raw = q.get("raw_text") or ""
-    stem = _strip_options_from_stem(raw)
-    has_options = bool(q.get("has_options"))
-
+    # NEVER strip anything from raw_text. The full extracted text — stem,
+    # options, whatever's in there — goes into the doc verbatim, so no content
+    # can ever silently disappear during export. Previously this code stripped
+    # options off the stem and only re-rendered them when `q.has_options` was
+    # True; when the flag was wrong, options were lost. Removing the strip
+    # entirely eliminates that entire class of data-loss bug at the cost of
+    # not having a separate "Options:" section header (options appear inline
+    # in the stem, which is exactly how they sit in the raw_text). User
+    # directive: "no data should be missing".
+    stem = (q.get("raw_text") or "").strip()
     question_label = "Question" if not label else f"Question {label}"
     b.labeled(question_label, stem)
-
-    if has_options:
-        opts = _parse_options(raw)
-        b.options(opts)
 
 
 def _render_question_tail(b: _DocBuilder, q: dict) -> None:
@@ -1196,6 +1204,14 @@ def build_final_draft_docx(
 
     current_section_key = ""
     last_sub = [""]
+    # Per-section question counter — resets at every section_heading. Used as
+    # the label for "Question N:" when the extractor didn't populate
+    # q.question_number (or left it empty). Without this, the final-draft path
+    # was the ONLY export path that didn't pass `label` to _render_question_head
+    # — every question rendered as just "Question:" with no number. The bank
+    # export paths (build_questions_docx / build_regen_docx) already had this
+    # pattern; we just bring the final-draft path in line.
+    section_q_counter = 0
     for it in items:
         t = it.get("type")
         if t == "section_heading":
@@ -1208,6 +1224,7 @@ def build_final_draft_docx(
             b.section_heading(title)
             current_section_key = _norm(title)
             last_sub = [""]
+            section_q_counter = 0  # reset per-section counter
             continue
         if t == "block":
             _render_block_item(b, it.get("block") or {}, current_section_key, last_sub)
@@ -1223,6 +1240,14 @@ def build_final_draft_docx(
             continue
         if t == "question":
             q = dict(it.get("question") or {})
+            # Per-section question number. Use the extracted `question_number`
+            # field when present (textbook-original "Q5", "Q19" etc.). When the
+            # extractor didn't populate it (empty/None), fall back to the
+            # per-section running index — so labels are always sequential 1, 2,
+            # 3 per section regardless of upstream data gaps. Mirrors the bank
+            # export's pattern (build_questions_docx / build_regen_docx).
+            section_q_counter += 1
+            qnum = (str(q.get("question_number") or "")).strip() or str(section_q_counter)
             # Layout: stem (+ options) → figures → solution.
             # Matches the PDF's original layout where the construction
             # diagram sits between the problem statement and the worked-
@@ -1230,7 +1255,7 @@ def build_final_draft_docx(
             # full question card (stem + options + solution), pushing
             # them past the solution text — wrong position relative to
             # the source PDF.
-            _render_question_head(b, q)
+            _render_question_head(b, q, label=qnum)
             # A regenerated diagram REPLACES the original figures (→ empty list
             # so nothing else emits). Otherwise split the embedded figures by
             # body_target: question-stem figures render UNDER THE STEM (before
