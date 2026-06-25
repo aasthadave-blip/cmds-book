@@ -75,7 +75,7 @@ $0.058 + 10×$0.059 + 10×$0.014 + $0.058 = $0.846 / chapter
 | Q3 | Question regen — multimodal | Worker when Q has figure | `gemini-2.5-pro` | S × P × V × Rq | $0.073 | Most expensive line item |
 | I2-img | Figure regen — IMAGE engine | `POST /api/books/{id}/sections/{ref}/regenerate-figures` (auto-picked by `pick_regen_engine` for photos / organic diagrams) | `gemini-3.1-flash-image` | F × Fr × E_img | $0.050 | Existing path |
 | I2-vec | Figure regen — VECTOR engine (NEW, 2026-06) | Same endpoint; auto-picked for line drawings / geometric figures | `gemini-2.5-pro` (via `_generate_diagram_blocking`) | F × Fr × E_vec | ~$0.025 | Generates LaTeX schematic |
-| I2-tab | Figure regen — TABLE_EMBED engine (NEW, 2026-06) | Same endpoint; auto-picked for composite tables with embedded graphics | `gemini-2.5-pro` × (1 + g_tab) | F × Fr × E_tab | ~$0.025 × (1 + g_tab) | 1 call for SVG table structure + 1 call per embedded graphic re-render |
+| I2-tab | Figure regen — TABLE_EMBED engine (NEW, 2026-06) | Same endpoint; auto-picked for composite tables with embedded graphics | 1× `gemini-2.5-pro` (SVG structure) + g_tab × `gemini-3.1-flash-image` (per-graphic redraw inside the table) | F × Fr × E_tab | ~$0.025 + (g_tab × $0.050) | Two-model pipeline: Pro generates the table SVG with `{{GRAPHIC_N}}` placeholders, then Flash-Image re-renders each inline graphic. g_tab default 1 → $0.075/fig; g_tab=3 → $0.175/fig. |
 | I-OL | Label overlay (×2 OCR passes) | OPTIONAL, gated by `OVERLAY_ENABLED` | `gemini-3.1-pro-preview` | F × Fr × E_img | $0.057 | On by default for IMAGE engine only; vector/table engines do their own labeling so overlay is skipped |
 
 ### 2.3 Admin / Maintenance (CPU-only, no API cost)
@@ -124,7 +124,7 @@ the legacy `image` engine — the doc's pre-2026-06 numbers apply.
 |---|---|---|---|---|
 | `image` | photos, organic diagrams, anything not vector-classifiable | `gemini-3.1-flash-image` (1 call) + overlay-OCR ×2 if `OVERLAY_ENABLED` | **$0.050** (+ $0.057 overlay) | Existing path; numbers identical to pre-2026-06 doc |
 | `vector` | line drawings, geometric / construction figures, simple schematics | `gemini-2.5-pro` (1 call to `_generate_diagram_blocking` → LaTeX → SVG → PNG) | **~$0.025** | Cheaper than image because Pro on a short LaTeX-gen prompt is ~half the cost of Flash-Image; overlay-OCR is skipped (vector engine emits clean labels itself) |
-| `table_embed` | composite tables with embedded graphics (cells contain mini-diagrams) | `gemini-2.5-pro` ×1 for SVG structure + `gemini-2.5-pro` × `g_tab` per embedded graphic re-render | **~$0.025 × (1 + g_tab)** | Most expensive when `g_tab` is high. `g_tab` is the count of graphics inside the table; typically 0-3, occasionally up to 10. Pure data tables (g_tab=0) → $0.025 |
+| `table_embed` | composite tables with embedded graphics (cells contain mini-diagrams) | 1× `gemini-2.5-pro` (table SVG structure) + g_tab × `gemini-3.1-flash-image` (per-graphic redraw via `_embed_table_graphics` at `question_regen_v3.py:1003`) | **~$0.025 + (g_tab × $0.050)** | Pro emits SVG with `{{GRAPHIC_N}}` placeholders; for each cell-graphic, the image model redraws the crop. `g_tab` is the graphic count: pure data tables → 0, typical → 1-3, rich composite figures → 5-10. Failure on `redraw` keeps the original crop (no extra Gemini cost, just CPU). |
 
 ### Engine mix (defaults, override per book/subject)
 
@@ -143,16 +143,23 @@ Mix shifts dramatically by subject:
 
 ### Why this can RAISE OR LOWER total cost
 
-Per-figure regen cost under default mix:
+Per-figure regen cost under default mix (excluding overlay/watermark, just the engine call itself):
 ```
-0.60 × $0.050  (image, including overlay $0.057 × 0.30 mix)
+0.60 × $0.050   (image)
 + 0.25 × $0.025 (vector)
-+ 0.15 × $0.025 × (1 + 1.0)  (table_embed @ g_tab=1)
-= $0.030 + $0.0063 + $0.0075 = $0.0438 per figure regenerated
++ 0.15 × ($0.025 + 1.0 × $0.050)  (table_embed @ g_tab=1: Pro + 1 Flash-Image redraw)
+= $0.030 + $0.00625 + $0.01125
+= $0.04750 per regenerated figure
 ```
-vs old single-engine model: $0.050 → **~12% cheaper on average**.
+vs old single-engine: $0.050 → **~5% cheaper on average**.
 
-**But tables with many embedded graphics (`g_tab` ≥ 5) can spike to $0.15+/fig** — those are rare in typical school textbooks but common in advanced data-science / engineering books. Watch your subject mix.
+**But table_embed dominates when g_tab is high**:
+  • g_tab=0 (pure data table): $0.025/fig
+  • g_tab=1 (one inline graphic): $0.075/fig
+  • g_tab=3 (composite figure): $0.175/fig
+  • g_tab=5 (heavy composite): $0.275/fig
+
+Subjects with lots of composite tables (stats / engineering / chemistry data) can easily double the per-figure cost vs the default mix.
 
 ### Disable to revert
 Set `FIGURE_ENGINE_ROUTING_ENABLED=false` to send every figure to the
@@ -189,11 +196,11 @@ QUESTIONS  = (N × $0.014) + (S × (1-P) × V × Rq × $0.014) + (S × P × V ×
              # V=1 in prod; if you ever raise V, S × ... terms scale linearly
 
 IMAGES     = $0.058
-           + (F × Fr × E_img × $0.050)              # image engine
-           + (F × Fr × E_vec × $0.025)              # vector engine (NEW)
-           + (F × Fr × E_tab × $0.025 × (1+g_tab))  # table_embed engine (NEW)
-           + (F × Fr × E_img × $0.057 × OVERLAY_ENABLED)
-             # overlay only applies to the image-engine slice
+           + (F × Fr × E_img × $0.050)                            # image engine
+           + (F × Fr × E_vec × $0.025)                            # vector engine (NEW)
+           + (F × Fr × E_tab × ($0.025 + g_tab × $0.050))         # table_embed engine (NEW): Pro for structure + Flash-Image per inline graphic
+           + (F × Fr × E_img × $0.057 × OVERLAY_ENABLED)          # overlay only applies to image-engine slice
+           + (F × Fr × E_img × $0.050 × WATERMARK_CLEAN)          # opt-in watermark cleanup, image-engine slice only (default OFF)
 
 AI_TOTAL    = THEORY + QUESTIONS + IMAGES
 RETRY       = AI_TOTAL × RETRY_BUFFER          # 0.30 if you observe retries, 0 default
@@ -216,29 +223,33 @@ QUESTIONS:                                            (V=1 throughout)
   QUESTIONS SUBTOTAL                          = $3.310
 
 IMAGES (engine-aware — see §2.5):
-  I1 figure ext:        1 × $0.058                       = $0.058
-  I2-img figure regen:  15 × 0.30 × 0.60 × $0.050        = $0.135
-  I2-vec figure regen:  15 × 0.30 × 0.25 × $0.025        = $0.028
-  I2-tab figure regen:  15 × 0.30 × 0.15 × $0.025 × 2.0  = $0.034
-  I-OL overlay (image-only): 15 × 0.30 × 0.60 × $0.057   = $0.154
-  IMAGES SUBTOTAL                                        = $0.409
+  I1 figure ext:        1 × $0.058                                = $0.058
+  I2-img figure regen:  15 × 0.30 × 0.60 × $0.050                 = $0.135
+  I2-vec figure regen:  15 × 0.30 × 0.25 × $0.025                 = $0.028
+  I2-tab figure regen:  15 × 0.30 × 0.15 × ($0.025 + 1.0×$0.050)  = $0.051
+  I-OL overlay (image-only): 15 × 0.30 × 0.60 × $0.057            = $0.154
+  WM1 watermark cleanup (default OFF):                              $0.000
+  IMAGES SUBTOTAL                                                 = $0.426
 
-AI_TOTAL                                                 = $5.077
-RETRY (0%):                                                $0.000
-INFRA:                                                     $0.100
-─────────────────────────────────────────────────────────
-GRAND TOTAL / CHAPTER                                    = $5.177
+AI_TOTAL                                                          = $5.094
+RETRY (0%):                                                         $0.000
+INFRA:                                                              $0.100
+──────────────────────────────────────────────────────────────────
+GRAND TOTAL / CHAPTER                                             = $5.194
 ```
 
-Net effect of engine-aware figure regen at default mix: **−$0.13/chapter (~2.5% cheaper)** vs the old single-engine model. Variance is wide — a stats / data-sci book with `E_tab=0.60, g_tab=3` adds ~$0.40/chapter. Math/geometry-heavy books with `E_vec=0.60` save another ~$0.10/chapter.
+Net effect of engine-aware figure regen at default mix: **−$0.11/chapter (~2% cheaper)** vs the old single-engine model. Variance is wide:
+  • stats / data-sci book with `E_tab=0.60, g_tab=3`: adds ~$0.50/chapter (table_embed dominates because each table costs $0.025 + 3×$0.050 = $0.175)
+  • math/geometry-heavy book with `E_vec=0.60`: saves ~$0.10/chapter
+  • if user turns on `watermark_clean=true` on every regen: adds ~$0.135/chapter (full F × Fr × $0.050 on image-engine slice)
 
 ### Annual estimate (12 chapters × 500 books, default engine mix)
 
 ```
-$5.177 × 12 × 500 = $31,062 / year
+$5.194 × 12 × 500 = $31,164 / year
 ```
 
-For 50 books / year: $3,106. For 1000 books / year: $62,124. Add Railway infra
+For 50 books / year: $3,116. For 1000 books / year: $62,328. Add Railway infra
 ($60–240/year). Cost is dominated by question regen (~63% of AI bill); see §5.
 
 ---
@@ -333,15 +344,15 @@ For showing cost in V-Studio UI:
 
 ## 9. Volume Projections
 
-| Volume | Extract only ($0.85) | Extract + 1 regen ($5.18) |
+| Volume | Extract only ($0.85) | Extract + 1 regen ($5.19) |
 |---|---|---|
-| 1 chapter | $0.85 | $5.18 |
-| 10 chapters | $8.46 | $51.77 |
-| 100 chapters | $84.60 | $517.70 |
-| 1 book (12 ch) | $10.15 | $62.12 |
-| 50 books / year | $507 | $3,106 |
-| 500 books / year | $5,070 | **$31,062** |
-| 1000 books / year | $10,140 | $62,124 |
+| 1 chapter | $0.85 | $5.19 |
+| 10 chapters | $8.46 | $51.94 |
+| 100 chapters | $84.60 | $519.40 |
+| 1 book (12 ch) | $10.15 | $62.33 |
+| 50 books / year | $507 | $3,116 |
+| 500 books / year | $5,070 | **$31,164** |
+| 1000 books / year | $10,140 | $62,328 |
 
 Add Railway infra: $5–20/month base ($60–240/year). Numbers above use V=1
 (fixed in prod) and default engine mix (E_img=0.60, E_vec=0.25, E_tab=0.15,
