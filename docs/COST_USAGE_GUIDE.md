@@ -3,9 +3,13 @@
 Comprehensive catalog of every Gemini/Anthropic API call the system makes,
 what triggers it, what it costs, and how to estimate volume.
 
-Updated: 2026-06-01
+Updated: 2026-06-23 — branch `architecture-v2` (prod). v3 (DB-polled worker) on
+`architecture-v3` branch is out of scope here; same per-call models, different
+coordination, no cost delta.
+
 Source: `backend/app/workers/*.py`, `backend/app/services/*.py`, Gemini API
-pricing (May 2026 verified).
+pricing (May 2026 verified). Updated for engine-aware figure regen (commit
+`fa0944e`) which routes figures to image / vector / table_embed engines.
 
 ---
 
@@ -69,8 +73,10 @@ $0.058 + 10×$0.059 + 10×$0.014 + $0.058 = $0.846 / chapter
 | T5 | Theory QC verifier | OPTIONAL, gated by `VERIFIER_ENABLED` | `gemini-2.5-flash` | N × Rt | $0.008 | Off by default in prod |
 | Q2 | Question regen — text | Worker on regen trigger | `gemini-2.5-flash` | S × (1-P) × V × Rq | $0.014 | S=src qs, P=img %, V=variants, Rq=passes |
 | Q3 | Question regen — multimodal | Worker when Q has figure | `gemini-2.5-pro` | S × P × V × Rq | $0.073 | Most expensive line item |
-| I2 | Figure regen | `POST /api/books/{id}/sections/{ref}/regenerate-figures` | `gemini-3.1-flash-image` | F × Fr | $0.050 | F=total figs, Fr=% regenerated |
-| I-OL | Label overlay (×2 OCR passes) | OPTIONAL, gated by `OVERLAY_ENABLED` | `gemini-3.1-pro-preview` | F × Fr | $0.057 | On by default; OCRs labels twice |
+| I2-img | Figure regen — IMAGE engine | `POST /api/books/{id}/sections/{ref}/regenerate-figures` (auto-picked by `pick_regen_engine` for photos / organic diagrams) | `gemini-3.1-flash-image` | F × Fr × E_img | $0.050 | Existing path |
+| I2-vec | Figure regen — VECTOR engine (NEW, 2026-06) | Same endpoint; auto-picked for line drawings / geometric figures | `gemini-2.5-pro` (via `_generate_diagram_blocking`) | F × Fr × E_vec | ~$0.025 | Generates LaTeX schematic |
+| I2-tab | Figure regen — TABLE_EMBED engine (NEW, 2026-06) | Same endpoint; auto-picked for composite tables with embedded graphics | `gemini-2.5-pro` × (1 + g_tab) | F × Fr × E_tab | ~$0.025 × (1 + g_tab) | 1 call for SVG table structure + 1 call per embedded graphic re-render |
+| I-OL | Label overlay (×2 OCR passes) | OPTIONAL, gated by `OVERLAY_ENABLED` | `gemini-3.1-pro-preview` | F × Fr × E_img | $0.057 | On by default for IMAGE engine only; vector/table engines do their own labeling so overlay is skipped |
 
 ### 2.3 Admin / Maintenance (CPU-only, no API cost)
 
@@ -103,18 +109,70 @@ for completeness and future-proofing if you switch providers or activate Anthrop
 
 ---
 
+## 2.5 Engine-Aware Figure Regen (NEW — added 2026-06)
+
+`pick_regen_engine(fig)` (in `app/workers/question_regen_v3.py:861`) classifies
+every figure and routes it to ONE of three engines. Gated by
+`FIGURE_ENGINE_ROUTING_ENABLED` (env, default ON). When OFF, everything goes to
+the legacy `image` engine — the doc's pre-2026-06 numbers apply.
+
+### Engine cost matrix
+
+| Engine | Picked when figure is… | Models hit | Per-fig cost | Notes |
+|---|---|---|---|---|
+| `image` | photos, organic diagrams, anything not vector-classifiable | `gemini-3.1-flash-image` (1 call) + overlay-OCR ×2 if `OVERLAY_ENABLED` | **$0.050** (+ $0.057 overlay) | Existing path; numbers identical to pre-2026-06 doc |
+| `vector` | line drawings, geometric / construction figures, simple schematics | `gemini-2.5-pro` (1 call to `_generate_diagram_blocking` → LaTeX → SVG → PNG) | **~$0.025** | Cheaper than image because Pro on a short LaTeX-gen prompt is ~half the cost of Flash-Image; overlay-OCR is skipped (vector engine emits clean labels itself) |
+| `table_embed` | composite tables with embedded graphics (cells contain mini-diagrams) | `gemini-2.5-pro` ×1 for SVG structure + `gemini-2.5-pro` × `g_tab` per embedded graphic re-render | **~$0.025 × (1 + g_tab)** | Most expensive when `g_tab` is high. `g_tab` is the count of graphics inside the table; typically 0-3, occasionally up to 10. Pure data tables (g_tab=0) → $0.025 |
+
+### Engine mix (defaults, override per book/subject)
+
+| Variable | Default | Meaning |
+|---|---|---|
+| `E_img` | 0.60 | Fraction of figures classified as IMAGE engine |
+| `E_vec` | 0.25 | Fraction classified as VECTOR (line drawings / schematics) |
+| `E_tab` | 0.15 | Fraction classified as TABLE_EMBED |
+| `g_tab` | 1.0 | Average graphics inside each table_embed figure |
+
+Mix shifts dramatically by subject:
+- **Math (algebra-heavy)**: E_img=0.30, E_vec=0.60, E_tab=0.10 → cheaper than baseline
+- **Geometry / Physics with circuits**: E_img=0.40, E_vec=0.50, E_tab=0.10
+- **Biology with labelled diagrams**: E_img=0.80, E_vec=0.10, E_tab=0.10 → close to baseline
+- **Stats / Data Sci with tables**: E_img=0.20, E_vec=0.20, E_tab=0.60, g_tab=2 → most expensive
+
+### Why this can RAISE OR LOWER total cost
+
+Per-figure regen cost under default mix:
+```
+0.60 × $0.050  (image, including overlay $0.057 × 0.30 mix)
++ 0.25 × $0.025 (vector)
++ 0.15 × $0.025 × (1 + 1.0)  (table_embed @ g_tab=1)
+= $0.030 + $0.0063 + $0.0075 = $0.0438 per figure regenerated
+```
+vs old single-engine model: $0.050 → **~12% cheaper on average**.
+
+**But tables with many embedded graphics (`g_tab` ≥ 5) can spike to $0.15+/fig** — those are rare in typical school textbooks but common in advanced data-science / engineering books. Watch your subject mix.
+
+### Disable to revert
+Set `FIGURE_ENGINE_ROUTING_ENABLED=false` to send every figure to the
+IMAGE engine. Use if Pro pricing changes or you want predictable per-fig
+cost. Doesn't affect any other pipeline stage.
+
+---
+
 ## 3. Variables / Assumptions (defaults)
 
 | Variable | Default | Meaning |
 |---|---|---|
 | N (sections per chapter) | 10 | Average for class 9-10 textbook |
 | S (questions per chapter) | 100 | All printed questions regenerated |
-| V (variants per regen) | 1 | Variants generated per source question |
+| **V (variants per regen)** | **1 (FIXED)** | **Variants generated per source question. Currently hardcoded to 1 in prod — every cost calc in this doc assumes V=1. Do NOT raise without re-doing the whole budget.** |
 | F (figures per chapter) | 15 | Total figures detected by extractor |
 | Fr (% figures regenerated) | 0.30 | Reviewer regenerates ~30% by default |
 | P (% questions with image) | 0.30 | Varies HEAVILY by subject — see §6 |
 | Rt (theory regen passes) | 1 | One regen click per chapter typical |
 | Rq (question regen passes) | 1 | One regen click per chapter typical |
+| E_img / E_vec / E_tab | 0.60 / 0.25 / 0.15 | Figure engine routing mix (NEW — see §2.5). Sum = 1.0 |
+| g_tab | 1.0 | Graphics inside each table_embed figure (NEW — see §2.5) |
 | Retry buffer | 0 | Set to 0.30 if you observe retry rate |
 | INFRA_PER_CHAPTER | $0.10 | Railway hosting amortised |
 
@@ -124,15 +182,23 @@ for completeness and future-proofing if you switch providers or activate Anthrop
 
 ```
 THEORY     = $0.058 + (N × $0.059) + (N × Rt × $0.071)
+
 QUESTIONS  = (N × $0.014) + (S × (1-P) × V × Rq × $0.014) + (S × P × V × Rq × $0.073)
-IMAGES     = $0.058 + (F × Fr × $0.050) + (F × Fr × $0.057 × OVERLAY_ENABLED)
+             # V=1 in prod; if you ever raise V, S × ... terms scale linearly
+
+IMAGES     = $0.058
+           + (F × Fr × E_img × $0.050)              # image engine
+           + (F × Fr × E_vec × $0.025)              # vector engine (NEW)
+           + (F × Fr × E_tab × $0.025 × (1+g_tab))  # table_embed engine (NEW)
+           + (F × Fr × E_img × $0.057 × OVERLAY_ENABLED)
+             # overlay only applies to the image-engine slice
 
 AI_TOTAL    = THEORY + QUESTIONS + IMAGES
-RETRY       = AI_TOTAL × RETRY_BUFFER         (0.30 typical, 0.00 if disabled)
+RETRY       = AI_TOTAL × RETRY_BUFFER          # 0.30 if you observe retries, 0 default
 GRAND_TOTAL = AI_TOTAL + RETRY + INFRA_PER_CHAPTER
 ```
 
-### Example — Typical chapter (N=10, S=100, V=1, F=15, Fr=0.30, P=0.30, Rt=1, Rq=1)
+### Example — Typical chapter (N=10, S=100, **V=1**, F=15, Fr=0.30, P=0.30, Rt=1, Rq=1, E_img=0.60, E_vec=0.25, E_tab=0.15, g_tab=1.0, OVERLAY=on)
 
 ```
 THEORY:
@@ -141,30 +207,37 @@ THEORY:
   T4 regen:        10 × $0.071 = $0.710
   THEORY SUBTOTAL              = $1.358
 
-QUESTIONS:
-  Q1 extract:      10 × $0.014        = $0.140
+QUESTIONS:                                            (V=1 throughout)
+  Q1 extract:      10 × $0.014                = $0.140
   Q2 text regen:   100 × 0.7 × 1 × 1 × $0.014 = $0.980
   Q3 mm regen:     100 × 0.3 × 1 × 1 × $0.073 = $2.190
-  QUESTIONS SUBTOTAL                  = $3.310
+  QUESTIONS SUBTOTAL                          = $3.310
 
-IMAGES:
-  I1 figure ext:    1 × $0.058        = $0.058
-  I2 figure regen:  15 × 0.30 × $0.05 = $0.225
-  I-OL overlay:     15 × 0.30 × $0.057 = $0.257
-  IMAGES SUBTOTAL                     = $0.540
+IMAGES (engine-aware — see §2.5):
+  I1 figure ext:        1 × $0.058                       = $0.058
+  I2-img figure regen:  15 × 0.30 × 0.60 × $0.050        = $0.135
+  I2-vec figure regen:  15 × 0.30 × 0.25 × $0.025        = $0.028
+  I2-tab figure regen:  15 × 0.30 × 0.15 × $0.025 × 2.0  = $0.034
+  I-OL overlay (image-only): 15 × 0.30 × 0.60 × $0.057   = $0.154
+  IMAGES SUBTOTAL                                        = $0.409
 
-AI_TOTAL                              = $5.208
-RETRY (0%):                             $0.000
-INFRA:                                  $0.100
-─────────────────────────────────────────────
-GRAND TOTAL / CHAPTER                 = $5.308
+AI_TOTAL                                                 = $5.077
+RETRY (0%):                                                $0.000
+INFRA:                                                     $0.100
+─────────────────────────────────────────────────────────
+GRAND TOTAL / CHAPTER                                    = $5.177
 ```
 
-### Annual estimate (12 chapters × 500 books)
+Net effect of engine-aware figure regen at default mix: **−$0.13/chapter (~2.5% cheaper)** vs the old single-engine model. Variance is wide — a stats / data-sci book with `E_tab=0.60, g_tab=3` adds ~$0.40/chapter. Math/geometry-heavy books with `E_vec=0.60` save another ~$0.10/chapter.
+
+### Annual estimate (12 chapters × 500 books, default engine mix)
 
 ```
-$5.308 × 12 × 500 = $31,848 / year
+$5.177 × 12 × 500 = $31,062 / year
 ```
+
+For 50 books / year: $3,106. For 1000 books / year: $62,124. Add Railway infra
+($60–240/year). Cost is dominated by question regen (~63% of AI bill); see §5.
 
 ---
 
@@ -172,18 +245,23 @@ $5.308 × 12 × 500 = $31,848 / year
 
 | Rank | Driver | $/chapter | % of bill |
 |---|---|---|---|
-| 1 | Q3 multimodal regen | $2.19 | 41% |
-| 2 | Q2 text regen | $0.98 | 18% |
-| 3 | T4 theory regen | $0.71 | 13% |
+| 1 | Q3 multimodal regen | $2.19 | 42% |
+| 2 | Q2 text regen | $0.98 | 19% |
+| 3 | T4 theory regen | $0.71 | 14% |
 | 4 | T3 theory extract | $0.59 | 11% |
-| 5 | I-OL label overlay | $0.26 | 5% |
-| 6 | I2 figure regen | $0.23 | 4% |
-| 7 | Q1 question extract | $0.14 | 3% |
+| 5 | I-OL label overlay (image-only) | $0.15 | 3% |
+| 6 | Q1 question extract | $0.14 | 3% |
+| 7 | I2-img figure regen | $0.14 | 3% |
 | 8 | Infrastructure | $0.10 | 2% |
-| 9 | I1 figure extract | $0.058 | 1% |
-| 10 | T2 schema | $0.058 | 1% |
+| 9 | I2-tab figure regen | $0.03 | 1% |
+| 10 | I2-vec figure regen | $0.03 | 1% |
+| 11 | I1 figure extract | $0.058 | 1% |
+| 12 | T2 schema | $0.058 | 1% |
 
-**Insight:** Question regen (Q2+Q3) = 59% of cost. Multimodal alone is 41%.
+**Insight:** Question regen (Q2+Q3) = 61% of the bill. Multimodal alone is 42%.
+Figure-engine routing (2026-06) saves ~$0.13/chapter on average but adds variance
+— a stats / data-sci textbook with many `table_embed` figures can shift I2-tab
+from rank 9 up to rank 5.
 
 ---
 
@@ -209,13 +287,14 @@ If your `P` is incorrect, the Q3 multimodal estimate is off by an order of magni
 
 | # | Lever | Effort | Savings $/ch | Risk |
 |---|---|---|---|---|
-| 1 | Disable multimodal regen (Q3 → Q2 fallback) | Env var (5 min) | ~$2.19 | MEDIUM — loses image-aware reasoning |
+| 1 | Disable multimodal regen (Q3 → Q2 fallback) | Env var `MULTIMODAL_REGEN_ENABLED=false` | ~$2.19 | MEDIUM — loses image-aware reasoning |
 | 2 | Skip regen on 50% of chapters | Workflow | ~$1.66 | LOW — selective regen |
 | 3 | Enable Gemini prompt caching | 1 dev day | ~$0.30 | ZERO — pure win |
-| 4 | Disable I-OL label overlay | Config flag | ~$0.26 | MEDIUM — label clarity |
+| 4 | Disable I-OL label overlay | Config flag | ~$0.15 | MEDIUM — label clarity |
 | 5 | Move T3 theory extract to Flash | Env var | ~$0.45 | HIGH — quality drop on dense pages |
 | 6 | Filter image-questions out of regen | Logic change | ~$2.19 | MEDIUM — those Qs stay as printed |
-| 7 | Reduce V (already at 1) | UI change | $0 currently | N/A |
+| 7 | Reduce V (already at 1) | UI change | $0 currently | N/A — `V=1` is hardcoded in prod |
+| 8 | **Disable engine routing** (`FIGURE_ENGINE_ROUTING_ENABLED=false`) | Env var | **−$0.13 (saves only on books with lots of `vector` figures)** | LOW — reverts to single image-engine cost. Use if you want predictable per-fig cost, otherwise leave ON for net savings |
 
 **Recommended sequence:**
 1. Enable prompt caching (zero risk, $0.30 saved)
@@ -228,16 +307,21 @@ If your `P` is incorrect, the Q3 multimodal estimate is off by an order of magni
 
 For showing cost in V-Studio UI:
 
-| User Action | API Cost |
+| User Action | API Cost (V=1) |
 |---|---|
 | Upload chapter | ~$0.85 (extraction) |
 | Click "Regenerate Theory" (whole book) | ~$0.71 |
 | Click "Regenerate this section" | ~$0.07 |
 | Click "Regenerate Questions" (whole bank) | ~$3.17 |
-| Click "Reseed figures" (whole section) | ~$0.04 per fig |
-| Click "Reseed figures" (whole chapter, 15 figs at 30%) | ~$0.23 |
-| View Preview page | $0 |
+| Click "Reseed figures" — image engine | ~$0.050 / fig |
+| Click "Reseed figures" — vector engine | ~$0.025 / fig |
+| Click "Reseed figures" — table_embed engine | ~$0.025 × (1 + g_tab) / fig |
+| Click "Reseed figures" (whole chapter, 15 figs at 30%, default engine mix) | ~$0.20 |
+| View Preview / Composer / Comparison tab | $0 |
 | Export DOCX | $0 |
+| Reseed final-draft (`POST /final-draft/reseed`) | $0 (recompute from DB only) |
+| Cancel-all jobs / per-book cancel | $0 (Celery revoke + DB flip) |
+| Drag-reorder a question in Composer | $0 |
 | Hide a question | $0 |
 | Add new folder | $0 |
 | Login | $0 |
@@ -246,17 +330,20 @@ For showing cost in V-Studio UI:
 
 ## 9. Volume Projections
 
-| Volume | Extract only ($0.85) | Extract + 1 regen ($5.31) |
+| Volume | Extract only ($0.85) | Extract + 1 regen ($5.18) |
 |---|---|---|
-| 1 chapter | $0.85 | $5.31 |
-| 10 chapters | $8.46 | $53.08 |
-| 100 chapters | $84.60 | $530.80 |
-| 1 book (12 ch) | $10.15 | $63.69 |
-| 50 books / year | $507 | $3,185 |
-| 500 books / year | $5,070 | **$31,848** |
-| 1000 books / year | $10,140 | $63,696 |
+| 1 chapter | $0.85 | $5.18 |
+| 10 chapters | $8.46 | $51.77 |
+| 100 chapters | $84.60 | $517.70 |
+| 1 book (12 ch) | $10.15 | $62.12 |
+| 50 books / year | $507 | $3,106 |
+| 500 books / year | $5,070 | **$31,062** |
+| 1000 books / year | $10,140 | $62,124 |
 
-Add Railway infra: $5–20/month base ($60–240/year).
+Add Railway infra: $5–20/month base ($60–240/year). Numbers above use V=1
+(fixed in prod) and default engine mix (E_img=0.60, E_vec=0.25, E_tab=0.15,
+g_tab=1.0). Subject-heavy outliers: data-sci/stats books with lots of tables
+can run ~$0.30/chapter higher; algebra-heavy math can run ~$0.10 lower.
 
 ---
 
@@ -289,8 +376,12 @@ Add Railway infra: $5–20/month base ($60–240/year).
 | Question regen — text | `backend/app/workers/question_regen_v3.py:366` | `call_gemini_text_only` (Flash) |
 | Question regen — multimodal | `backend/app/workers/question_regen_v3.py:354` | `call_gemini_text_with_images` (Pro) |
 | Figure extract | `backend/app/services/figures/extractor.py:134` | `generate_content` (Pro Preview) |
-| Figure regen | `backend/app/services/figures/regenerator.py:141` | `generate_content` (Flash Image) |
-| Label overlay (OCR) | `backend/app/services/figures/overlay.py:159` | `generate_content` (Pro Preview, ×2 passes) |
+| Figure regen — engine router | `backend/app/workers/question_regen_v3.py:861` | `pick_regen_engine(fig)` — returns "image" / "vector" / "table_embed" |
+| Figure regen — image engine | `backend/app/services/figures/regenerator.py:141` | `generate_content` (Flash Image) |
+| Figure regen — vector engine | `backend/app/workers/question_regen_v3.py:1150` | `compute_vector_png` → `_generate_diagram_blocking` (Pro) |
+| Figure regen — table_embed engine | `backend/app/workers/question_regen_v3.py:1185` | `compute_table_png` → `_generate_diagram_blocking` (Pro) + `_embed_table_graphics` (Pro per inline graphic) |
+| Engine dispatch site (figures pipeline) | `backend/app/workers/figures_tasks.py:780-799` | `qr3.pick_regen_engine` + route to compute_table_png / compute_vector_png / image-engine fallback |
+| Label overlay (OCR) | `backend/app/services/figures/overlay.py:159` | `generate_content` (Pro Preview, ×2 passes) — image-engine only |
 
 ### Shared infrastructure
 
@@ -394,9 +485,11 @@ not switching models globally.
 
 ---
 
-## 11.8. Recent Runtime Optimizations (shipped in this session)
+## 11.8. Recent Runtime Optimizations (cumulative)
 
-These are code-level cost/reliability changes already pushed to `infra/phase1-celery`:
+These are code-level cost/reliability changes shipped to `architecture-v2`
+(prod). Older items shipped earlier on `infra/phase1-celery`; the 2026-06-23
+group landed today.
 
 | Change | Where | Cost impact | Reliability impact |
 |---|---|---|---|
@@ -409,6 +502,18 @@ These are code-level cost/reliability changes already pushed to `infra/phase1-ce
 | **Worked-example subsection dedup** | `final_merge.py:999+` | No direct cost change | Prevents duplicate "Q4.2 + EXAMPLE 4.2" in preview |
 | **SKIP_ORPHAN_RECOVERY env var** | `main.py:171` | Saves cost of crash loop re-dispatching | Backend stays UP even if a job is poisoned |
 | **CELERY_CONCURRENCY=1 default** | `start.sh` | No direct cost change | RAM safety on 512MB tier |
+| **Engine-aware figure regen** (`fa0944e`) | `question_regen_v3.py:pick_regen_engine`, `figures_tasks.py:780` | -$0.13/chapter on default mix; ±$0.40 by subject | Vector/table figures regenerate with type-appropriate engine instead of all going to image |
+| **pylatexenc declared as dep** (`355b137`) | `backend/pyproject.toml` | No cost change | Theory/Q/Fig stages no longer crash on `ModuleNotFoundError` post-schema |
+| **Tolerant figures JSON parser** (`177642b`) | `figures/extractor.py` | No cost change | Figure stage no longer crashes when Gemini's response has trailing garbage after the JSON object |
+| **needs_review schema → ready** (`4241ce4`) | `book_status.py` | No cost change | Books finalize properly instead of hanging at "processing" |
+| **Auto-reaper (watchdog)** (`e78a69d`) | `core/watchdog.py:_reap_zombie_tasks` | Saves cost of re-running zombie tasks after Celery redelivery — variable, depends on restart frequency | Redeploys self-heal; no manual cancel-all needed |
+| **Real cancel (revoke + purge)** (`fda69c1`) | `services/cancellation.py`, `workers/runner.py` | Saves wasted Gemini calls on cancelled work (cancellation now actually stops in-flight tasks) | No restart needed to cancel |
+| **Figures-only fail → partial book** (`177642b`) | `book_status.py` | No cost change | Theory + questions stay usable when only figures fails |
+| **DOCX no-strip + per-section question numbering + question_number sort** (`efca48f`, `3179023`, `70bbe85`) | `docx_export.py`, `final_merge.py`, `question_regen_v3.py`, frontend `question-sort.ts` | No cost change | Export shows full raw_text + textbook-numeric order across Preview/Composer/Regen/DOCX |
+| **Figure URL normalization** (`e5fd369`) | `TheoryView.tsx:EmbeddedFigureRender` | No cost change | Label-less placement-only figures render in the review UI instead of broken-image icons |
+| **Live N-of-M progress for figures + questions** (`1379016`, `8feb88c`) | `extractionPipeline.ts` | No cost change | UI shows "N figures extracted" / "N questions extracted" during run |
+| **Pillow declared as direct dep** (`676d91f`) | `pyproject.toml` | No cost change | Was transitive via cairosvg/pdfplumber; now explicit since used by `_embed_table_graphics` |
+| **"numbers_only" question-regen similarity restored** (`f821e9a`) | regen UI | No new cost path | Adds setting that uses existing regen call — no extra calls |
 
 ### Net cost effect of session changes
 
@@ -428,19 +533,30 @@ So this session's work made the system **6.6% cheaper if v3 prompts activated** 
 Set env vars on the Railway Backend service:
 
 ```
-ANTHROPIC_API_KEY=mock          # disables Claude (no cost)
+# ── Providers ──────────────────────────────────────────────────────────
+ANTHROPIC_API_KEY=mock              # disables Claude (no cost)
 ANTHROPIC_MODEL=claude-sonnet-4-6
-GEMINI_REGEN_MODEL=gemini-2.5-pro   # downgrade to flash for cost savings
+ANTHROPIC_MODE=auto                 # auto | mock | real | agent
+GEMINI_REGEN_MODEL=gemini-2.5-pro   # also used by vector/table_embed engines
 
-# Concurrency / safety (cost-relevant)
-FIGURE_EXTRACT_MAX_INFLIGHT=1   # parallel figure extracts (RAM trade)
-CELERY_CONCURRENCY=1            # parallel worker tasks (RAM + cost cap)
+# ── Concurrency / safety (cost-relevant) ───────────────────────────────
+CELERY_CONCURRENCY=3                # parallel worker tasks (RAM + cost cap). start.sh default is 2; prod sets 3.
+FIGURE_EXTRACT_MAX_INFLIGHT=1       # parallel figure extracts (RAM trade)
+GEMINI_GLOBAL_INFLIGHT=8            # NEW (2026-06): container-wide cap on concurrent Gemini calls. Divides across CELERY_CONCURRENCY workers (e.g. 8/3 = 2 per worker). Bumping to 16 doubles throughput for single books but doesn't change per-call cost.
 
-# Disable expensive features
-# (no env yet — would need code change to gate)
-# MULTIMODAL_REGEN_ENABLED=0      # → drops Q3 cost to zero
-# OVERLAY_ENABLED=0               # → drops I-OL cost
-# VERIFIER_ENABLED=0              # T5 already off by default
+# ── Feature flags ──────────────────────────────────────────────────────
+MULTIMODAL_REGEN_ENABLED=true       # set false → drops Q3 cost; image questions get Flash text-only regen instead of Pro multimodal
+FIGURE_ENGINE_ROUTING_ENABLED=true  # NEW (2026-06): when true, vector/table_embed engines split the figure regen load. false → everything goes to legacy image engine (single per-fig cost).
+USE_DB_WORKER=false                 # v3 toggle. Leave false on architecture-v2. (true only switches if you're on architecture-v3 branch with v3 code present.)
+
+# ── Reliability knobs ──────────────────────────────────────────────────
+SKIP_ORPHAN_RECOVERY=0              # set 1 to skip orphan-job re-dispatch on startup
+CELERY_TASK_TIME_LIMIT=1200         # 20 min hard limit per task (env-overridable)
+CELERY_TASK_SOFT_TIME_LIMIT=1020    # 17 min soft limit
+
+# ── Future-gated (no env keys yet — would need code change to wire) ───
+# OVERLAY_ENABLED=0                 # would drop I-OL cost (~$0.15/chapter)
+# VERIFIER_ENABLED=0                # T5 already off by default
 ```
 
 ---
