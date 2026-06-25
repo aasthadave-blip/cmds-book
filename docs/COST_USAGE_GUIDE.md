@@ -103,6 +103,8 @@ are set or specific user actions are taken.
 | QV1 | Question extraction v2 (LEGACY) | `workers/questions_v2.py` | `gemini-2.5-flash` | $0.014/call | Only if v3 is disabled (not currently) |
 | QV1b | Question extraction v1 (DEPRECATED) | `workers/questions.py` | `gemini-2.5-flash` | $0.014/call | Not used in current pipeline |
 | RG1 | Standalone figure_regenerator.py | `services/figure_regenerator.py` | `gemini-3.1-flash-image` | $0.05/image | Alternative regen path; routed via figures_tasks.py |
+| WM1 | Watermark cleanup on regen output | `services/figures/watermark.py` (called from `figures_tasks.py:606,1040`) | `gemini-3.1-flash-image-preview` | $0.050/image | Opt-in — user passes `watermark_clean=true` in figure-regen payload. Default OFF. When ON: adds ~$0.05 per regenerated figure (post-process Gemini call to strip any watermark in the regenerated image). |
+| QCA | Claude QC auditor (P6) | `services/qc/llm.py` | `claude-sonnet-4-6` | depends on prompt; ~$0.005-0.02/section | DEAD by default — no live callers in the current pipeline (it's the legacy "audit a failed extraction" path from earlier QC architecture). Also requires real Anthropic key (currently mocked). Listed for completeness; activate only by explicit code wiring + real key. |
 
 **Status:** All 7 of these are currently NOT firing in your production setup. They're listed
 for completeness and future-proofing if you switch providers or activate Anthropic.
@@ -317,6 +319,7 @@ For showing cost in V-Studio UI:
 | Click "Reseed figures" — vector engine | ~$0.025 / fig |
 | Click "Reseed figures" — table_embed engine | ~$0.025 × (1 + g_tab) / fig |
 | Click "Reseed figures" (whole chapter, 15 figs at 30%, default engine mix) | ~$0.20 |
+| Click "Reseed figures" with **watermark_clean=true** | +$0.05 per regenerated figure (opt-in WM1 stage) |
 | View Preview / Composer / Comparison tab | $0 |
 | Export DOCX | $0 |
 | Reseed final-draft (`POST /final-draft/reseed`) | $0 (recompute from DB only) |
@@ -382,6 +385,7 @@ can run ~$0.30/chapter higher; algebra-heavy math can run ~$0.10 lower.
 | Figure regen — table_embed engine | `backend/app/workers/question_regen_v3.py:1185` | `compute_table_png` → `_generate_diagram_blocking` (Pro) + `_embed_table_graphics` (Pro per inline graphic) |
 | Engine dispatch site (figures pipeline) | `backend/app/workers/figures_tasks.py:780-799` | `qr3.pick_regen_engine` + route to compute_table_png / compute_vector_png / image-engine fallback |
 | Label overlay (OCR) | `backend/app/services/figures/overlay.py:159` | `generate_content` (Pro Preview, ×2 passes) — image-engine only |
+| Watermark cleanup (WM1) | `backend/app/services/figures/watermark.py:67`, called from `figures_tasks.py:606,1040` | `generate_content` (Flash Image Preview) — opt-in, fires only when `watermark_clean=true` |
 
 ### Shared infrastructure
 
