@@ -7,6 +7,10 @@ Updated: 2026-06-23 — branch `architecture-v2` (prod). v3 (DB-polled worker) o
 `architecture-v3` branch is out of scope here; same per-call models, different
 coordination, no cost delta.
 
+Baseline assumptions (this revision): N=100 sections/chapter, S=150
+questions/chapter, V=1, **theory regen (T4) costed on Flash 2.5** (~4× cheaper
+than Pro). Headline: **$14.44/chapter, $86,632/year @ 500 books × 12 ch.**
+
 Source: `backend/app/workers/*.py`, `backend/app/services/*.py`, Gemini API
 pricing (May 2026 verified). Updated for engine-aware figure regen (commit
 `fa0944e`) which routes figures to image / vector / table_embed engines.
@@ -18,8 +22,8 @@ pricing (May 2026 verified). Updated for engine-aware figure regen (commit
 ### Primary models (always-on)
 | Model | Input $/1M tokens | Output $/1M tokens | Where used |
 |---|---|---|---|
-| `gemini-2.5-pro` | 1.25 | 10.00 | Schema, theory extract+regen, multimodal Q regen |
-| `gemini-2.5-flash` | 0.30 | 2.50 | Question extract, text-only Q regen, optional QC verifier |
+| `gemini-2.5-pro` | 1.25 | 10.00 | Schema, theory extract, multimodal Q regen |
+| `gemini-2.5-flash` | 0.30 | 2.50 | Question extract, text-only Q regen, **theory regen (Flash 2.5)**, optional QC verifier |
 | `gemini-3.1-pro-preview` | 2.00 | 12.00 | Figure extraction, figure-regen label overlay |
 | `gemini-3.1-flash-image` | flat $0.05 / image | n/a | Figure image regeneration |
 
@@ -60,16 +64,16 @@ times this fires per book chapter processed.
 
 **Extraction subtotal (no regen):** ≈ $0.058 + (N × $0.059) + (N × $0.014) + $0.058
 
-For N = 10 sections:
+For N = 100 sections (baseline):
 ```
-$0.058 + 10×$0.059 + 10×$0.014 + $0.058 = $0.846 / chapter
+$0.058 + 100×$0.059 + 100×$0.014 + $0.058 = $7.416 / chapter
 ```
 
 ### 2.2 Regeneration Pipeline (user-triggered)
 
 | Tag | Stage | Trigger | Model | Calls/regen | Per-call $ | Notes |
 |---|---|---|---|---|---|---|
-| T4 | Theory regen | `POST /api/books/{id}/regenerate` or per-section reseed | `gemini-2.5-pro` | N × Rt | $0.071 | N = sections, Rt = regen passes |
+| T4 | Theory regen | `POST /api/books/{id}/regenerate` or per-section reseed | `gemini-2.5-flash` | N × Rt | $0.018 | N = sections, Rt = regen passes. Flash 2.5 (~4× cheaper than Pro); was $0.071 on Pro |
 | T5 | Theory QC verifier | OPTIONAL, gated by `VERIFIER_ENABLED` | `gemini-2.5-flash` | N × Rt | $0.008 | Off by default in prod |
 | Q2 | Question regen — text | Worker on regen trigger | `gemini-2.5-flash` | S × (1-P) × V × Rq | $0.014 | S=src qs, P=img %, V=variants, Rq=passes |
 | Q3 | Question regen — multimodal | Worker when Q has figure | `gemini-2.5-pro` | S × P × V × Rq | $0.073 | Most expensive line item |
@@ -172,8 +176,8 @@ cost. Doesn't affect any other pipeline stage.
 
 | Variable | Default | Meaning |
 |---|---|---|
-| N (sections per chapter) | 10 | Average for class 9-10 textbook |
-| S (questions per chapter) | 100 | All printed questions regenerated |
+| N (sections per chapter) | 100 | Large-book baseline (per current planning) |
+| S (questions per chapter) | 150 | All printed questions regenerated |
 | **V (variants per regen)** | **1 (FIXED)** | **Variants generated per source question. Currently hardcoded to 1 in prod — every cost calc in this doc assumes V=1. Do NOT raise without re-doing the whole budget.** |
 | F (figures per chapter) | 15 | Total figures detected by extractor |
 | Fr (% figures regenerated) | 0.30 | Reviewer regenerates ~30% by default |
@@ -190,7 +194,8 @@ cost. Doesn't affect any other pipeline stage.
 ## 4. Per-Chapter Cost Formulas
 
 ```
-THEORY     = $0.058 + (N × $0.059) + (N × Rt × $0.071)
+THEORY     = $0.058 + (N × $0.059) + (N × Rt × $0.018)
+             # T4 theory regen on Flash 2.5 ($0.018/sec); was $0.071 on Pro
 
 QUESTIONS  = (N × $0.014) + (S × (1-P) × V × Rq × $0.014) + (S × P × V × Rq × $0.073)
              # V=1 in prod; if you ever raise V, S × ... terms scale linearly
@@ -207,20 +212,20 @@ RETRY       = AI_TOTAL × RETRY_BUFFER          # 0.30 if you observe retries, 0
 GRAND_TOTAL = AI_TOTAL + RETRY + INFRA_PER_CHAPTER
 ```
 
-### Example — Typical chapter (N=10, S=100, **V=1**, F=15, Fr=0.30, P=0.30, Rt=1, Rq=1, E_img=0.60, E_vec=0.25, E_tab=0.15, g_tab=1.0, OVERLAY=on)
+### Example — Baseline chapter (N=100, S=150, **V=1**, F=15, Fr=0.30, P=0.30, Rt=1, Rq=1, E_img=0.60, E_vec=0.25, E_tab=0.15, g_tab=1.0, OVERLAY=on, **T4 theory regen = Flash 2.5**)
 
 ```
 THEORY:
-  T2 schema:        1 × $0.058 = $0.058
-  T3 theory:       10 × $0.059 = $0.590
-  T4 regen:        10 × $0.071 = $0.710
-  THEORY SUBTOTAL              = $1.358
+  T2 schema:         1 × $0.058 = $0.058
+  T3 theory:       100 × $0.059 = $5.900
+  T4 regen (FLASH):100 × $0.018 = $1.800
+  THEORY SUBTOTAL               = $7.758
 
 QUESTIONS:                                            (V=1 throughout)
-  Q1 extract:      10 × $0.014                = $0.140
-  Q2 text regen:   100 × 0.7 × 1 × 1 × $0.014 = $0.980
-  Q3 mm regen:     100 × 0.3 × 1 × 1 × $0.073 = $2.190
-  QUESTIONS SUBTOTAL                          = $3.310
+  Q1 extract:      100 × $0.014               = $1.400
+  Q2 text regen:   150 × 0.7 × 1 × 1 × $0.014 = $1.470
+  Q3 mm regen:     150 × 0.3 × 1 × 1 × $0.073 = $3.285
+  QUESTIONS SUBTOTAL                          = $6.155
 
 IMAGES (engine-aware — see §2.5):
   I1 figure ext:        1 × $0.058                                = $0.058
@@ -231,50 +236,55 @@ IMAGES (engine-aware — see §2.5):
   WM1 watermark cleanup (default OFF):                              $0.000
   IMAGES SUBTOTAL                                                 = $0.426
 
-AI_TOTAL                                                          = $5.094
+AI_TOTAL                                                          = $14.339
 RETRY (0%):                                                         $0.000
 INFRA:                                                              $0.100
 ──────────────────────────────────────────────────────────────────
-GRAND TOTAL / CHAPTER                                             = $5.194
+GRAND TOTAL / CHAPTER                                             = $14.439
 ```
 
-Net effect of engine-aware figure regen at default mix: **−$0.11/chapter (~2% cheaper)** vs the old single-engine model. Variance is wide:
-  • stats / data-sci book with `E_tab=0.60, g_tab=3`: adds ~$0.50/chapter (table_embed dominates because each table costs $0.025 + 3×$0.050 = $0.175)
-  • math/geometry-heavy book with `E_vec=0.60`: saves ~$0.10/chapter
-  • if user turns on `watermark_clean=true` on every regen: adds ~$0.135/chapter (full F × Fr × $0.050 on image-engine slice)
+Notes on this baseline:
+  • **THEORY now dominates (54% of the bill)** — T3 extract + T4 regen are per-section, and N=100 makes them the largest blocks. T3 extract ($5.90) is the single biggest line.
+  • **T4 on Flash 2.5 saves $5.30/chapter** vs Pro ($1.80 vs $7.10 at N=100). That's the biggest single lever applied here.
+  • Engine-aware figure regen still ~$0.11/chapter cheaper than single-engine at default mix; table-heavy books (`E_tab=0.60, g_tab=3`) add ~$0.50/chapter.
+  • `watermark_clean=true` on every regen would add ~$0.135/chapter.
 
-### Annual estimate (12 chapters × 500 books, default engine mix)
+### Annual estimate (12 chapters × 500 books, baseline assumptions)
 
 ```
-$5.194 × 12 × 500 = $31,164 / year
+$14.439 × 12 × 500 = $86,632 / year
 ```
 
-For 50 books / year: $3,116. For 1000 books / year: $62,328. Add Railway infra
-($60–240/year). Cost is dominated by question regen (~63% of AI bill); see §5.
+For 50 books / year: $8,663. For 1000 books / year: $173,264. Add Railway infra
+($60–240/year). Cost is dominated by theory (T3 extract + T4 regen ≈ 54% of bill
+at N=100); see §5.
 
 ---
 
 ## 5. Cost Drivers (ranked by % share at Typical baseline)
 
+Baseline: N=100, S=150, T4=Flash. Per-chapter $14.44.
+
 | Rank | Driver | $/chapter | % of bill |
 |---|---|---|---|
-| 1 | Q3 multimodal regen | $2.19 | 42% |
-| 2 | Q2 text regen | $0.98 | 19% |
-| 3 | T4 theory regen | $0.71 | 14% |
-| 4 | T3 theory extract | $0.59 | 11% |
-| 5 | I-OL label overlay (image-only) | $0.15 | 3% |
-| 6 | Q1 question extract | $0.14 | 3% |
-| 7 | I2-img figure regen | $0.14 | 3% |
-| 8 | Infrastructure | $0.10 | 2% |
-| 9 | I2-tab figure regen | $0.03 | 1% |
-| 10 | I2-vec figure regen | $0.03 | 1% |
-| 11 | I1 figure extract | $0.058 | 1% |
-| 12 | T2 schema | $0.058 | 1% |
+| 1 | T3 theory extract | $5.90 | 41% |
+| 2 | Q3 multimodal regen | $3.29 | 23% |
+| 3 | T4 theory regen (Flash) | $1.80 | 12% |
+| 4 | Q2 text regen | $1.47 | 10% |
+| 5 | Q1 question extract | $1.40 | 10% |
+| 6 | I-OL label overlay (image-only) | $0.15 | 1% |
+| 7 | I2-img figure regen | $0.14 | 1% |
+| 8 | Infrastructure | $0.10 | 1% |
+| 9 | T2 schema | $0.058 | 0.4% |
+| 10 | I1 figure extract | $0.058 | 0.4% |
+| 11 | I2-tab figure regen | $0.05 | 0.4% |
+| 12 | I2-vec figure regen | $0.03 | 0.2% |
 
-**Insight:** Question regen (Q2+Q3) = 61% of the bill. Multimodal alone is 42%.
-Figure-engine routing (2026-06) saves ~$0.11/chapter on average but adds variance
-— a stats / data-sci textbook with many `table_embed` figures (high g_tab) can
-shift I2-tab from rank 9 up to rank 5.
+**Insight:** At N=100, **theory dominates** — T3 extract + T4 regen = 53% of the
+bill (was a minor cost at N=10). The per-section nature of theory means section
+count `N` is now the #1 driver of total cost. Question regen (Q2+Q3) is 33%.
+Putting T4 on Flash already shaved $5.30/chapter; the next biggest lever is T3
+extract ($5.90) — but moving *that* to Flash is higher-risk (see §7).
 
 ---
 
@@ -300,19 +310,25 @@ If your `P` is incorrect, the Q3 multimodal estimate is off by an order of magni
 
 | # | Lever | Effort | Savings $/ch | Risk |
 |---|---|---|---|---|
-| 1 | Disable multimodal regen (Q3 → Q2 fallback) | Env var `MULTIMODAL_REGEN_ENABLED=false` | ~$2.19 | MEDIUM — loses image-aware reasoning |
-| 2 | Skip regen on 50% of chapters | Workflow | ~$1.66 | LOW — selective regen |
-| 3 | Enable Gemini prompt caching | 1 dev day | ~$0.30 | ZERO — pure win |
-| 4 | Disable I-OL label overlay | Config flag | ~$0.15 | MEDIUM — label clarity |
-| 5 | Move T3 theory extract to Flash | Env var | ~$0.45 | HIGH — quality drop on dense pages |
-| 6 | Filter image-questions out of regen | Logic change | ~$2.19 | MEDIUM — those Qs stay as printed |
+Savings below are at the N=100 / S=150 baseline.
+
+| # | Lever | Effort | Savings $/ch | Risk |
+|---|---|---|---|---|
+| ✅ | **Theory regen → Flash 2.5 (T4)** | Already applied | **$5.30 saved** | MEDIUM — regen rewrites prose; spot-check one chapter |
+| 1 | Move T3 theory extract to Flash | Env var | ~$4.40 | HIGH — extract quality drop on dense pages/equations. Biggest remaining lever but riskiest |
+| 2 | Disable multimodal regen (Q3 → Q2 fallback) | Env var `MULTIMODAL_REGEN_ENABLED=false` | ~$2.62 | MEDIUM — loses image-aware reasoning |
+| 3 | Filter image-questions out of regen | Logic change | ~$3.29 | MEDIUM — those Qs stay as printed |
+| 4 | Skip regen on 50% of chapters | Workflow | ~$1.64 | LOW — selective regen |
+| 5 | Enable Gemini prompt caching | 1 dev day | ~$0.30+ | ZERO — pure win |
+| 6 | Disable I-OL label overlay | Config flag | ~$0.15 | MEDIUM — label clarity |
 | 7 | Reduce V (already at 1) | UI change | $0 currently | N/A — `V=1` is hardcoded in prod |
-| 8 | **Disable engine routing** (`FIGURE_ENGINE_ROUTING_ENABLED=false`) | Env var | **−$0.11 (engine routing is already net-cheaper; turning OFF saves only on books that are mostly `table_embed` with high g_tab)** | LOW — reverts to single image-engine cost. Leave ON for net savings unless a book is table-heavy |
+| 8 | **Disable engine routing** (`FIGURE_ENGINE_ROUTING_ENABLED=false`) | Env var | **−$0.11 (routing is already net-cheaper; OFF only helps table-heavy high-g_tab books)** | LOW — reverts to single image-engine cost |
 
 **Recommended sequence:**
-1. Enable prompt caching (zero risk, $0.30 saved)
-2. Filter low-quality image questions before Q3 (saves bulk of $2.19)
-3. Lower retry buffer to 0% if your observed retry rate is <5%
+1. ✅ Theory regen on Flash — done ($5.30 saved).
+2. Enable prompt caching (zero risk).
+3. Pilot T3 extract on Flash on ONE chapter, eyeball quality — if acceptable, it's the next $4.40.
+4. Filter low-quality image questions before Q3.
 
 ---
 
@@ -320,12 +336,14 @@ If your `P` is incorrect, the Q3 multimodal estimate is off by an order of magni
 
 For showing cost in V-Studio UI:
 
-| User Action | API Cost (V=1) |
+Baseline N=100 sections, S=150 questions, V=1, T4 theory regen on Flash.
+
+| User Action | API Cost |
 |---|---|
-| Upload chapter | ~$0.85 (extraction) |
-| Click "Regenerate Theory" (whole book) | ~$0.71 |
-| Click "Regenerate this section" | ~$0.07 |
-| Click "Regenerate Questions" (whole bank) | ~$3.17 |
+| Upload chapter | ~$7.42 (extraction: T2+T3×100+Q1×100+I1) |
+| Click "Regenerate Theory" (whole book) | ~$1.80 (100 sections × $0.018 Flash) |
+| Click "Regenerate this section" | ~$0.018 (Flash) |
+| Click "Regenerate Questions" (whole bank) | ~$4.76 (Q2+Q3 at S=150) |
 | Click "Reseed figures" — image engine | ~$0.050 / fig |
 | Click "Reseed figures" — vector engine | ~$0.025 / fig |
 | Click "Reseed figures" — table_embed engine | ~$0.025 + (g_tab × $0.050) / fig (g_tab=1 → $0.075; g_tab=3 → $0.175) |
@@ -344,20 +362,24 @@ For showing cost in V-Studio UI:
 
 ## 9. Volume Projections
 
-| Volume | Extract only ($0.85) | Extract + 1 regen ($5.19) |
+Baseline N=100, S=150, T4=Flash → extract $7.42/ch, extract+regen $14.44/ch.
+
+| Volume | Extract only ($7.42) | Extract + 1 regen ($14.44) |
 |---|---|---|
-| 1 chapter | $0.85 | $5.19 |
-| 10 chapters | $8.46 | $51.94 |
-| 100 chapters | $84.60 | $519.40 |
-| 1 book (12 ch) | $10.15 | $62.33 |
-| 50 books / year | $507 | $3,116 |
-| 500 books / year | $5,070 | **$31,164** |
-| 1000 books / year | $10,140 | $62,328 |
+| 1 chapter | $7.42 | $14.44 |
+| 10 chapters | $74.16 | $144.39 |
+| 100 chapters | $741.60 | $1,443.86 |
+| 1 book (12 ch) | $88.99 | $173.26 |
+| 50 books / year | $4,450 | $8,663 |
+| 500 books / year | $44,496 | **$86,632** |
+| 1000 books / year | $88,992 | $173,264 |
 
 Add Railway infra: $5–20/month base ($60–240/year). Numbers above use V=1
-(fixed in prod) and default engine mix (E_img=0.60, E_vec=0.25, E_tab=0.15,
-g_tab=1.0). Subject-heavy outliers: data-sci/stats books with lots of tables
-can run ~$0.30/chapter higher; algebra-heavy math can run ~$0.10 lower.
+(fixed in prod), T4 theory regen on Flash 2.5, and default engine mix
+(E_img=0.60, E_vec=0.25, E_tab=0.15, g_tab=1.0). The total is driven by `N`
+(sections): theory extract + regen are per-section, so halving N nearly halves
+the bill. Subject outliers: data-sci/stats books with lots of tables run
+~$0.30/chapter higher; algebra-heavy math ~$0.10 lower.
 
 ---
 
@@ -386,7 +408,7 @@ can run ~$0.30/chapter higher; algebra-heavy math can run ~$0.10 lower.
 | Theory extract | `backend/app/services/theory_extractor.py:173` | `call_gemini_with_pdf` (Pro) |
 | Question extract | `backend/app/workers/questions_v3.py:731` | `call_gemini_with_pdf` (Flash) |
 | QA verifier (optional) | `backend/app/services/qa/verifier.py:65` | `call_gemini_with_pdf` (Flash) |
-| Theory regen | `backend/app/workers/regen_v3.py` | direct Gemini call |
+| Theory regen | `backend/app/workers/regen_v3.py` | direct Gemini call — **costed on Flash 2.5** ($0.018/sec). NOTE: if the worker still hardcodes Pro, change the model there for this cost to hold. |
 | Question regen — text | `backend/app/workers/question_regen_v3.py:366` | `call_gemini_text_only` (Flash) |
 | Question regen — multimodal | `backend/app/workers/question_regen_v3.py:354` | `call_gemini_text_with_images` (Pro) |
 | Figure extract | `backend/app/services/figures/extractor.py:134` | `generate_content` (Pro Preview) |
