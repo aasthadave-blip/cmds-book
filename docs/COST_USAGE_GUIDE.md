@@ -272,9 +272,9 @@ For 50 books / year: $3,116. For 1000 books / year: $62,328. Add Railway infra
 | 12 | T2 schema | $0.058 | 1% |
 
 **Insight:** Question regen (Q2+Q3) = 61% of the bill. Multimodal alone is 42%.
-Figure-engine routing (2026-06) saves ~$0.13/chapter on average but adds variance
-— a stats / data-sci textbook with many `table_embed` figures can shift I2-tab
-from rank 9 up to rank 5.
+Figure-engine routing (2026-06) saves ~$0.11/chapter on average but adds variance
+— a stats / data-sci textbook with many `table_embed` figures (high g_tab) can
+shift I2-tab from rank 9 up to rank 5.
 
 ---
 
@@ -307,7 +307,7 @@ If your `P` is incorrect, the Q3 multimodal estimate is off by an order of magni
 | 5 | Move T3 theory extract to Flash | Env var | ~$0.45 | HIGH — quality drop on dense pages |
 | 6 | Filter image-questions out of regen | Logic change | ~$2.19 | MEDIUM — those Qs stay as printed |
 | 7 | Reduce V (already at 1) | UI change | $0 currently | N/A — `V=1` is hardcoded in prod |
-| 8 | **Disable engine routing** (`FIGURE_ENGINE_ROUTING_ENABLED=false`) | Env var | **−$0.13 (saves only on books with lots of `vector` figures)** | LOW — reverts to single image-engine cost. Use if you want predictable per-fig cost, otherwise leave ON for net savings |
+| 8 | **Disable engine routing** (`FIGURE_ENGINE_ROUTING_ENABLED=false`) | Env var | **−$0.11 (engine routing is already net-cheaper; turning OFF saves only on books that are mostly `table_embed` with high g_tab)** | LOW — reverts to single image-engine cost. Leave ON for net savings unless a book is table-heavy |
 
 **Recommended sequence:**
 1. Enable prompt caching (zero risk, $0.30 saved)
@@ -328,7 +328,7 @@ For showing cost in V-Studio UI:
 | Click "Regenerate Questions" (whole bank) | ~$3.17 |
 | Click "Reseed figures" — image engine | ~$0.050 / fig |
 | Click "Reseed figures" — vector engine | ~$0.025 / fig |
-| Click "Reseed figures" — table_embed engine | ~$0.025 × (1 + g_tab) / fig |
+| Click "Reseed figures" — table_embed engine | ~$0.025 + (g_tab × $0.050) / fig (g_tab=1 → $0.075; g_tab=3 → $0.175) |
 | Click "Reseed figures" (whole chapter, 15 figs at 30%, default engine mix) | ~$0.20 |
 | Click "Reseed figures" with **watermark_clean=true** | +$0.05 per regenerated figure (opt-in WM1 stage) |
 | View Preview / Composer / Comparison tab | $0 |
@@ -517,7 +517,7 @@ group landed today.
 | **Worked-example subsection dedup** | `final_merge.py:999+` | No direct cost change | Prevents duplicate "Q4.2 + EXAMPLE 4.2" in preview |
 | **SKIP_ORPHAN_RECOVERY env var** | `main.py:171` | Saves cost of crash loop re-dispatching | Backend stays UP even if a job is poisoned |
 | **CELERY_CONCURRENCY=1 default** | `start.sh` | No direct cost change | RAM safety on 512MB tier |
-| **Engine-aware figure regen** (`fa0944e`) | `question_regen_v3.py:pick_regen_engine`, `figures_tasks.py:780` | -$0.13/chapter on default mix; ±$0.40 by subject | Vector/table figures regenerate with type-appropriate engine instead of all going to image |
+| **Engine-aware figure regen** (`fa0944e`) | `question_regen_v3.py:pick_regen_engine`, `figures_tasks.py:780` | -$0.11/chapter on default mix; +$0.50 on table-heavy books (g_tab=3), -$0.10 on vector-heavy math | Vector/table figures regenerate with type-appropriate engine instead of all going to image |
 | **pylatexenc declared as dep** (`355b137`) | `backend/pyproject.toml` | No cost change | Theory/Q/Fig stages no longer crash on `ModuleNotFoundError` post-schema |
 | **Tolerant figures JSON parser** (`177642b`) | `figures/extractor.py` | No cost change | Figure stage no longer crashes when Gemini's response has trailing garbage after the JSON object |
 | **needs_review schema → ready** (`4241ce4`) | `book_status.py` | No cost change | Books finalize properly instead of hanging at "processing" |
